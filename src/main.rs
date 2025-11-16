@@ -129,6 +129,7 @@ fn main() {
     });
 
     // Fill lower triangle (symmetric matrix)
+    #[allow(clippy::needless_range_loop)]
     for i in 0..n {
         for j in (i + 1)..n {
             mat[j][i] = mat[i][j];
