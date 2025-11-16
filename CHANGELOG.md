@@ -3,9 +3,12 @@
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+This project uses release names based on random words from [codenamegenerator.com](https://www.codenamegenerator.com/):
+    - PREFIX: Microsoft Corperation
+    - DICTIONARY: Snakes
 
-## [0.2.1] - 2025-11-16
+## [0.2.1] - Slate King Cobra (2025-11-16)
 
 ### Changed
 
@@ -33,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Updated pre-commit configuration
 
-## [0.1.0] - Initial Release
+## [0.1.0] - Aero Boa (Initial Release)
 
 Initial release with basic functionality for computing phylogenetic tree distances:
 
