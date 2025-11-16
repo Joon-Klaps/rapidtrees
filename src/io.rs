@@ -61,8 +61,8 @@ pub fn read_beast_trees<P: AsRef<Path>>(
         .enumerate()
         //generate tree name & extract state number
         .map(|(idx, tree)| {
-            let state = extract_state(tree.header);
-            (idx, tree, state, format!("{base_name}_tree_STATE{state}"))
+            let (name, state) = extract_name_state(tree.header);
+            (idx, tree, state, format!("{base_name}_{name}"))
         })
         // Filter out burn-in trees based on count and/or state number if 0 we don't filter
         .filter(|(idx, _tree, state, _name)| {
@@ -100,19 +100,36 @@ pub fn read_beast_trees<P: AsRef<Path>>(
     (taxons, trees)
 }
 
-fn extract_state(header: &str) -> usize {
-    if let Some(start) = header.to_ascii_uppercase().find("STATE_") {
-        let num_start = start + 6; // length of "STATE_"
-        let rest = &header[num_start..];
-        let state = rest
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect::<String>();
-        if let Ok(num) = state.parse::<usize>() {
-            return num;
+fn extract_name_state(header: &str) -> (String, usize) {
+    // tree classic2_STATE_968940000 [...]
+    // tree STATE_8500000 [...]
+    // tree classic1_STATE_766540000 [...]
+
+    // Find "STATE_" in the header (case-insensitive)
+    let upper = header.to_ascii_uppercase();
+    if let Some(state_pos) = upper.find("STATE_") {
+        // Split on first space to get the tree name part (after "tree ")
+        if let Some((_, rest)) = header.split_once(' ') {
+            // Extract just the tree name (everything before the opening bracket or end of string)
+            let tree_name = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string();
+
+            // Extract the state number (digits after "STATE_")
+            let digits = header[state_pos + 6..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>();
+
+            if let Ok(num) = digits.parse::<usize>() {
+                return (tree_name, num);
+            }
         }
     }
-    0
+
+    ("".to_string(), 0)
 }
 
 struct TreeBlock<'a> {
@@ -143,6 +160,7 @@ fn parse_taxon_block(content: &str) -> HashMap<String, String> {
         // STRUCTURE:
         // 1 '1959.M.CD.59.ZR59',
         // 2 '1960.DRC60A',
+        // 3 GU573545|Soromba_R245|Mouse|MLI|2009,
         .filter_map(|line| {
             let line = line.trim().trim_end_matches(',');
             let mut parts = line.split_whitespace();

@@ -12,6 +12,8 @@
 //! 3. **Kuhner-Felsenstein (Branch Score)**: Similar to weighted RF but uses
 //!    squared differences: sqrt(Σ(length_a - length_b)²)
 
+use std::collections::HashSet;
+
 use crate::snapshot::TreeSnapshot;
 use phylotree::tree::{Tree as PhyloTree, TreeError};
 
@@ -60,17 +62,9 @@ pub fn robinson_foulds(tree_a: &PhyloTree, tree_b: &PhyloTree) -> Result<usize, 
 /// RF = len(A) + len(B) - 2 * len(intersection)
 /// ```
 ///
-/// This is dramatically faster than the O(m+n) merge algorithm for sorted vectors,
-/// and much simpler too! HashSet intersection is optimized at the system level.
 pub fn rf_from_snapshots(a: &TreeSnapshot, b: &TreeSnapshot) -> usize {
     let inter = a.parts.intersection(&b.parts).count();
-    let rf = a.parts.len() + b.parts.len() - 2 * inter;
-    let same_root = a.root_children == b.root_children;
-    if a.rooted && b.rooted && rf != 0 && !same_root {
-        rf + 2
-    } else {
-        rf
-    }
+    a.parts.len() + b.parts.len() - 2 * inter
 }
 
 /// Compute Weighted Robinson-Foulds distance between two trees.
