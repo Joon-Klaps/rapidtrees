@@ -23,7 +23,7 @@
 
 use crate::bitset::Bitset;
 use phylotree::tree::{Tree as PhyloTree, TreeError};
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// An immutable snapshot of all partitions in a phylogenetic tree.
 ///
@@ -45,11 +45,11 @@ use std::collections::{HashMap, HashSet};
 /// and weighted distance calculations, instead of O(n log n) with sorted vectors.
 #[derive(Debug, Clone)]
 pub struct TreeSnapshot {
-    /// All partitions in the tree, canonicalized (HashSet for fast lookup)
-    pub parts: HashSet<Bitset>,
+    /// All partitions in the tree, canonicalized (FxHashSet for fast lookup)
+    pub parts: FxHashSet<Bitset>,
 
     /// Branch length for each partition (keyed by the canonical Bitset)
-    pub lengths: HashMap<Bitset, f64>,
+    pub lengths: FxHashMap<Bitset, f64>,
 
     /// Bitsets of root's immediate children (for rooted tree adjustment)
     pub root_children: Vec<Bitset>,
@@ -100,7 +100,7 @@ impl TreeSnapshot {
         let words = num_leaves.div_ceil(64);
 
         // Step 2: Create mapping: node_id → bit_index (based on sorted names)
-        let node_id_to_leaf_index: HashMap<usize, usize> = leaf_names
+        let node_id_to_leaf_index: FxHashMap<usize, usize> = leaf_names
             .iter()
             .enumerate()
             .map(|(idx, &(node_id, _))| (node_id, idx))
@@ -111,7 +111,7 @@ impl TreeSnapshot {
         // Cache to store computed bitsets
         // Key: node_id, Value: Bitset of leaves under this node
         // Node_id, allows us to get a branch length associated with the partition
-        let mut cache: HashMap<usize, Bitset> = HashMap::new();
+        let mut cache: FxHashMap<usize, Bitset> = FxHashMap::with_capacity_and_hasher(num_leaves * 2, Default::default());
         Self::compute_bitsets(root_id, tree, &node_id_to_leaf_index, words, &mut cache);
 
         // Step 4: Collect partitions (with or without trivial partitions)
@@ -144,9 +144,9 @@ impl TreeSnapshot {
     fn compute_bitsets(
         node_id: usize,
         tree: &PhyloTree,
-        node_id_to_leaf_index: &HashMap<usize, usize>,
+        node_id_to_leaf_index: &FxHashMap<usize, usize>,
         words: usize,
-        cache: &mut HashMap<usize, Bitset>,
+        cache: &mut FxHashMap<usize, Bitset>,
     ) -> Bitset {
         // Return cached result if available
         if let Some(bitset) = cache.get(&node_id) {
@@ -192,7 +192,7 @@ impl TreeSnapshot {
     fn collect_partitions(
         tree: &PhyloTree,
         root_id: usize,
-        cache: &HashMap<usize, Bitset>,
+        cache: &FxHashMap<usize, Bitset>,
     ) -> Result<(Vec<Bitset>, Vec<f64>), TreeError> {
         let mut parts = Vec::new();
         let mut lengths = Vec::new();
@@ -268,15 +268,15 @@ impl TreeSnapshot {
     /// Partition {C,D}: bitset 0b1100 (leaf 0 NOT set) → keep as 0b1100
     ///
     /// # Returns
-    /// Returns (HashSet<Bitset>, HashMap<Bitset, f64>) for O(1) lookups
+    /// Returns (FxHashSet<Bitset>, FxHashMap<Bitset, f64>) for O(1) lookups
     fn canonicalize_partitions(
         parts: Vec<Bitset>,
         lengths: Vec<f64>,
         words: usize,
         num_leaves: usize,
-    ) -> (HashSet<Bitset>, HashMap<Bitset, f64>) {
-        let mut canonical_parts = HashSet::with_capacity(parts.len());
-        let mut canonical_lengths = HashMap::with_capacity(lengths.len());
+    ) -> (FxHashSet<Bitset>, FxHashMap<Bitset, f64>) {
+        let mut canonical_parts = FxHashSet::with_capacity_and_hasher(parts.len(), Default::default());
+        let mut canonical_lengths = FxHashMap::with_capacity_and_hasher(lengths.len(), Default::default());
 
         for (bitset, length) in parts.into_iter().zip(lengths.into_iter()) {
             // Check if leaf 0 (bit 0 of word 0) is set
@@ -331,7 +331,7 @@ impl TreeSnapshot {
     fn get_root_children(
         tree: &PhyloTree,
         root_id: usize,
-        cache: &HashMap<usize, Bitset>,
+        cache: &FxHashMap<usize, Bitset>,
     ) -> Result<Vec<Bitset>, TreeError> {
         let root = tree.get(&root_id)?;
         let mut root_children: Vec<Bitset> = root

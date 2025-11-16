@@ -12,8 +12,6 @@
 //! 3. **Kuhner-Felsenstein (Branch Score)**: Similar to weighted RF but uses
 //!    squared differences: sqrt(Σ(length_a - length_b)²)
 
-use std::collections::HashSet;
-
 use crate::snapshot::TreeSnapshot;
 use phylotree::tree::{Tree as PhyloTree, TreeError};
 
@@ -156,7 +154,7 @@ pub fn kuhner_felsenstein(tree_a: &PhyloTree, tree_b: &PhyloTree) -> Result<f64,
 ///
 /// Uses HashSet/HashMap for O(n) performance, accumulating squared differences.
 pub fn kf_from_snapshots(a: &TreeSnapshot, b: &TreeSnapshot) -> f64 {
-    let mut sum_squared = 0.0;
+    let mut sum_squared: f64 = 0.0;
 
     // Iterate through partitions in tree A
     for part in &a.parts {

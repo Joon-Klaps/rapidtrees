@@ -2,6 +2,11 @@
 
 Compute pairwise tree distances (Robinson–Foulds, weighted RF, Kuhner–Felsenstein) from BEAST/NEXUS `.trees` files and write a labeled distance matrix.
 
+## Performance ZIKA dataset (283 taxa, 4000 trees, ~8M comparisons)
+- **Robinson-Foulds (RF)**: ~5.1s total → **~1.57M comparisons/sec**
+- **Weighted RF**: ~15.6s total → **~513K comparisons/sec**
+- **Kuhner-Felsenstein (KF)**: ~15.6s total → **~511K comparisons/sec**
+
 ## Install / Build
 
 Requirements: Rust toolchain (stable). Then build the binary:
