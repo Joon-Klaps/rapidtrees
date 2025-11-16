@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "rust-python-tree-distances"
-version = "0.1.0"
+version = "0.2.1"
 description = "Fast tree distance calculations (Robinson-Foulds, Weighted RF, Kuhner-Felsenstein) for phylogenetic trees"
 readme = "README.md"
 requires-python = ">=3.9"

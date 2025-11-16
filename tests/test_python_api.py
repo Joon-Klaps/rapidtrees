@@ -124,7 +124,7 @@ class TestPairwiseRF:
         # Should filter out trees with STATE < 100000
         assert all("STATE" in name for name in tree_names)
         # Extract state values and verify they're all >= 100000
-        states = [int(name.split("STATE")[1]) for name in tree_names]
+        states = [int(name.split("STATE_")[1]) for name in tree_names]
         assert all(s >= 100000 for s in states)
 
     def test_use_real_taxa(self):
@@ -207,41 +207,22 @@ class TestPairwiseWeightedRF:
         # Most weighted distances should be >= unweighted
         assert larger_count / total_count > 0.8
 
-    def test_weighted_output_consistency(self):
-        """Test that weighted RF produces numerically consistent output."""
+    def test_weighted_rf_is_deterministic(self):
+        """Test that weighted RF distances are deterministic across multiple runs."""
         paths = [str(TEST_DATA / "hiv1.trees")]
 
-        # Run multiple times to check consistency
+        # Run three times - should be deterministic
         tree_names1, matrix1 = rtd.pairwise_weighted_rf(paths, burnin_trees=1)
         tree_names2, matrix2 = rtd.pairwise_weighted_rf(paths, burnin_trees=1)
         tree_names3, matrix3 = rtd.pairwise_weighted_rf(paths, burnin_trees=1)
 
-        # Tree names should always be identical
+        # Tree names should be identical
         assert tree_names1 == tree_names2 == tree_names3
 
-        # Matrix dimensions should match
-        assert len(matrix1) == len(matrix2) == len(matrix3)
+        # Matrices should be exactly identical (deterministic)
+        assert matrices_close(matrix1, matrix2), "Weighted RF distances should be deterministic between runs 1 and 2"
+        assert matrices_close(matrix2, matrix3), "Weighted RF distances should be deterministic between runs 2 and 3"
 
-        # Due to parallel processing and floating-point arithmetic,
-        # results may vary slightly. Check they're within a reasonable tolerance.
-        # The variation is due to non-deterministic parallel reduction of floating-point sums.
-        max_diff_1_2 = max(abs(matrix1[i][j] - matrix2[i][j])
-                           for i in range(len(matrix1))
-                           for j in range(len(matrix1)))
-        max_diff_2_3 = max(abs(matrix2[i][j] - matrix3[i][j])
-                           for i in range(len(matrix2))
-                           for j in range(len(matrix2)))
-
-        # Differences should be small relative to the distance values
-        # (< 10% of typical distances which range 100-600 for these trees)
-        assert max_diff_1_2 < 60.0, f"Max difference between runs 1 and 2: {max_diff_1_2}"
-        assert max_diff_2_3 < 60.0, f"Max difference between runs 2 and 3: {max_diff_2_3}"
-
-        # Diagonal should always be exactly zero
-        assert all(matrix1[i][i] == 0.0 for i in range(len(matrix1)))
-
-        # All distances should be positive
-        assert all(matrix1[i][j] > 0 for i in range(len(matrix1)) for j in range(len(matrix1)) if i != j)
 
 
 class TestPairwiseKF:
@@ -268,34 +249,22 @@ class TestPairwiseKF:
         # Check that values are positive and reasonable
         assert matrix[0][1] > 0
 
-    def test_kf_output_consistency(self):
-        """Test that KF produces numerically consistent output."""
+    def test_kf_is_deterministic(self):
+        """Test that KF distances are deterministic across multiple runs."""
         paths = [str(TEST_DATA / "hiv1.trees")]
 
-        # Run twice to check consistency
+        # Run three times - should be deterministic
         tree_names1, matrix1 = rtd.pairwise_kf(paths, burnin_trees=1)
         tree_names2, matrix2 = rtd.pairwise_kf(paths, burnin_trees=1)
+        tree_names3, matrix3 = rtd.pairwise_kf(paths, burnin_trees=1)
 
-        # Tree names should always be the same
-        assert tree_names1 == tree_names2
+        # Tree names should be identical
+        assert tree_names1 == tree_names2 == tree_names3
 
-        # Matrix dimensions should match
-        assert len(matrix1) == len(matrix2)
+        # Matrices should be exactly identical (deterministic)
+        assert matrices_close(matrix1, matrix2), "KF distances should be deterministic between runs 1 and 2"
+        assert matrices_close(matrix2, matrix3), "KF distances should be deterministic between runs 2 and 3"
 
-        # Due to parallel processing, check results are within tolerance
-        max_diff = max(abs(matrix1[i][j] - matrix2[i][j])
-                       for i in range(len(matrix1))
-                       for j in range(len(matrix1)))
-
-        # Differences should be small relative to distance values
-        # (< 10% of typical KF distances which range 30-100 for these trees)
-        assert max_diff < 30.0, f"Max difference between runs: {max_diff}"
-
-        # Diagonal should be exactly zero
-        assert all(matrix1[i][i] == 0.0 for i in range(len(matrix1)))
-
-        # All distances should be positive
-        assert all(matrix1[i][j] > 0 for i in range(len(matrix1)) for j in range(len(matrix1)) if i != j)
 
     def test_kf_vs_weighted(self):
         """Test KF produces different values from weighted RF."""

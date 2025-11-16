@@ -111,11 +111,7 @@ fn extract_name_state(header: &str) -> (String, usize) {
         // Split on first space to get the tree name part (after "tree ")
         if let Some((_, rest)) = header.split_once(' ') {
             // Extract just the tree name (everything before the opening bracket or end of string)
-            let tree_name = rest
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .to_string();
+            let tree_name = rest.split_whitespace().next().unwrap_or("").to_string();
 
             // Extract the state number (digits after "STATE_")
             let digits = header[state_pos + 6..]

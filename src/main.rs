@@ -5,7 +5,7 @@ use rust_python_tree_distances::distances::{
 };
 use rust_python_tree_distances::io::{read_beast_trees, write_matrix_tsv};
 use rust_python_tree_distances::snapshot::TreeSnapshot;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 /// Compute pairwise Robinson–Foulds distances from a BEAST/NEXUS tree file
@@ -69,7 +69,7 @@ fn main() {
         std::process::exit(2);
     }
     let read_s = t0.elapsed().as_secs_f64();
-    log_if(!args.quiet, format!("Reading in beast {read_s:.3}s"));
+    log_if(!args.quiet, format!("Read beast trees in {read_s:.3}s"));
     log_if(
         !args.quiet,
         format!(
@@ -90,10 +90,11 @@ fn main() {
             eprintln!("Failed to build snapshots: {e}");
             std::process::exit(3);
         });
+
     let snap_s = t1.elapsed().as_secs_f64();
     log_if(
         !args.quiet,
-        format!("Creating tree bit snapshots {snap_s:.3}s"),
+        format!("Created tree bit snapshots in {snap_s:.3}s"),
     );
 
     let t2 = Instant::now();
@@ -115,26 +116,29 @@ fn main() {
 
     let n = names.len();
 
-    // Compute distances in parallel
-    let pairs: Vec<(usize, usize, f64)> = (0..n)
-        .into_par_iter()
-        .flat_map_iter(|i| (i + 1..n).map(move |j| (i, j)))
-        .map(|(i, j)| {
-            let dist = metric_fn(&snaps[i], &snaps[j]);
-            (i, j, dist)
-        })
-        .collect();
-
+    // Pre-allocate matrix for better performance
     let mut mat = vec![vec![0.0f64; n]; n];
-    for (i, j, d) in pairs {
-        mat[i][j] = d;
-        mat[j][i] = d;
+
+    // Compute distances in parallel using work-stealing for perfect load balance
+    // Each row is independent, Rayon handles distribution automatically
+    mat.par_iter_mut().enumerate().for_each(|(i, row)| {
+        for j in (i + 1)..n {
+            let dist = metric_fn(&snaps[i], &snaps[j]);
+            row[j] = dist;
+        }
+    });
+
+    // Fill lower triangle (symmetric matrix)
+    for i in 0..n {
+        for j in (i + 1)..n {
+            mat[j][i] = mat[i][j];
+        }
     }
 
     let comp_s = t2.elapsed().as_secs_f64();
     log_if(
         !args.quiet,
-        format!("Determining distances using {metric_label} {comp_s:.3}s"),
+        format!("Determined distances using {metric_label} in {comp_s:.3}s"),
     );
 
     let t3 = Instant::now();
@@ -143,23 +147,14 @@ fn main() {
         std::process::exit(4);
     }
     let write_s = t3.elapsed().as_secs_f64();
-    log_write_done(!args.quiet, &args.output, write_s);
+    log_if(
+        !args.quiet,
+        format!("Writing to {} in {write_s:.3}s", args.output.display()),
+    );
 }
 
 fn log_if(show: bool, msg: String) {
     if show {
         println!("{}", msg);
-    }
-}
-
-fn log_write_done(show: bool, output: &Path, secs: f64) {
-    if !show {
-        return;
-    }
-    let is_stdout = output.as_os_str() == "-";
-    if is_stdout {
-        println!("Writing to stdout {secs:.3}s");
-    } else {
-        println!("Writing to output {secs:.3}s");
     }
 }
