@@ -1,11 +1,11 @@
-use rust_python_tree_distances::snapshot::TreeSnapshot;
-use rust_python_tree_distances::distances::rf_from_snapshots;
-use phylotree::tree::Tree as PhyloTree;
-use std::time::{Duration, Instant};
 use cpu_time::ProcessTime;
 use memory_stats::memory_stats;
+use phylotree::tree::Tree as PhyloTree;
 use rayon::prelude::*;
+use rust_python_tree_distances::distances::rf_from_snapshots;
+use rust_python_tree_distances::snapshot::TreeSnapshot;
 use std::mem;
+use std::time::{Duration, Instant};
 
 fn generate_balanced_newick(start_index: usize, num_leaves: usize) -> String {
     if num_leaves == 1 {
@@ -75,7 +75,8 @@ fn estimate_size(snap: &TreeSnapshot) -> usize {
     size += snap.lengths.capacity() * mem::size_of::<f64>();
 
     // root_children: Vec<Bitset>
-    size += snap.root_children.capacity() * mem::size_of::<rust_python_tree_distances::bitset::Bitset>();
+    size += snap.root_children.capacity()
+        * mem::size_of::<rust_python_tree_distances::bitset::Bitset>();
     for part in &snap.root_children {
         size += part.0.capacity() * mem::size_of::<u64>();
     }
@@ -84,8 +85,12 @@ fn estimate_size(snap: &TreeSnapshot) -> usize {
 }
 
 fn main() {
-    println!("| Taxa (N) | Trees (T) | Combinations | Est. Memory | Actual Memory | Wall Time | CPU Time |");
-    println!("|----------|-----------|--------------|-------------|---------------|-----------|----------|");
+    println!(
+        "| Taxa (N) | Trees (T) | Combinations | Est. Memory | Actual Memory | Wall Time | CPU Time |"
+    );
+    println!(
+        "|----------|-----------|--------------|-------------|---------------|-----------|----------|"
+    );
 
     let taxa_counts = [10, 100, 500, 1000, 2000, 5000];
     let tree_counts = [100, 1000, 10_000, 100_000];
@@ -105,8 +110,10 @@ fn main() {
             let est_mem_str = format_size(total_est_size);
 
             if total_est_size > MEMORY_LIMIT {
-                println!("| {:<8} | {:<9} | {:<12} | {:<11} | {:<13} | {:<9} | {:<8} |",
-                    n, t, combs_str, est_mem_str, "Skipped (>30GB)", "-", "-");
+                println!(
+                    "| {:<8} | {:<9} | {:<12} | {:<11} | {:<13} | {:<9} | {:<8} |",
+                    n, t, combs_str, est_mem_str, "Skipped (>30GB)", "-", "-"
+                );
                 continue;
             }
 
@@ -117,13 +124,21 @@ fn main() {
             let trees: Vec<TreeSnapshot> = (0..t).map(|_| snap.clone()).collect();
 
             let end_mem = memory_stats().map(|s| s.physical_mem).unwrap_or(0);
-            let mem_diff = if end_mem > start_mem { end_mem - start_mem } else { 0 };
+            let mem_diff = end_mem.saturating_sub(start_mem);
             let actual_mem_str = format_size(mem_diff);
 
             if mem_diff > MEMORY_LIMIT {
-                 println!("| {:<8} | {:<9} | {:<12} | {:<11} | {:<13} | {:<9} | {:<8} |",
-                    n, t, combs_str, est_mem_str, format!("> {}", format_size(MEMORY_LIMIT)), "Skipped", "-");
-                 continue;
+                println!(
+                    "| {:<8} | {:<9} | {:<12} | {:<11} | {:<13} | {:<9} | {:<8} |",
+                    n,
+                    t,
+                    combs_str,
+                    est_mem_str,
+                    format!("> {}", format_size(MEMORY_LIMIT)),
+                    "Skipped",
+                    "-"
+                );
+                continue;
             }
 
             // Benchmark Time
@@ -158,11 +173,21 @@ fn main() {
             let est_wall = wall_duration.mul_f64(ratio);
             let est_cpu = cpu_duration.mul_f64(ratio);
 
-            let wall_str = if ratio > 1.01 { format!("{} (est)", format_duration(est_wall)) } else { format_duration(est_wall) };
-            let cpu_str = if ratio > 1.01 { format!("{} (est)", format_duration(est_cpu)) } else { format_duration(est_cpu) };
+            let wall_str = if ratio > 1.01 {
+                format!("{} (est)", format_duration(est_wall))
+            } else {
+                format_duration(est_wall)
+            };
+            let cpu_str = if ratio > 1.01 {
+                format!("{} (est)", format_duration(est_cpu))
+            } else {
+                format_duration(est_cpu)
+            };
 
-            println!("| {:<8} | {:<9} | {:<12} | {:<11} | {:<13} | {:<9} | {:<8} |",
-                n, t, combs_str, est_mem_str, actual_mem_str, wall_str, cpu_str);
+            println!(
+                "| {:<8} | {:<9} | {:<12} | {:<11} | {:<13} | {:<9} | {:<8} |",
+                n, t, combs_str, est_mem_str, actual_mem_str, wall_str, cpu_str
+            );
         }
     }
 }
