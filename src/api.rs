@@ -7,10 +7,11 @@ use phylotree::tree::Tree as PhyloTree;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::collections::HashSet;
 
 use crate::distances::{kf_from_snapshots, rf_from_snapshots, weighted_rf_from_snapshots};
-use crate::io::read_beast_trees;
+use crate::io::{read_beast_trees, rename_leaf_nodes, strip_beast_annotations};
 use crate::snapshot::TreeSnapshot;
 
 /// Compute pairwise Robinson-Foulds distances from multiple tree files.
@@ -180,6 +181,108 @@ fn pairwise_kf(
     Ok((tree_names, matrix))
 }
 
+/// Parse newick strings and apply translate maps to produce PhyloTrees.
+///
+/// Each newick is stripped of BEAST annotations, parsed, then leaf nodes are
+/// renamed using the translate map selected by `map_indices[i]`.
+pub(crate) fn parse_and_translate(
+    newicks: &[String],
+    translate_maps: &[HashMap<String, String>],
+    map_indices: &[usize],
+) -> Result<Vec<PhyloTree>, String> {
+    if newicks.len() != map_indices.len() {
+        return Err(format!(
+            "newicks length ({}) must equal map_indices length ({})",
+            newicks.len(),
+            map_indices.len()
+        ));
+    }
+
+    for (i, &idx) in map_indices.iter().enumerate() {
+        if idx >= translate_maps.len() {
+            return Err(format!(
+                "map_indices[{}] = {} is out of bounds (only {} translate maps provided)",
+                i,
+                idx,
+                translate_maps.len()
+            ));
+        }
+    }
+
+    let mut trees = Vec::with_capacity(newicks.len());
+    for (i, newick) in newicks.iter().enumerate() {
+        let clean = strip_beast_annotations(newick);
+        let mut tree = PhyloTree::from_newick(&clean)
+            .map_err(|e| format!("Failed to parse newick at index {}: {}", i, e))?;
+        rename_leaf_nodes(&mut tree, &translate_maps[map_indices[i]]);
+        trees.push(tree);
+    }
+
+    Ok(trees)
+}
+
+/// Compute pairwise Robinson-Foulds distances from newick strings with translate maps.
+///
+/// Args:
+///     names: List of tree identifiers (one per newick)
+///     newicks: List of newick strings (may contain BEAST annotations)
+///     translate_maps: List of translate maps (number → taxon name)
+///     map_indices: Per-tree index into translate_maps
+///
+/// Returns:
+///     A tuple of (tree_names, distance_matrix) where:
+///     - tree_names is the input names list
+///     - distance_matrix is a 2D list of RF distances
+///
+/// Raises:
+///     ValueError: If lengths mismatch, indices are out of bounds, or fewer than 2 trees
+#[pyfunction]
+#[pyo3(signature = (names, newicks, translate_maps, map_indices))]
+fn pairwise_rf_from_newicks(
+    names: Vec<String>,
+    newicks: Vec<String>,
+    translate_maps: Vec<HashMap<String, String>>,
+    map_indices: Vec<usize>,
+) -> PyResult<(Vec<String>, Vec<Vec<usize>>)> {
+    if names.len() != newicks.len() {
+        return Err(PyValueError::new_err(format!(
+            "names length ({}) must equal newicks length ({})",
+            names.len(),
+            newicks.len()
+        )));
+    }
+
+    let trees = parse_and_translate(&newicks, &translate_maps, &map_indices)
+        .map_err(PyValueError::new_err)?;
+
+    sanity_check_trees(&trees)?;
+
+    let snapshots: Vec<TreeSnapshot> = trees
+        .iter()
+        .map(TreeSnapshot::from_tree)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| PyValueError::new_err(format!("Failed to create tree snapshot: {}", e)))?;
+
+    let n = snapshots.len();
+    let mut matrix = vec![vec![0usize; n]; n];
+
+    let pairs: Vec<(usize, usize, usize)> = (0..n)
+        .into_par_iter()
+        .flat_map_iter(|i| (i + 1..n).map(move |j| (i, j)))
+        .map(|(i, j)| {
+            let dist = rf_from_snapshots(&snapshots[i], &snapshots[j]);
+            (i, j, dist)
+        })
+        .collect();
+
+    for (i, j, dist) in pairs {
+        matrix[i][j] = dist;
+        matrix[j][i] = dist;
+    }
+
+    Ok((names, matrix))
+}
+
 /// Helper function to read trees from multiple files
 fn read_all_trees(
     paths: &[String],
@@ -276,5 +379,6 @@ fn rust_python_tree_distances(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pairwise_rf, m)?)?;
     m.add_function(wrap_pyfunction!(pairwise_weighted_rf, m)?)?;
     m.add_function(wrap_pyfunction!(pairwise_kf, m)?)?;
+    m.add_function(wrap_pyfunction!(pairwise_rf_from_newicks, m)?)?;
     Ok(())
 }
