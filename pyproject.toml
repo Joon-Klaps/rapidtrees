@@ -28,6 +28,9 @@ classifiers = [
 Homepage = "https://github.com/Joon-Klaps/rust-python-tree-distances"
 Repository = "https://github.com/Joon-Klaps/rust-python-tree-distances"
 
+[project.optional-dependencies]
+dev = ["pytest"]
+
 [tool.maturin]
 features = ["python"]
 module-name = "rust_python_tree_distances"

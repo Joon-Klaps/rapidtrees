@@ -30,12 +30,13 @@ use crate::snapshot::TreeSnapshot;
 /// Raises:
 ///     ValueError: If no trees are found, trees have different leaf sets, or sanity checks fail
 #[pyfunction]
-#[pyo3(signature = (paths, burnin_trees=0, burnin_states=0, use_real_taxa=true))]
+#[pyo3(signature = (paths, burnin_trees=0, burnin_states=0, use_real_taxa=true, rooted=false))]
 fn pairwise_rf(
     paths: Vec<String>,
     burnin_trees: usize,
     burnin_states: usize,
     use_real_taxa: bool,
+    rooted: bool,
 ) -> PyResult<(Vec<String>, Vec<Vec<usize>>)> {
     // Read all trees from all files
     let (tree_names, trees) = read_all_trees(&paths, burnin_trees, burnin_states, use_real_taxa)?;
@@ -46,7 +47,7 @@ fn pairwise_rf(
     // Build snapshots
     let snapshots: Vec<TreeSnapshot> = trees
         .iter()
-        .map(TreeSnapshot::from_tree)
+        .map(|t| TreeSnapshot::from_tree(t, rooted))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| PyValueError::new_err(format!("Failed to create tree snapshot: {}", e)))?;
 
@@ -91,19 +92,20 @@ fn pairwise_rf(
 /// Raises:
 ///     ValueError: If no trees are found, trees have different leaf sets, or sanity checks fail
 #[pyfunction]
-#[pyo3(signature = (paths, burnin_trees=0, burnin_states=0, use_real_taxa=true))]
+#[pyo3(signature = (paths, burnin_trees=0, burnin_states=0, use_real_taxa=true, rooted=false))]
 fn pairwise_weighted_rf(
     paths: Vec<String>,
     burnin_trees: usize,
     burnin_states: usize,
     use_real_taxa: bool,
+    rooted: bool,
 ) -> PyResult<(Vec<String>, Vec<Vec<f64>>)> {
     let (tree_names, trees) = read_all_trees(&paths, burnin_trees, burnin_states, use_real_taxa)?;
     sanity_check_trees(&trees)?;
 
     let snapshots: Vec<TreeSnapshot> = trees
         .iter()
-        .map(TreeSnapshot::from_tree)
+        .map(|t| TreeSnapshot::from_tree(t, rooted))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| PyValueError::new_err(format!("Failed to create tree snapshot: {}", e)))?;
 
@@ -145,19 +147,20 @@ fn pairwise_weighted_rf(
 /// Raises:
 ///     ValueError: If no trees are found, trees have different leaf sets, or sanity checks fail
 #[pyfunction]
-#[pyo3(signature = (paths, burnin_trees=0, burnin_states=0, use_real_taxa=true))]
+#[pyo3(signature = (paths, burnin_trees=0, burnin_states=0, use_real_taxa=true, rooted=false))]
 fn pairwise_kf(
     paths: Vec<String>,
     burnin_trees: usize,
     burnin_states: usize,
     use_real_taxa: bool,
+    rooted: bool,
 ) -> PyResult<(Vec<String>, Vec<Vec<f64>>)> {
     let (tree_names, trees) = read_all_trees(&paths, burnin_trees, burnin_states, use_real_taxa)?;
     sanity_check_trees(&trees)?;
 
     let snapshots: Vec<TreeSnapshot> = trees
         .iter()
-        .map(TreeSnapshot::from_tree)
+        .map(|t| TreeSnapshot::from_tree(t, rooted))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| PyValueError::new_err(format!("Failed to create tree snapshot: {}", e)))?;
 
@@ -237,12 +240,13 @@ pub(crate) fn parse_and_translate(
 /// Raises:
 ///     ValueError: If lengths mismatch, indices are out of bounds, or fewer than 2 trees
 #[pyfunction]
-#[pyo3(signature = (names, newicks, translate_maps, map_indices))]
+#[pyo3(signature = (names, newicks, translate_maps, map_indices, rooted=false))]
 fn pairwise_rf_from_newicks(
     names: Vec<String>,
     newicks: Vec<String>,
     translate_maps: Vec<HashMap<String, String>>,
     map_indices: Vec<usize>,
+    rooted: bool,
 ) -> PyResult<(Vec<String>, Vec<Vec<usize>>)> {
     if names.len() != newicks.len() {
         return Err(PyValueError::new_err(format!(
@@ -259,7 +263,7 @@ fn pairwise_rf_from_newicks(
 
     let snapshots: Vec<TreeSnapshot> = trees
         .iter()
-        .map(TreeSnapshot::from_tree)
+        .map(|t| TreeSnapshot::from_tree(t, rooted))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| PyValueError::new_err(format!("Failed to create tree snapshot: {}", e)))?;
 

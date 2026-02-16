@@ -44,8 +44,8 @@ use itertools::Itertools;
 /// # Errors
 /// Returns `TreeError` if trees have different leaf sets or are malformed.
 pub fn robinson_foulds(tree_a: &PhyloTree, tree_b: &PhyloTree) -> Result<usize, TreeError> {
-    let snap_a = TreeSnapshot::from_tree(tree_a)?;
-    let snap_b = TreeSnapshot::from_tree(tree_b)?;
+    let snap_a = TreeSnapshot::from_tree(tree_a, false)?;
+    let snap_b = TreeSnapshot::from_tree(tree_b, false)?;
 
     Ok(rf_from_snapshots(&snap_a, &snap_b))
 }
@@ -105,8 +105,8 @@ pub fn rf_from_snapshots(a: &TreeSnapshot, b: &TreeSnapshot) -> usize {
 /// # Errors
 /// Returns `TreeError` if trees have different leaf sets or are malformed.
 pub fn weighted_robinson_foulds(tree_a: &PhyloTree, tree_b: &PhyloTree) -> Result<f64, TreeError> {
-    let snap_a = TreeSnapshot::from_tree(tree_a)?;
-    let snap_b = TreeSnapshot::from_tree(tree_b)?;
+    let snap_a = TreeSnapshot::from_tree(tree_a, false)?;
+    let snap_b = TreeSnapshot::from_tree(tree_b, false)?;
 
     Ok(weighted_rf_from_snapshots(&snap_a, &snap_b))
 }
@@ -179,8 +179,8 @@ pub fn weighted_rf_from_snapshots(a: &TreeSnapshot, b: &TreeSnapshot) -> f64 {
 /// # Errors
 /// Returns `TreeError` if trees have different leaf sets or are malformed.
 pub fn kuhner_felsenstein(tree_a: &PhyloTree, tree_b: &PhyloTree) -> Result<f64, TreeError> {
-    let snap_a = TreeSnapshot::from_tree(tree_a)?;
-    let snap_b = TreeSnapshot::from_tree(tree_b)?;
+    let snap_a = TreeSnapshot::from_tree(tree_a, false)?;
+    let snap_b = TreeSnapshot::from_tree(tree_b, false)?;
 
     Ok(kf_from_snapshots(&snap_a, &snap_b))
 }
