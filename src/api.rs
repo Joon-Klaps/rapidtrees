@@ -6,6 +6,7 @@
 use phylotree::tree::Tree as PhyloTree;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyIterator;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -287,6 +288,150 @@ fn pairwise_rf_from_newicks(
     Ok((names, matrix))
 }
 
+/// Compute pairwise Robinson-Foulds distances from a Python iterator of newick strings.
+///
+/// Unlike `pairwise_rf_from_newicks`, this accepts a lazy Python iterator so that
+/// only one newick string needs to be in memory at a time. Each newick is parsed
+/// into a compact `TreeSnapshot` immediately and the raw string is discarded.
+///
+/// Args:
+///     names: List of tree identifiers (one per newick)
+///     newick_iter: Python iterator yielding newick strings
+///     translate_maps: List of translate maps (number → taxon name)
+///     map_indices: Per-tree index into translate_maps
+///     rooted: If True compare clades; if False compare bipartitions (default: False)
+///
+/// Returns:
+///     A tuple of (tree_names, distance_matrix)
+///
+/// Raises:
+///     ValueError: If lengths mismatch, indices are out of bounds, trees have
+///                 different leaf sets, or fewer than 2 trees
+#[pyfunction]
+#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false))]
+fn pairwise_rf_from_newick_iter(
+    names: Vec<String>,
+    newick_iter: Bound<'_, PyIterator>,
+    translate_maps: Vec<HashMap<String, String>>,
+    map_indices: Vec<usize>,
+    rooted: bool,
+) -> PyResult<(Vec<String>, Vec<Vec<usize>>)> {
+    let n = names.len();
+
+    if n != map_indices.len() {
+        return Err(PyValueError::new_err(format!(
+            "names length ({}) must equal map_indices length ({})",
+            n,
+            map_indices.len()
+        )));
+    }
+
+    // Validate map_indices upfront
+    for (i, &idx) in map_indices.iter().enumerate() {
+        if idx >= translate_maps.len() {
+            return Err(PyValueError::new_err(format!(
+                "map_indices[{}] = {} is out of bounds (only {} translate maps provided)",
+                i, idx, translate_maps.len()
+            )));
+        }
+    }
+
+    let mut snapshots: Vec<TreeSnapshot> = Vec::with_capacity(n);
+    let mut reference_leaves: Option<HashSet<String>> = None;
+    let mut tree_count: usize = 0;
+
+    for item in newick_iter {
+        let item = item?;
+        let newick: String = item.extract()?;
+
+        if tree_count >= n {
+            return Err(PyValueError::new_err(format!(
+                "Iterator yielded more than {} newick strings (expected {})",
+                n, n
+            )));
+        }
+
+        let map_idx = map_indices[tree_count];
+        let clean = strip_beast_annotations(&newick);
+        let mut tree = PhyloTree::from_newick(&clean).map_err(|e| {
+            PyValueError::new_err(format!(
+                "Failed to parse newick at index {}: {}",
+                tree_count, e
+            ))
+        })?;
+        rename_leaf_nodes(&mut tree, &translate_maps[map_idx]);
+
+        // Incremental sanity check: verify leaf set matches the first tree
+        let leaves: HashSet<String> = tree
+            .get_leaves()
+            .iter()
+            .filter_map(|&id| tree.get(&id).ok()?.name.clone())
+            .collect();
+
+        match &reference_leaves {
+            None => {
+                reference_leaves = Some(leaves);
+            }
+            Some(ref_leaves) => {
+                if leaves.len() != ref_leaves.len() {
+                    return Err(PyValueError::new_err(format!(
+                        "Tree {} has {} leaves, but tree 0 has {} leaves. All trees must have the same number of leaves.",
+                        tree_count, leaves.len(), ref_leaves.len()
+                    )));
+                }
+                if leaves != *ref_leaves {
+                    return Err(PyValueError::new_err(format!(
+                        "Tree {} has different leaf set than tree 0. All trees must have the same taxa.",
+                        tree_count
+                    )));
+                }
+            }
+        }
+
+        let snapshot = TreeSnapshot::from_tree(&tree, rooted).map_err(|e| {
+            PyValueError::new_err(format!(
+                "Failed to create tree snapshot at index {}: {}",
+                tree_count, e
+            ))
+        })?;
+        snapshots.push(snapshot);
+        tree_count += 1;
+        // `newick` and `tree` are dropped here — only snapshot remains
+    }
+
+    if tree_count != n {
+        return Err(PyValueError::new_err(format!(
+            "Iterator yielded {} newick strings, but names has {} entries",
+            tree_count, n
+        )));
+    }
+
+    if tree_count < 2 {
+        return Err(PyValueError::new_err(
+            "Need at least 2 trees to compute pairwise distances",
+        ));
+    }
+
+    // Parallel pairwise RF computation (same as pairwise_rf_from_newicks)
+    let mut matrix = vec![vec![0usize; tree_count]; tree_count];
+
+    let pairs: Vec<(usize, usize, usize)> = (0..tree_count)
+        .into_par_iter()
+        .flat_map_iter(|i| (i + 1..tree_count).map(move |j| (i, j)))
+        .map(|(i, j)| {
+            let dist = rf_from_snapshots(&snapshots[i], &snapshots[j]);
+            (i, j, dist)
+        })
+        .collect();
+
+    for (i, j, dist) in pairs {
+        matrix[i][j] = dist;
+        matrix[j][i] = dist;
+    }
+
+    Ok((names, matrix))
+}
+
 /// Helper function to read trees from multiple files
 fn read_all_trees(
     paths: &[String],
@@ -384,5 +529,6 @@ fn rust_python_tree_distances(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pairwise_weighted_rf, m)?)?;
     m.add_function(wrap_pyfunction!(pairwise_kf, m)?)?;
     m.add_function(wrap_pyfunction!(pairwise_rf_from_newicks, m)?)?;
+    m.add_function(wrap_pyfunction!(pairwise_rf_from_newick_iter, m)?)?;
     Ok(())
 }
