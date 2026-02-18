@@ -6,7 +6,7 @@
 use phylotree::tree::Tree as PhyloTree;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyIterator;
+use pyo3::types::{PyBytes, PyIterator};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -302,7 +302,10 @@ fn pairwise_rf_from_newicks(
 ///     rooted: If True compare clades; if False compare bipartitions (default: False)
 ///
 /// Returns:
-///     A tuple of (tree_names, distance_matrix)
+///     A tuple of (tree_names, matrix_bytes) where matrix_bytes is a bytes
+///     object containing the n×n distance matrix as row-major native-endian
+///     u32 values.  Python reconstructs the numpy array via:
+///         np.frombuffer(matrix_bytes, dtype=np.uint32).reshape(n, n).copy()
 ///
 /// Raises:
 ///     ValueError: If lengths mismatch, indices are out of bounds, trees have
@@ -310,12 +313,13 @@ fn pairwise_rf_from_newicks(
 #[pyfunction]
 #[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false))]
 fn pairwise_rf_from_newick_iter(
+    py: Python<'_>,
     names: Vec<String>,
     newick_iter: Bound<'_, PyIterator>,
     translate_maps: Vec<HashMap<String, String>>,
     map_indices: Vec<usize>,
     rooted: bool,
-) -> PyResult<(Vec<String>, Vec<Vec<usize>>)> {
+) -> PyResult<(Vec<String>, Py<PyAny>)> {
     let n = names.len();
 
     if n != map_indices.len() {
@@ -412,8 +416,8 @@ fn pairwise_rf_from_newick_iter(
         ));
     }
 
-    // Parallel pairwise RF computation (same as pairwise_rf_from_newicks)
-    let mut matrix = vec![vec![0usize; tree_count]; tree_count];
+    // Parallel pairwise RF computation — pack directly into flat u32 bytes
+    let mut matrix_bytes = vec![0u8; tree_count * tree_count * 4];
 
     let pairs: Vec<(usize, usize, usize)> = (0..tree_count)
         .into_par_iter()
@@ -425,11 +429,15 @@ fn pairwise_rf_from_newick_iter(
         .collect();
 
     for (i, j, dist) in pairs {
-        matrix[i][j] = dist;
-        matrix[j][i] = dist;
+        let bytes = (dist as u32).to_ne_bytes();
+        let idx_ij = (i * tree_count + j) * 4;
+        let idx_ji = (j * tree_count + i) * 4;
+        matrix_bytes[idx_ij..idx_ij + 4].copy_from_slice(&bytes);
+        matrix_bytes[idx_ji..idx_ji + 4].copy_from_slice(&bytes);
     }
 
-    Ok((names, matrix))
+    let py_bytes = PyBytes::new(py, &matrix_bytes);
+    Ok((names, py_bytes.into()))
 }
 
 /// Helper function to read trees from multiple files
