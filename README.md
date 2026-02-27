@@ -1,4 +1,10 @@
-# rapidtrees CLI
+# rapidtrees
+
+[![Crates.io](https://img.shields.io/crates/v/rapidtrees.svg)](https://crates.io/crates/rapidtrees)
+[![PyPI](https://img.shields.io/pypi/v/rapidtrees.svg)](https://pypi.org/project/rapidtrees)
+[![CI](https://github.com/Joon-Klaps/rapidtrees/actions/workflows/ci.yml/badge.svg)](https://github.com/Joon-Klaps/rapidtrees/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/Joon-Klaps/rapidtrees/branch/master/graph/badge.svg)](https://codecov.io/gh/Joon-Klaps/rapidtrees)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Compute pairwise tree distances (Robinson–Foulds, weighted RF, Kuhner–Felsenstein) from BEAST/NEXUS `.trees` files and write a labeled distance matrix.
 
@@ -8,31 +14,32 @@ Compute pairwise tree distances (Robinson–Foulds, weighted RF, Kuhner–Felsen
 - **Weighted RF**: ~3.5s total → **~2.3M comparisons/sec**
 - **Kuhner-Felsenstein (KF)**: ~3.5s total → **~2.3M comparisons/sec**
 
-## Install / Build
+## Install
 
-Requirements: Rust toolchain (stable). Then build the binary:
+### Python (PyPI)
 
-> [!NOTE]
-> Install the Rust toolchain from https://rustup.rs/ if you don't have it yet.
->
-> ```bash
-> curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-> ```
+```bash
+pip install rapidtrees
+```
 
-Clone the repository:
+No Rust toolchain required — pre-built wheels are available for Linux, macOS, and Windows.
+
+### CLI (crates.io)
+
+```bash
+cargo install rapidtrees
+```
+
+Requires the Rust toolchain. Install it from https://rustup.rs/ if you don't have it yet.
+
+### From source
 
 ```bash
 git clone https://github.com/Joon-Klaps/rapidtrees.git
-```
-
-Build the project:
-
-```bash
 cd rapidtrees
-cargo build --release
+cargo build --release          # CLI binary → target/release/rapidtrees
+pip install -e .               # Python bindings (requires Rust toolchain)
 ```
-
-The executable will be at `target/release/rapidtrees`.
 
 ## Usage
 
@@ -134,7 +141,6 @@ Various output (on a MacBook Pro M1):
 | 5000     | 10000     | 100.0M       | 30.92 GB    | Skipped (>30GB) | -                | -                |
 | 5000     | 100000    | 10.0B        | 309.21 GB   | Skipped (>30GB) | -                | -                |
 
-
 ## Troubleshooting
 
 - If no trees are parsed, verify the input is a valid NEXUS `.trees` file and adjust `--burnin-*` settings.
@@ -149,15 +155,8 @@ The package also provides Python bindings for easy integration into Python workf
 
 ### Installation
 
-From source (requires Rust):
-
 ```bash
-# Using pip (recommended)
-pip install -e .
-
-# Or using maturin directly
-pip install maturin
-maturin develop --release
+pip install rapidtrees
 ```
 
 ### Quick Start
