@@ -2,6 +2,13 @@
 name = "rapidtrees"
 version = "0.2.2"
 edition = "2024"
+description = "Fast pairwise tree distance calculations (Robinson-Foulds, Weighted RF, Kuhner-Felsenstein) for phylogenetic trees"
+license = "MIT"
+repository = "https://github.com/Joon-Klaps/rapidtrees"
+homepage = "https://github.com/Joon-Klaps/rapidtrees"
+readme = "README.md"
+keywords = ["phylogenetics", "tree-distance", "robinson-foulds", "bioinformatics"]
+categories = ["science", "command-line-utilities"]
 
 [lib]
 name = "rapidtrees"
