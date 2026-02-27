@@ -1,50 +1,89 @@
-# rapidtrees
+# 🌲⚡ rapidtrees
 
-[![Crates.io](https://img.shields.io/crates/v/rapidtrees.svg)](https://crates.io/crates/rapidtrees)
-[![PyPI](https://img.shields.io/pypi/v/rapidtrees.svg)](https://pypi.org/project/rapidtrees)
-[![CI](https://github.com/Joon-Klaps/rapidtrees/actions/workflows/ci.yml/badge.svg)](https://github.com/Joon-Klaps/rapidtrees/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/Joon-Klaps/rapidtrees/branch/master/graph/badge.svg)](https://codecov.io/gh/Joon-Klaps/rapidtrees)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+<p align="center">
+  <em>Blazingly fast pairwise phylogenetic tree distance calculations — Robinson–Foulds, Weighted RF, and Kuhner–Felsenstein — powered by Rust</em>
+</p>
 
-Compute pairwise tree distances (Robinson–Foulds, weighted RF, Kuhner–Felsenstein) from BEAST/NEXUS `.trees` files and write a labeled distance matrix.
+<p align="center">
+  <a href="https://crates.io/crates/rapidtrees"><img src="https://img.shields.io/crates/v/rapidtrees.svg?style=flat-square&logo=rust&logoColor=white" alt="Crates.io" /></a>
+  <a href="https://pypi.org/project/rapidtrees"><img src="https://img.shields.io/pypi/v/rapidtrees.svg?style=flat-square&logo=python&logoColor=white" alt="PyPI" /></a>
+  <a href="https://github.com/Joon-Klaps/rapidtrees/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Joon-Klaps/rapidtrees/ci.yml?style=flat-square&logo=github&label=CI" alt="CI" /></a>
+  <a href="https://codecov.io/gh/Joon-Klaps/rapidtrees"><img src="https://img.shields.io/codecov/c/github/Joon-Klaps/rapidtrees?style=flat-square&logo=codecov" alt="Coverage" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square" alt="License: MIT" /></a>
+</p>
 
-## Performance ZIKA dataset (283 taxa, 4000 trees, ~8M comparisons)
+<p align="center">
+  <a href="#%EF%B8%8F-overview">Overview</a> •
+  <a href="#-installing">Installing</a> •
+  <a href="#-usage">Usage</a> •
+  <a href="#-python-api">Python API</a> •
+  <a href="#%EF%B8%8F-benchmarks">Benchmarks</a>
+</p>
 
-- **Robinson-Foulds (RF)**: ~3.5s total → **~2.3M comparisons/sec**
-- **Weighted RF**: ~3.5s total → **~2.3M comparisons/sec**
-- **Kuhner-Felsenstein (KF)**: ~3.5s total → **~2.3M comparisons/sec**
+---
 
-## Install
+## 🗺️ Overview
 
-### Python (PyPI)
+`rapidtrees` computes pairwise tree distances from [BEAST](https://beast.community/)/NEXUS `.trees` files and writes a labeled distance matrix. Three metrics are supported:
+
+| Metric             | Flag                | Output  | Description                                   |
+| ------------------ | ------------------- | ------- | --------------------------------------------- |
+| Robinson–Foulds    | `--metric rf`       | integer | Symmetric difference of bipartitions          |
+| Weighted RF        | `--metric weighted` | float   | Branch-length-weighted bipartition difference |
+| Kuhner–Felsenstein | `--metric kf`       | float   | Euclidean distance on branch lengths          |
+
+### ✨ Why `rapidtrees`?
+
+- 🦀 **Rust core** — zero-overhead bitset operations with a cache-friendly memory layout
+- 🔀 **Parallel by default** — powered by [`rayon`](https://github.com/rayon-rs/rayon), automatically scales across all cores
+- 🐍 **Python bindings** — drop into any Python/NumPy workflow via [`PyO3`](https://pyo3.rs/)
+- 📦 **No Rust toolchain required** — pre-built wheels on PyPI for Linux, macOS, and Windows
+- 🗜️ **Gzip output** — stream directly to `.tsv.gz` without a separate compression step
+
+### 🚀 Performance
+
+Benchmarked on a ZIKA dataset (283 taxa · 4 000 trees · ~8 M comparisons):
+
+| Metric             | Total time | Throughput                 |
+| ------------------ | ---------- | -------------------------- |
+| Robinson-Foulds    | ~3.5 s     | **~2.3 M comparisons/sec** |
+| Weighted RF        | ~3.5 s     | **~2.3 M comparisons/sec** |
+| Kuhner-Felsenstein | ~3.5 s     | **~2.3 M comparisons/sec** |
+
+---
+
+## 🔧 Installing
+
+### 🐍 Python (PyPI) — _recommended_
+
+Pre-built wheels for Linux, macOS, and Windows. No Rust toolchain needed.
 
 ```bash
 pip install rapidtrees
 ```
 
-No Rust toolchain required — pre-built wheels are available for Linux, macOS, and Windows.
+### 🦀 CLI (crates.io)
 
-### CLI (crates.io)
+Install the standalone command-line binary. Requires the [Rust toolchain](https://rustup.rs/).
 
 ```bash
 cargo install rapidtrees
 ```
 
-Requires the Rust toolchain. Install it from https://rustup.rs/ if you don't have it yet.
-
-### From source
+### 🛠️ From source
 
 ```bash
 git clone https://github.com/Joon-Klaps/rapidtrees.git
 cd rapidtrees
-cargo build --release          # CLI binary → target/release/rapidtrees
-pip install -e .               # Python bindings (requires Rust toolchain)
+cargo build --release   # CLI binary → target/release/rapidtrees
+pip install -e .        # Python bindings (requires Rust toolchain + maturin)
 ```
 
-## Usage
+---
+
+## 💻 Usage
 
 ```bash
-# if rapidtrees is not in your PATH, use the full path, e.g. ./target/release/rapidtrees
 rapidtrees \
   --input <path/to/file.trees> \
   --output <path/to/output.tsv[.gz]> \
@@ -55,21 +94,22 @@ rapidtrees \
   [-q|--quiet]
 ```
 
-Flags and options:
+| Flag                          | Description                                                        |
+| ----------------------------- | ------------------------------------------------------------------ |
+| `-i, --input <INPUT>`         | Path to BEAST `.trees` (NEXUS) file                                |
+| `-o, --output <OUTPUT>`       | Output path. Use `.gz` suffix for gzip compression; `-` for stdout |
+| `-t, --burnin-trees <N>`      | Drop the first N trees (default: `0`)                              |
+| `-s, --burnin-states <STATE>` | Keep only trees with `STATE > STATE` (default: `0`)                |
+| `--use-real-taxa`             | Map numeric taxon IDs via the TRANSLATE block                      |
+| `--metric <rf\|weighted\|kf>` | Distance metric (default: `rf`)                                    |
+| `-q, --quiet`                 | Suppress progress messages (errors still go to stderr)             |
 
-- `-i, --input <INPUT>`: Path to BEAST `.trees` (NEXUS) file.
-- `-o, --output <OUTPUT>`: Output path for the TSV distance matrix. If the path ends with `.gz` it will be gzip-compressed. Use `-` to write to stdout (uncompressed).
-- `-t, --burnin-trees <N>`: Drop the first N trees (default: 0).
-- `-s, --burnin-states <STATE>`: Keep only trees with `STATE_ > STATE` (default: 0).
-- `--use-real-taxa`: Map numeric taxon IDs to labels using the TRANSLATE block if present.
-- `--metric <rf|weighted|kf>`: Choose the distance metric (default: `rf`), weighted referring to weighted RF.
-- `-q, --quiet`: Suppress progress messages on stdout. Errors still go to stderr.
+The output is a **square TSV matrix** where both the header row and first column contain tree names formatted as `<file_basename>_tree_STATE<state>`. Use `-o -` to write to stdout for easy piping.
 
-The output is a square TSV matrix where both the header row and the first column are tree names, constructed as `<file_basename>_tree_STATE<state>`. When writing to stdout (`-o -`), the matrix is printed to stdout, allowing easy piping.
+### 💡 Examples
 
-## Examples
-
-- Compute RF matrix and write to gzipped file:
+<details open>
+<summary><strong>Compute RF matrix → gzipped file</strong></summary>
 
 ```bash
 rapidtrees \
@@ -85,13 +125,16 @@ rapidtrees \
 # Writing to output 0.000s
 ```
 
-- Apply burn-in by tree count and state:
+</details>
+
+<details>
+<summary><strong>Apply burn-in by tree count</strong></summary>
 
 ```bash
-rapidtrees \                                                                                                      2 ↵
+rapidtrees \
   -i tests/data/hiv1.trees \
   -o out/hiv1_rf.tsv \
-  -t 2 \
+  -t 2
 
 # Reading in beast 0.003s
 # Read in 162 taxons for 19 trees
@@ -101,18 +144,49 @@ rapidtrees \                                                                    
 # Writing to output 0.000s
 ```
 
-## Performance notes
+</details>
 
-- Trees are parsed once. Bitset snapshots are built once and reused for pairwise comparisons. Parallelism is provided by `rayon`.
-- Weighted RF and KF produce floating-point matrices; RF produces integer matrices.
+---
 
-## Benchmarks
+## 🐍 Python API
 
-We provide a benchmark suite to evaluate both memory usage and runtime performance for varying dataset sizes.
+`rapidtrees` ships Python bindings for seamless integration into Python workflows.
 
-This will output a table showing estimated memory usage, wall-clock time, and CPU time for pairwise distance calculations.
+```python
+import rapidtrees as rtd
 
-Various output (on a MacBook Pro M1):
+# Robinson-Foulds distances
+tree_names, rf_matrix = rtd.pairwise_rf(
+    paths=["file1.trees", "file2.trees"],
+    burnin_trees=10,    # skip first 10 trees per file
+    burnin_states=0,    # skip trees with STATE < 0
+    use_real_taxa=True  # use TRANSLATE block when merging multiple files
+)
+
+# Weighted RF (considers branch lengths)
+tree_names, wrf_matrix = rtd.pairwise_weighted_rf(
+    paths=["file1.trees"],
+    burnin_trees=10
+)
+
+# Kuhner-Felsenstein distances
+tree_names, kf_matrix = rtd.pairwise_kf(
+    paths=["file1.trees"],
+    burnin_trees=10
+)
+
+print(f"Computed distances for {len(tree_names)} trees")
+print(f"RF distance between tree 0 and 1: {rf_matrix[0][1]}")
+```
+
+---
+
+## ⏱️ Benchmarks
+
+Benchmarks were run on a MacBook Pro M1. Trees are parsed **once** and bitset snapshots are reused across all pairwise comparisons. Parallelism is provided by [`rayon`](https://github.com/rayon-rs/rayon) — no manual thread management needed.
+
+<details>
+<summary><strong>Show full benchmark table</strong></summary>
 
 | Taxa (N) | Trees (T) | Combinations | Est. Memory | Actual Memory   | Wall Time        | CPU Time         |
 | -------- | --------- | ------------ | ----------- | --------------- | ---------------- | ---------------- |
@@ -141,50 +215,20 @@ Various output (on a MacBook Pro M1):
 | 5000     | 10000     | 100.0M       | 30.92 GB    | Skipped (>30GB) | -                | -                |
 | 5000     | 100000    | 10.0B        | 309.21 GB   | Skipped (>30GB) | -                | -                |
 
-## Troubleshooting
+</details>
 
-- If no trees are parsed, verify the input is a valid NEXUS `.trees` file and adjust `--burnin-*` settings.
-- Use `-q` when writing to stdout and piping to other tools to suppress timing messages.
-- For gzipped output, ensure the output filename ends with `.gz`.
+> **Note:** Weighted RF and KF produce floating-point matrices; RF produces integer matrices.
 
 ---
 
-## Python API
+## 🔍 Troubleshooting
 
-The package also provides Python bindings for easy integration into Python workflows.
+- **No trees parsed?** Verify the input is a valid NEXUS `.trees` file and adjust `--burnin-*` settings.
+- **Piping to other tools?** Use `-q` to suppress timing messages on stdout.
+- **Gzipped output not working?** Ensure the output filename ends with `.gz`.
 
-### Installation
+---
 
-```bash
-pip install rapidtrees
-```
+## ⚖️ License
 
-### Quick Start
-
-```python
-import rapidtrees as rtd
-
-# Compute Robinson-Foulds distances
-tree_names, rf_matrix = rtd.pairwise_rf(
-    paths=["file1.trees", "file2.trees"],
-    burnin_trees=10,  # Skip first 10 trees from each file
-    burnin_states=0,   # Skip trees with STATE < 0
-    use_real_taxa=True # Use TRANSLATE block if available, set to true if multiple files are provided
-)
-
-# Compute Weighted RF distances (considers branch lengths)
-tree_names, wrf_matrix = rtd.pairwise_weighted_rf(
-    paths=["file1.trees"],
-    burnin_trees=10
-)
-
-# Compute Kuhner-Felsenstein distances
-tree_names, kf_matrix = rtd.pairwise_kf(
-    paths=["file1.trees"],
-    burnin_trees=10
-)
-
-# Output is a list of tree names and a 2D distance matrix
-print(f"Computed distances for {len(tree_names)} trees")
-print(f"RF distance between tree 0 and 1: {rf_matrix[0][1]}")
-```
+`rapidtrees` is provided under the [MIT License](LICENSE).
