@@ -1,0 +1,146 @@
+name: Publish to PyPI
+
+on:
+    release:
+        types: ["published"]
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+jobs:
+    # ── Validate tag matches Cargo.toml version ──────────────────────────
+    validate-release-tag:
+        name: Validate git tag
+        runs-on: ubuntu-latest
+        if: github.event_name == 'release'
+        steps:
+            - uses: actions/checkout@v4
+            - name: Compare git tag with Cargo.toml version
+              run: |
+                  PUSHED_TAG=${GITHUB_REF##*/}
+                  CURR_VER=$( grep '^version' Cargo.toml | head -n 1 | awk '{print $3}' | tr -d '"' )
+                  if [[ "${PUSHED_TAG}" != "v${CURR_VER}" ]]; then
+                    echo "::error::Cargo.toml has version ${CURR_VER}, but tag is ${PUSHED_TAG} (expected v${CURR_VER})"
+                    exit 1
+                  fi
+
+    # ── Build PyPI wheels: Linux ─────────────────────────────────────────
+    build-linux:
+        name: Build wheels (Linux ${{ matrix.target }})
+        needs: validate-release-tag
+        if: always() && (needs.validate-release-tag.result == 'success' || needs.validate-release-tag.result == 'skipped')
+        runs-on: ubuntu-latest
+        strategy:
+            fail-fast: false
+            matrix:
+                target: [x86_64, aarch64]
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-python@v5
+              with:
+                  python-version: "3.x"
+            - name: Build wheels
+              uses: PyO3/maturin-action@v1
+              with:
+                  target: ${{ matrix.target }}
+                  args: --release --out dist --find-interpreter
+                  sccache: "true"
+                  manylinux: auto
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: wheels-linux-${{ matrix.target }}
+                  path: dist
+
+    # ── Build PyPI wheels: macOS ─────────────────────────────────────────
+    build-macos:
+        name: Build wheels (macOS ${{ matrix.target }})
+        needs: validate-release-tag
+        if: always() && (needs.validate-release-tag.result == 'success' || needs.validate-release-tag.result == 'skipped')
+        runs-on: ${{ matrix.runner }}
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - runner: macos-13
+                      target: x86_64
+                    - runner: macos-14
+                      target: aarch64
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-python@v5
+              with:
+                  python-version: "3.x"
+            - name: Build wheels
+              uses: PyO3/maturin-action@v1
+              with:
+                  target: ${{ matrix.target }}
+                  args: --release --out dist --find-interpreter
+                  sccache: "true"
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: wheels-macos-${{ matrix.target }}
+                  path: dist
+
+    # ── Build PyPI wheels: Windows ───────────────────────────────────────
+    build-windows:
+        name: Build wheels (Windows x64)
+        needs: validate-release-tag
+        if: always() && (needs.validate-release-tag.result == 'success' || needs.validate-release-tag.result == 'skipped')
+        runs-on: windows-latest
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-python@v5
+              with:
+                  python-version: "3.x"
+                  architecture: x64
+            - name: Build wheels
+              uses: PyO3/maturin-action@v1
+              with:
+                  target: x64
+                  args: --release --out dist --find-interpreter
+                  sccache: "true"
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: wheels-windows-x64
+                  path: dist
+
+    # ── Build source distribution ────────────────────────────────────────
+    build-sdist:
+        name: Build source distribution
+        needs: validate-release-tag
+        if: always() && (needs.validate-release-tag.result == 'success' || needs.validate-release-tag.result == 'skipped')
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - name: Build sdist
+              uses: PyO3/maturin-action@v1
+              with:
+                  command: sdist
+                  args: --out dist
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: wheels-sdist
+                  path: dist
+
+    # ── Publish to PyPI ──────────────────────────────────────────────────
+    publish-pypi:
+        name: Publish to PyPI
+        runs-on: ubuntu-latest
+        needs: [build-linux, build-macos, build-windows, build-sdist]
+        if: github.event_name == 'release'
+        environment:
+            name: pypi
+            url: https://pypi.org/p/rapidtrees
+        permissions:
+            id-token: write
+        steps:
+            - uses: actions/download-artifact@v4
+              with:
+                  pattern: wheels-*
+                  merge-multiple: true
+                  path: dist
+            - name: List dist files
+              run: ls -lh dist/
+            - name: Publish to PyPI
+              uses: pypa/gh-action-pypi-publish@release/v1

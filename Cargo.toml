@@ -1,14 +1,14 @@
 [package]
-name = "rust-python-tree-distances"
-version = "0.2.1"
+name = "rapidtrees"
+version = "0.2.2"
 edition = "2024"
 
 [lib]
-name = "rust_python_tree_distances"
+name = "rapidtrees"
 crate-type = ["rlib", "cdylib"]
 
 [[bin]]
-name = "rust-python-tree-distances"
+name = "rapidtrees"
 path = "src/main.rs"
 required-features = []
 
