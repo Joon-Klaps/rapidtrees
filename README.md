@@ -103,12 +103,6 @@ rapidtrees \                                                                    
 
 We provide a benchmark suite to evaluate both memory usage and runtime performance for varying dataset sizes.
 
-To run the benchmark:
-
-```bash
-cargo bench --bench memory_time_benchmark
-```
-
 This will output a table showing estimated memory usage, wall-clock time, and CPU time for pairwise distance calculations.
 
 Various output (on a MacBook Pro M1):
