@@ -20,8 +20,8 @@ jobs:
               run: |
                   PUSHED_TAG=${GITHUB_REF##*/}
                   CURR_VER=$( grep '^version' Cargo.toml | head -n 1 | awk '{print $3}' | tr -d '"' )
-                  if [[ "${PUSHED_TAG}" != "v${CURR_VER}" ]]; then
-                    echo "::error::Cargo.toml has version ${CURR_VER}, but tag is ${PUSHED_TAG} (expected v${CURR_VER})"
+                  if [[ "${PUSHED_TAG}" != "${CURR_VER}" ]]; then
+                    echo "::error::Cargo.toml has version ${CURR_VER}, but tag is ${PUSHED_TAG} (expected ${CURR_VER})"
                     exit 1
                   fi
 
