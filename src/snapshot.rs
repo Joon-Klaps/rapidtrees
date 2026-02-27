@@ -71,7 +71,6 @@ impl TreeSnapshot {
     ///
     /// # Parameters
     /// - `tree`: The phylogenetic tree to extract partitions from
-    /// - `include_trivial`: If true, includes single-leaf partitions (needed for weighted metrics like Robinson-Foulds and Kuhner-Felsenstein)
     ///
     /// # Algorithm
     /// 1. Extract leaf names and sort them alphabetically for consistency
