@@ -10,9 +10,9 @@ use std::time::Instant;
 /// and write a labeled distance matrix (TSV) where row/column names are tree names.
 #[derive(Parser, Debug)]
 #[command(
-    name = "tree-dists",
+    name = "rapidtrees",
     version,
-    about = "Pairwise RF distance matrix for BEAST trees"
+    about = "Fast pairwise tree distance calculations (Robinson-Foulds, Weighted RF, Kuhner-Felsenstein) for phylogenetic trees"
 )]
 struct Args {
     /// Path to BEAST .trees (NEXUS) file
