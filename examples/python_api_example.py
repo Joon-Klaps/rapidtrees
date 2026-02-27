@@ -1,8 +1,8 @@
 """
-Example usage of rust_python_tree_distances Python API
+Example usage of rapidtrees Python API
 """
 
-import rust_python_tree_distances as rtd
+import rapidtrees
 
 # Example: Compute Robinson-Foulds distances from multiple tree files
 def example_rf():
@@ -16,7 +16,7 @@ def example_rf():
     # - burnin_trees: skip first N trees from each file
     # - burnin_states: skip trees with STATE < N
     # - use_real_taxa: use TRANSLATE block when available
-    tree_names, distance_matrix = rtd.pairwise_rf(
+    tree_names, distance_matrix = rapidtrees.pairwise_rf(
         paths=tree_files,
         burnin_trees=10,
         burnin_states=0,
@@ -44,7 +44,7 @@ def example_rf():
 def example_weighted_rf():
     tree_files = ["tests/data/hiv1.trees"]
 
-    tree_names, distance_matrix = rtd.pairwise_weighted_rf(
+    tree_names, distance_matrix = rapidtrees.pairwise_weighted_rf(
         paths=tree_files,
         burnin_trees=5,
     )
@@ -57,7 +57,7 @@ def example_weighted_rf():
 def example_kf():
     tree_files = ["tests/data/hiv1.trees"]
 
-    tree_names, distance_matrix = rtd.pairwise_kf(
+    tree_names, distance_matrix = rapidtrees.pairwise_kf(
         paths=tree_files,
         burnin_trees=5,
     )

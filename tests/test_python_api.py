@@ -11,7 +11,7 @@ from pathlib import Path
 
 # Try to import the module
 try:
-    import rust_python_tree_distances as rtd
+    import rapidtrees as rtd
     RUST_MODULE_AVAILABLE = True
 except ImportError:
     RUST_MODULE_AVAILABLE = False
@@ -22,7 +22,7 @@ TEST_DATA = Path(__file__).parent / "data"
 # Mark all tests to skip if module not available
 pytestmark = pytest.mark.skipif(
     not RUST_MODULE_AVAILABLE,
-    reason="rust_python_tree_distances module not installed. Run: maturin develop --release --features python"
+    reason="rapidtrees module not installed. Run: maturin develop --release --features python"
 )
 
 

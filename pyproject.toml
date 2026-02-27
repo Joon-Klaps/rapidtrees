@@ -3,13 +3,13 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "rust-python-tree-distances"
-version = "0.2.1"
+name = "rapidtrees"
+version = "0.2.2"
 description = "Fast tree distance calculations (Robinson-Foulds, Weighted RF, Kuhner-Felsenstein) for phylogenetic trees"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-keywords = ["phylogenetics", "tree-distance", "robinson-foulds", "bioinformatics"]
+keywords = ["phylogenetics", "tree-distance", "robinson-foulds"," "bioinformatics","kuhner-felsenstein"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
@@ -25,9 +25,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Joon-Klaps/rust-python-tree-distances"
-Repository = "https://github.com/Joon-Klaps/rust-python-tree-distances"
+Homepage = "https://github.com/Joon-Klaps/rapidtrees"
+Repository = "https://github.com/Joon-Klaps/rapidtrees"
 
 [tool.maturin]
 features = ["python"]
-module-name = "rust_python_tree_distances"
+module-name = "rapidtrees"
