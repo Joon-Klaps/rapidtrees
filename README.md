@@ -134,7 +134,6 @@ Various output (on a MacBook Pro M1):
 | 5000     | 10000     | 100.0M       | 30.92 GB    | Skipped (>30GB) | -                | -                |
 | 5000     | 100000    | 10.0B        | 309.21 GB   | Skipped (>30GB) | -                | -                |
 
-_Note: Times for large T are extrapolated from a smaller sample of comparisons._
 
 ## Troubleshooting
 

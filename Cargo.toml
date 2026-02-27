@@ -24,3 +24,13 @@ rustc-hash = "2.1"
 [features]
 default = []
 python = ["pyo3"]
+
+[dev-dependencies]
+rand = "0.9.2"
+criterion = "0.7.0"
+cpu-time = "1.0.0"
+memory-stats = "1.0.0"
+
+[[bench]]
+name = "memory_time_benchmark"
+harness = false
