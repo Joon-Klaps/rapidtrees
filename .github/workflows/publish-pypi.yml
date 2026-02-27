@@ -128,6 +128,7 @@ jobs:
         name: Publish to PyPI
         runs-on: ubuntu-latest
         needs: [build-linux, build-macos, build-windows, build-sdist]
+        if: always() && needs.build-linux.result == 'success' && needs.build-macos.result == 'success' && needs.build-windows.result == 'success' && needs.build-sdist.result == 'success'
         environment:
             name: pypi
             url: https://pypi.org/p/rapidtrees
