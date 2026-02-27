@@ -9,7 +9,7 @@ description = "Fast tree distance calculations (Robinson-Foulds, Weighted RF, Ku
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-keywords = ["phylogenetics", "tree-distance", "robinson-foulds"," "bioinformatics","kuhner-felsenstein"]
+keywords = ["phylogenetics", "tree-distance", "robinson-foulds", "bioinformatics", "kuhner-felsenstein" ]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
