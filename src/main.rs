@@ -39,6 +39,10 @@ struct Args {
     #[arg(long = "metric", value_enum, default_value_t = MetricArg::Rf)]
     metric: MetricArg,
 
+    /// Compute rooted distances (compare clades) instead of unrooted (compare bipartitions)
+    #[arg(long = "rooted", default_value_t = false)]
+    rooted: bool,
+
     /// Quiet mode: suppresses progress messages on stdout
     #[arg(short = 'q', long = "quiet", default_value_t = false)]
     quiet: bool,
@@ -82,7 +86,7 @@ fn main() {
     let t1 = Instant::now();
     let snaps: Vec<TreeSnapshot> = trees
         .iter()
-        .map(TreeSnapshot::from_tree)
+        .map(|t| TreeSnapshot::from_tree(t, args.rooted))
         .collect::<Result<Vec<_>, _>>()
         .unwrap_or_else(|e| {
             eprintln!("Failed to build snapshots: {e}");

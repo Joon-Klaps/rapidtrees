@@ -82,7 +82,7 @@ impl TreeSnapshot {
     ///
     /// # Errors
     /// Returns `TreeError` if the tree is empty, malformed, or has unnamed leaves.
-    pub fn from_tree(tree: &PhyloTree) -> Result<Self, TreeError> {
+    pub fn from_tree(tree: &PhyloTree, rooted_mode: bool) -> Result<Self, TreeError> {
         let rooted = tree.is_rooted()?;
         // Step 1: Extract leaf names and sort them alphabetically
         let mut leaf_names: Vec<(usize, String)> = tree
@@ -119,9 +119,11 @@ impl TreeSnapshot {
         // Step 4: Collect partitions (with or without trivial partitions)
         let (parts, lengths) = Self::collect_partitions(tree, root_id, &cache)?;
 
-        // Step 5: Canonicalize partitions (always store side WITHOUT leaf 0)
+        // Step 5: Canonicalize partitions
+        // rooted_mode=false: bipartitions (canonicalized, deduped, trivial-filtered)
+        // rooted_mode=true:  clades (raw subtree bitsets, just sorted)
         let (parts_canonical, lengths_canonical) =
-            Self::canonicalize_partitions(parts, lengths, words, num_leaves);
+            Self::canonicalize_partitions(parts, lengths, words, num_leaves, rooted_mode);
 
         // Step 6: Record root's children for rooted tree adjustment
         let root_children = Self::get_root_children(tree, root_id, &cache)?;
@@ -276,12 +278,23 @@ impl TreeSnapshot {
         lengths: Vec<f64>,
         words: usize,
         num_leaves: usize,
+        rooted_mode: bool,
     ) -> (Vec<Bitset>, Vec<f64>) {
-        // Build pairs of (canonical_bitset, length)
+        if rooted_mode {
+            // Rooted clade mode: use raw subtree bitsets as clades.
+            // No canonicalization, no trivial filter, no dedup.
+            // Both root children are distinct clades; L-1 leaf clades are valid.
+            let mut pairs: Vec<(Bitset, f64)> = parts.into_iter().zip(lengths).collect();
+            pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            return pairs.into_iter().unzip();
+        }
+
+        // Unrooted bipartition mode: canonicalize, filter trivials, dedup.
+        // Build pairs of (canonical_bitset, length), filtering trivial splits
         let mut pairs: Vec<(Bitset, f64)> = parts
             .into_iter()
             .zip(lengths)
-            .map(|(bitset, length)| {
+            .filter_map(|(bitset, length)| {
                 // Check if leaf 0 (bit 0 of word 0) is set
                 let leaf_0_is_set = (bitset.0[0] & 1) != 0;
 
@@ -293,16 +306,40 @@ impl TreeSnapshot {
                     bitset
                 };
 
-                (canonical_bitset, length)
+                // Filter trivial bipartitions: a split is trivial if either
+                // side has ≤ 1 leaf.  The canonical form stores the side
+                // without leaf 0, so check both sides:
+                //   canonical side:   count_ones
+                //   complement side:  num_leaves - count_ones
+                let ones = canonical_bitset.count_ones();
+                if ones <= 1 || ones >= num_leaves - 1 {
+                    return None; // trivial split
+                }
+
+                Some((canonical_bitset, length))
             })
             .collect();
 
         // CRITICAL: Sort by bitset for O(m+n) merge-based intersection
         pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
+        // Deduplicate consecutive identical bitsets (e.g. root bipartition
+        // in rooted binary trees where both root children canonicalize to
+        // the same split).  Merge by summing branch lengths.
+        let mut deduped: Vec<(Bitset, f64)> = Vec::with_capacity(pairs.len());
+        for (bitset, length) in pairs {
+            if let Some(last) = deduped.last_mut()
+                && last.0 == bitset
+            {
+                last.1 += length;
+                continue;
+            }
+            deduped.push((bitset, length));
+        }
+
         // Unzip into parallel vectors - indices now match!
         let (canonical_parts, canonical_lengths): (Vec<Bitset>, Vec<f64>) =
-            pairs.into_iter().unzip();
+            deduped.into_iter().unzip();
 
         (canonical_parts, canonical_lengths)
     }
@@ -443,6 +480,93 @@ mod tests {
 
         // Both represent the same split, so after canonicalization
         // they'll be identical - that's CORRECT behavior!
+
+        // Verify that canonicalize_partitions deduplicates the root bipartition:
+        // parts = [{A,B} = 0b0011, {C,D} = 0b1100]
+        // After canonicalization: both become 0b1100
+        // After dedup: only one partition remains
+        let parts = vec![part_ab, part_cd];
+        let lengths = vec![1.0, 2.0];
+        let (canon_parts, canon_lengths) =
+            TreeSnapshot::canonicalize_partitions(parts, lengths, 1, 4, false);
+        assert_eq!(
+            canon_parts.len(),
+            1,
+            "Root bipartition should be deduplicated to 1 partition, got {}",
+            canon_parts.len()
+        );
+        assert_eq!(
+            canon_lengths[0], 3.0,
+            "Deduplicated lengths should sum: 1.0 + 2.0 = 3.0"
+        );
+    }
+
+    /// Test that from_tree deduplicates root bipartitions in rooted binary trees.
+    ///
+    /// In a rooted binary tree ((A,B),(C,D)), both root children produce the
+    /// same canonical bipartition ({C,D}|{A,B}).  Without deduplication, this
+    /// causes RF distances to be inflated by +2 compared to the unrooted RF
+    /// (e.g. R's phangorn RF.dist with rooted=FALSE).
+    #[test]
+    fn test_root_bipartition_dedup() {
+        use phylotree::tree::Tree as PhyloTree;
+
+        // Tree: ((A:1,B:1):1,(C:1,D:1):1);
+        // Root has two internal children - classic root bipartition duplication case
+        let tree = PhyloTree::from_newick("((A:1,B:1):1,(C:1,D:1):1);").unwrap();
+        let snap = TreeSnapshot::from_tree(&tree, false).unwrap();
+
+        // For 4 leaves, an unrooted binary tree has L-3 = 1 non-trivial bipartition.
+        // With dedup, the rooted tree should also have 1 (not 2).
+        assert_eq!(
+            snap.parts.len(),
+            1,
+            "Rooted 4-leaf binary tree should have 1 non-trivial partition after dedup, got {}",
+            snap.parts.len()
+        );
+    }
+
+    /// Test rooted vs unrooted mode partition counts and RF distances.
+    #[test]
+    fn test_rooted_vs_unrooted_partitions() {
+        use crate::distances::rf_from_snapshots;
+        use phylotree::tree::Tree as PhyloTree;
+
+        let tree1 = PhyloTree::from_newick("((A:1,B:1):1,(C:1,D:1):1);").unwrap();
+        let tree2 = PhyloTree::from_newick("((A:1,C:1):1,(B:1,D:1):1);").unwrap();
+
+        // Unrooted mode: L-3 = 1 bipartition per tree
+        let snap1_u = TreeSnapshot::from_tree(&tree1, false).unwrap();
+        let snap2_u = TreeSnapshot::from_tree(&tree2, false).unwrap();
+        assert_eq!(
+            snap1_u.parts.len(),
+            1,
+            "Unrooted: 1 bipartition for 4-leaf tree"
+        );
+        assert_eq!(snap2_u.parts.len(), 1);
+        assert_eq!(rf_from_snapshots(&snap1_u, &snap2_u), 2, "Unrooted RF = 2");
+
+        // Rooted mode: L-2 = 2 clades per tree
+        let snap1_r = TreeSnapshot::from_tree(&tree1, true).unwrap();
+        let snap2_r = TreeSnapshot::from_tree(&tree2, true).unwrap();
+        assert_eq!(snap1_r.parts.len(), 2, "Rooted: 2 clades for 4-leaf tree");
+        assert_eq!(snap2_r.parts.len(), 2);
+        assert_eq!(rf_from_snapshots(&snap1_r, &snap2_r), 4, "Rooted RF = 4");
+
+        // Same topology: both modes give RF = 0
+        let tree1b = PhyloTree::from_newick("((B:2,A:2):2,(D:2,C:2):2);").unwrap();
+        let snap1b_u = TreeSnapshot::from_tree(&tree1b, false).unwrap();
+        let snap1b_r = TreeSnapshot::from_tree(&tree1b, true).unwrap();
+        assert_eq!(
+            rf_from_snapshots(&snap1_u, &snap1b_u),
+            0,
+            "Unrooted same topo = 0"
+        );
+        assert_eq!(
+            rf_from_snapshots(&snap1_r, &snap1b_r),
+            0,
+            "Rooted same topo = 0"
+        );
     }
 
     /// Better example: Asymmetric tree with distinct partitions
