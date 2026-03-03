@@ -1,10 +1,13 @@
 use phylotree::tree::Tree;
 use std::collections::HashMap;
 use std::fs;
+#[cfg(feature = "cli")]
 use std::io::{self, Write};
 use std::path::Path;
 
+#[cfg(feature = "cli")]
 use flate2::Compression;
+#[cfg(feature = "cli")]
 use flate2::write::GzEncoder;
 
 /// Strip BEAST annotations from Newick strings.
@@ -12,7 +15,7 @@ use flate2::write::GzEncoder;
 /// BEAST format includes annotations like :[&rate=0.123]2.45 where 2.45 is the actual branch length.
 /// This function removes the [&...] annotations while preserving the branch lengths.
 /// We shouldn't be needing, this TODO: update phylotree to handle BEAST annotations directly.
-fn strip_beast_annotations(newick: &str) -> String {
+pub fn strip_beast_annotations(newick: &str) -> String {
     let mut result = String::with_capacity(newick.len());
     let mut in_annotation = false;
     let mut chars = newick.chars().peekable();
@@ -181,6 +184,7 @@ pub fn rename_leaf_nodes(
 /// Write a labeled square matrix as TSV to a file or stdout.
 /// If `path` ends with `.gz`, the output is gzip-compressed.
 /// If `path` equals `-`, the matrix is written to stdout (uncompressed).
+#[cfg(feature = "cli")]
 pub fn write_matrix_tsv<P: AsRef<Path>, T: std::fmt::Display>(
     path: P,
     names: &[String],

@@ -335,6 +335,54 @@ class TestAPIConsistency:
         assert len(matrix_rf[0]) == len(matrix_weighted[0]) == len(matrix_kf[0])
 
 
+class TestRootedRF:
+    """Tests for rooted RF distance (clade-based comparison)."""
+
+    def test_rooted_rf_greater_or_equal(self):
+        """Rooted RF should be >= unrooted RF for the same trees."""
+        paths = [str(TEST_DATA / "hiv1.trees")]
+
+        _, matrix_unrooted = rtd.pairwise_rf(paths, burnin_trees=1, rooted=False)
+        _, matrix_rooted = rtd.pairwise_rf(paths, burnin_trees=1, rooted=True)
+
+        for i in range(len(matrix_rooted)):
+            for j in range(i + 1, len(matrix_rooted)):
+                assert matrix_rooted[i][j] >= matrix_unrooted[i][j], (
+                    f"Rooted RF[{i}][{j}]={matrix_rooted[i][j]} should be >= "
+                    f"unrooted RF[{i}][{j}]={matrix_unrooted[i][j]}"
+                )
+
+    def test_rooted_rf_structure(self):
+        """Rooted RF matrix should be symmetric with zero diagonal."""
+        paths = [str(TEST_DATA / "hiv1.trees")]
+        _, matrix = rtd.pairwise_rf(paths, burnin_trees=1, rooted=True)
+
+        for i in range(len(matrix)):
+            assert matrix[i][i] == 0, f"Diagonal [{i}][{i}] should be 0"
+
+        for i in range(len(matrix)):
+            for j in range(len(matrix)):
+                assert matrix[i][j] == matrix[j][i], f"Should be symmetric at [{i}][{j}]"
+
+    def test_rooted_rf_deterministic(self):
+        """Rooted RF should be deterministic."""
+        paths = [str(TEST_DATA / "hiv1.trees")]
+
+        _, m1 = rtd.pairwise_rf(paths, burnin_trees=1, rooted=True)
+        _, m2 = rtd.pairwise_rf(paths, burnin_trees=1, rooted=True)
+
+        assert m1 == m2, "Rooted RF must be deterministic"
+
+    def test_rooted_default_is_false(self):
+        """Default rooted=False should match explicit rooted=False."""
+        paths = [str(TEST_DATA / "hiv1.trees")]
+
+        _, matrix_default = rtd.pairwise_rf(paths, burnin_trees=1)
+        _, matrix_explicit = rtd.pairwise_rf(paths, burnin_trees=1, rooted=False)
+
+        assert matrix_default == matrix_explicit
+
+
 if __name__ == "__main__":
     # Allow running tests directly
     pytest.main([__file__, "-v"])

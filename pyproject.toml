@@ -28,6 +28,9 @@ classifiers = [
 Homepage = "https://github.com/Joon-Klaps/rapidtrees"
 Repository = "https://github.com/Joon-Klaps/rapidtrees"
 
+[project.optional-dependencies]
+dev = ["pytest"]
+
 [tool.maturin]
 features = ["python"]
 module-name = "rapidtrees"

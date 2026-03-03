@@ -99,7 +99,7 @@ fn main() {
     for &n in &taxa_counts {
         let newick = format!("{};", generate_balanced_newick(0, n));
         let tree = PhyloTree::from_newick(&newick).expect("Failed to parse generated tree");
-        let snap = TreeSnapshot::from_tree(&tree).expect("Failed to create snapshot");
+        let snap = TreeSnapshot::from_tree(&tree, false).expect("Failed to create snapshot");
         let size_per_tree = estimate_size(&snap);
 
         for &t in &tree_counts {
