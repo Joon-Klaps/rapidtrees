@@ -1,10 +1,8 @@
 use clap::{Parser, ValueEnum};
+use rapidtrees::distances::{kf_from_snapshots, rf_from_snapshots, weighted_rf_from_snapshots};
+use rapidtrees::io::{read_beast_trees, write_matrix_tsv};
+use rapidtrees::snapshot::TreeSnapshot;
 use rayon::prelude::*;
-use rust_python_tree_distances::distances::{
-    kf_from_snapshots, rf_from_snapshots, weighted_rf_from_snapshots,
-};
-use rust_python_tree_distances::io::{read_beast_trees, write_matrix_tsv};
-use rust_python_tree_distances::snapshot::TreeSnapshot;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -12,9 +10,9 @@ use std::time::Instant;
 /// and write a labeled distance matrix (TSV) where row/column names are tree names.
 #[derive(Parser, Debug)]
 #[command(
-    name = "tree-dists",
+    name = "rapidtrees",
     version,
-    about = "Pairwise RF distance matrix for BEAST trees"
+    about = "Fast pairwise tree distance calculations (Robinson-Foulds, Weighted RF, Kuhner-Felsenstein) for phylogenetic trees"
 )]
 struct Args {
     /// Path to BEAST .trees (NEXUS) file

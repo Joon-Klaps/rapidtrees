@@ -3,28 +3,28 @@
 # Setup hooks: pre-commit install
 
 repos:
-  - repo: local
-    hooks:
-      - id: cargo-fmt
-        name: cargo fmt
-        description: Format Rust code with cargo fmt
-        entry: cargo fmt --all
-        language: system
-        types: [rust]
-        pass_filenames: false
+    - repo: local
+      hooks:
+          - id: cargo-fmt
+            name: cargo fmt
+            description: Format Rust code with cargo fmt
+            entry: cargo fmt --all
+            language: system
+            types: [rust]
+            pass_filenames: false
 
-      - id: cargo-clippy
-        name: cargo clippy
-        description: Lint Rust code with cargo clippy
-        entry: cargo clippy --all-targets --all-features --fix --allow-staged --allow-dirty -- -D warnings
-        language: system
-        types: [rust]
-        pass_filenames: false
+          - id: cargo-clippy
+            name: cargo clippy
+            description: Lint Rust code with cargo clippy
+            entry: cargo clippy --all-targets --all-features --fix --allow-staged --allow-dirty -- -D warnings
+            language: system
+            types: [rust]
+            pass_filenames: false
 
-      - id: cargo-check
-        name: cargo check
-        description: Check if Rust code compiles
-        entry: cargo check --all-targets --all-features
-        language: system
-        types: [rust]
-        pass_filenames: false
+          - id: cargo-check
+            name: cargo check
+            description: Check if Rust code compiles
+            entry: cargo check --all-targets --all-features
+            language: system
+            types: [rust]
+            pass_filenames: false

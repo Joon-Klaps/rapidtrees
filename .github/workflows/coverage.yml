@@ -1,0 +1,77 @@
+name: Coverage
+
+on:
+    push:
+        branches: [master, main]
+    pull_request:
+        branches: [master, main]
+
+env:
+    CARGO_TERM_COLOR: always
+
+jobs:
+    # ── Rust coverage with cargo-llvm-cov ────────────────────────────────
+    rust-coverage:
+        name: Rust Coverage
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  lfs: true
+
+            - name: Setup Rust
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  components: llvm-tools-preview
+
+            - name: Install cargo-llvm-cov
+              uses: taiki-e/install-action@cargo-llvm-cov
+
+            - name: Generate Rust coverage
+              run: cargo llvm-cov --lib --lcov --output-path rust-lcov.info
+
+            - name: Upload Rust coverage to Codecov
+              uses: codecov/codecov-action@v5
+              with:
+                  files: rust-lcov.info
+                  flags: rust
+                  fail_ci_if_error: false
+              env:
+                  CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+    # ── Python coverage with pytest-cov ──────────────────────────────────
+    python-coverage:
+        name: Python Coverage
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  lfs: true
+
+            - name: Setup Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.12"
+
+            - name: Setup Rust
+              uses: dtolnay/rust-toolchain@stable
+
+            - name: Install dependencies
+              run: |
+                  pip install --upgrade pip
+                  pip install maturin pytest pytest-cov
+
+            - name: Build and install package
+              run: pip install -e . --verbose
+
+            - name: Run Python tests with coverage
+              run: pytest tests/test_python_api.py -v --cov=rapidtrees --cov-report=xml:python-coverage.xml
+
+            - name: Upload Python coverage to Codecov
+              uses: codecov/codecov-action@v5
+              with:
+                  files: python-coverage.xml
+                  flags: python
+                  fail_ci_if_error: false
+              env:
+                  CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

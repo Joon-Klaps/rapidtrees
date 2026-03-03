@@ -28,7 +28,7 @@ impl Bitset {
     ///
     /// # Example
     /// ```
-    /// # use rust_python_tree_distances::bitset::Bitset;
+    /// # use rapidtrees::bitset::Bitset;
     /// // For a tree with 100 leaves, need 2 words (128 bits)
     /// let bs = Bitset::zeros(2);
     /// assert_eq!(bs.0.len(), 2);
@@ -46,7 +46,7 @@ impl Bitset {
     ///
     /// # Example
     /// ```
-    /// # use rust_python_tree_distances::bitset::Bitset;
+    /// # use rapidtrees::bitset::Bitset;
     /// let mut bs = Bitset::zeros(1);
     /// bs.set(0);  // Mark leaf 0 as present
     /// bs.set(5);  // Mark leaf 5 as present
@@ -65,7 +65,7 @@ impl Bitset {
     ///
     /// # Example
     /// ```
-    /// # use rust_python_tree_distances::bitset::Bitset;
+    /// # use rapidtrees::bitset::Bitset;
     /// let mut left = Bitset::zeros(1);
     /// left.set(0);   // {0}
     ///
@@ -88,7 +88,7 @@ impl Bitset {
     ///
     /// # Example
     /// ```
-    /// # use rust_python_tree_distances::bitset::Bitset;
+    /// # use rapidtrees::bitset::Bitset;
     /// let mut bs = Bitset::zeros(1);
     /// bs.set(0);
     /// bs.set(2);

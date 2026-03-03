@@ -1,9 +1,9 @@
 use cpu_time::ProcessTime;
 use memory_stats::memory_stats;
 use phylotree::tree::Tree as PhyloTree;
+use rapidtrees::distances::rf_from_snapshots;
+use rapidtrees::snapshot::TreeSnapshot;
 use rayon::prelude::*;
-use rust_python_tree_distances::distances::rf_from_snapshots;
-use rust_python_tree_distances::snapshot::TreeSnapshot;
 use std::mem;
 use std::time::{Duration, Instant};
 
@@ -65,7 +65,7 @@ fn estimate_size(snap: &TreeSnapshot) -> usize {
     let mut size = mem::size_of::<TreeSnapshot>();
 
     // parts: Vec<Bitset>
-    size += snap.parts.capacity() * mem::size_of::<rust_python_tree_distances::bitset::Bitset>();
+    size += snap.parts.capacity() * mem::size_of::<rapidtrees::bitset::Bitset>();
     for part in &snap.parts {
         // Bitset is a wrapper around Vec<u64>
         size += part.0.capacity() * mem::size_of::<u64>();
@@ -75,8 +75,7 @@ fn estimate_size(snap: &TreeSnapshot) -> usize {
     size += snap.lengths.capacity() * mem::size_of::<f64>();
 
     // root_children: Vec<Bitset>
-    size += snap.root_children.capacity()
-        * mem::size_of::<rust_python_tree_distances::bitset::Bitset>();
+    size += snap.root_children.capacity() * mem::size_of::<rapidtrees::bitset::Bitset>();
     for part in &snap.root_children {
         size += part.0.capacity() * mem::size_of::<u64>();
     }

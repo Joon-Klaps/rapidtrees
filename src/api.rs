@@ -536,7 +536,7 @@ fn sanity_check_trees(trees: &[PhyloTree]) -> PyResult<()> {
 
 /// Python module definition
 #[pymodule]
-fn rust_python_tree_distances(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn rapidtrees(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pairwise_rf, m)?)?;
     m.add_function(wrap_pyfunction!(pairwise_weighted_rf, m)?)?;
     m.add_function(wrap_pyfunction!(pairwise_kf, m)?)?;
