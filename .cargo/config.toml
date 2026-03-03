@@ -1,0 +1,4 @@
+[env]
+# Force VIRTUAL_ENV to this project's .venv so pyo3's build script always
+# finds the correct Python interpreter, regardless of the shell environment.
+VIRTUAL_ENV = { value = ".venv", relative = true, force = true }

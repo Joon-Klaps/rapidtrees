@@ -19,7 +19,7 @@ pub mod api;
 
 // Re-export frequently used types & functions
 pub use bitset::Bitset;
-pub use io::{read_beast_trees, rename_leaf_nodes, strip_beast_annotations};
 #[cfg(feature = "cli")]
 pub use io::write_matrix_tsv;
+pub use io::{read_beast_trees, rename_leaf_nodes, strip_beast_annotations};
 pub use snapshot::TreeSnapshot;

@@ -328,11 +328,11 @@ impl TreeSnapshot {
         // the same split).  Merge by summing branch lengths.
         let mut deduped: Vec<(Bitset, f64)> = Vec::with_capacity(pairs.len());
         for (bitset, length) in pairs {
-            if let Some(last) = deduped.last_mut() {
-                if last.0 == bitset {
-                    last.1 += length;
-                    continue;
-                }
+            if let Some(last) = deduped.last_mut()
+                && last.0 == bitset
+            {
+                last.1 += length;
+                continue;
             }
             deduped.push((bitset, length));
         }
@@ -538,7 +538,11 @@ mod tests {
         // Unrooted mode: L-3 = 1 bipartition per tree
         let snap1_u = TreeSnapshot::from_tree(&tree1, false).unwrap();
         let snap2_u = TreeSnapshot::from_tree(&tree2, false).unwrap();
-        assert_eq!(snap1_u.parts.len(), 1, "Unrooted: 1 bipartition for 4-leaf tree");
+        assert_eq!(
+            snap1_u.parts.len(),
+            1,
+            "Unrooted: 1 bipartition for 4-leaf tree"
+        );
         assert_eq!(snap2_u.parts.len(), 1);
         assert_eq!(rf_from_snapshots(&snap1_u, &snap2_u), 2, "Unrooted RF = 2");
 
@@ -553,8 +557,16 @@ mod tests {
         let tree1b = PhyloTree::from_newick("((B:2,A:2):2,(D:2,C:2):2);").unwrap();
         let snap1b_u = TreeSnapshot::from_tree(&tree1b, false).unwrap();
         let snap1b_r = TreeSnapshot::from_tree(&tree1b, true).unwrap();
-        assert_eq!(rf_from_snapshots(&snap1_u, &snap1b_u), 0, "Unrooted same topo = 0");
-        assert_eq!(rf_from_snapshots(&snap1_r, &snap1b_r), 0, "Rooted same topo = 0");
+        assert_eq!(
+            rf_from_snapshots(&snap1_u, &snap1b_u),
+            0,
+            "Unrooted same topo = 0"
+        );
+        assert_eq!(
+            rf_from_snapshots(&snap1_r, &snap1b_r),
+            0,
+            "Rooted same topo = 0"
+        );
     }
 
     /// Better example: Asymmetric tree with distinct partitions

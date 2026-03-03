@@ -335,7 +335,9 @@ fn pairwise_rf_from_newick_iter(
         if idx >= translate_maps.len() {
             return Err(PyValueError::new_err(format!(
                 "map_indices[{}] = {} is out of bounds (only {} translate maps provided)",
-                i, idx, translate_maps.len()
+                i,
+                idx,
+                translate_maps.len()
             )));
         }
     }
@@ -380,7 +382,9 @@ fn pairwise_rf_from_newick_iter(
                 if leaves.len() != ref_leaves.len() {
                     return Err(PyValueError::new_err(format!(
                         "Tree {} has {} leaves, but tree 0 has {} leaves. All trees must have the same number of leaves.",
-                        tree_count, leaves.len(), ref_leaves.len()
+                        tree_count,
+                        leaves.len(),
+                        ref_leaves.len()
                     )));
                 }
                 if leaves != *ref_leaves {
