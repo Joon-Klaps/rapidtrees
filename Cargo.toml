@@ -1,6 +1,6 @@
 [package]
 name = "rapidtrees"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
 description = "Fast pairwise tree distance calculations (Robinson-Foulds, Weighted RF, Kuhner-Felsenstein) for phylogenetic trees"
 license = "MIT"
