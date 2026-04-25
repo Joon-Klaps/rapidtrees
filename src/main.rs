@@ -71,7 +71,6 @@ enum MetricArg {
 
 enum DistanceInput {
     Snapshots(Vec<TreeSnapshot>),
-    Presence { n_bip: usize, presence: Vec<u8> },
 }
 
 fn main() {
@@ -101,7 +100,7 @@ fn main() {
     );
 
     let t = Instant::now();
-    let mat = compute_matrix(args.metric, &names, &distance_input);
+    let mat = compute_matrix(args.metric, &distance_input);
     log_if(
         quiet,
         format!(
@@ -127,19 +126,19 @@ fn main() {
 
 fn load_from_snap(path: &PathBuf, quiet: bool) -> (Vec<String>, DistanceInput) {
     let t = Instant::now();
-    let (names, _taxa_names, n_bip, presence) = read_snap(path).unwrap_or_else(|e| {
+    let (names, _taxa_names, snapshots) = read_snap(path).unwrap_or_else(|e| {
         eprintln!("Failed to read snap {path:?}: {e}");
         std::process::exit(2);
     });
     log_if(
         quiet,
         format!(
-            "Read snap with {} trees and {n_bip} bipartitions in {:.3}s",
+            "Read snap with {} trees in {:.3}s",
             names.len(),
             t.elapsed().as_secs_f64()
         ),
     );
-    (names, DistanceInput::Presence { n_bip, presence })
+    (names, DistanceInput::Snapshots(snapshots))
 }
 
 fn load_from_beast(args: &Args, quiet: bool) -> (Vec<String>, DistanceInput) {
@@ -223,33 +222,15 @@ fn export_snap(
     );
 }
 
-fn compute_matrix(metric: MetricArg, names: &[String], input: &DistanceInput) -> Vec<Vec<f64>> {
+fn compute_matrix(metric: MetricArg, input: &DistanceInput) -> Vec<Vec<f64>> {
     match (metric, input) {
         (MetricArg::Rf, DistanceInput::Snapshots(snaps)) => pairwise_rf_matrix(snaps)
             .into_iter()
             .map(|row| row.into_iter().map(|v| v as f64).collect())
             .collect(),
 
-        (MetricArg::Rf, DistanceInput::Presence { n_bip, presence }) => {
-            let n = names.len();
-            let mut mat = vec![vec![0.0_f64; n]; n];
-            for i in 0..n {
-                for j in i + 1..n {
-                    let rf = presence[i * n_bip..(i + 1) * n_bip]
-                        .iter()
-                        .zip(&presence[j * n_bip..(j + 1) * n_bip])
-                        .filter(|(a, b)| a != b)
-                        .count() as f64;
-                    mat[i][j] = rf;
-                    mat[j][i] = rf;
-                }
-            }
-            mat
-        }
-
         (MetricArg::Weighted, DistanceInput::Snapshots(snaps)) => pairwise_wrf_matrix(snaps),
         (MetricArg::Kf, DistanceInput::Snapshots(snaps)) => pairwise_kf_matrix(snaps),
-        _ => unreachable!("snap input is restricted to RF by argument validation"),
     }
 }
 

@@ -1,3 +1,5 @@
+#[cfg(feature = "cli")]
+use crate::bitset::Bitset;
 use crate::snapshot::TreeSnapshot;
 use phylotree::tree::Tree;
 use std::collections::{HashMap, HashSet};
@@ -12,7 +14,10 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 
 #[cfg(feature = "cli")]
-type SnapReadResult = (Vec<String>, Vec<String>, usize, Vec<u8>);
+type SnapRawReadResult = (Vec<String>, Vec<String>, usize, Vec<u8>);
+
+#[cfg(feature = "cli")]
+type SnapReadResult = (Vec<String>, Vec<String>, Vec<TreeSnapshot>);
 
 /// Strip BEAST annotations from Newick strings.
 ///
@@ -498,18 +503,20 @@ pub fn write_snap<P: AsRef<Path>>(
 
 /// Read a `.snap` file produced by [`write_snap`].
 ///
-/// Returns `(tree_names, taxa_names, n_bip, presence_bytes)` where
-/// `presence_bytes` is a flat row-major `u8` buffer of shape `n_trees × n_bip`.
+/// Returns `(tree_names, taxa_names, snapshots)`.
 ///
-/// RF distance between tree `i` and tree `j` is:
-/// ```text
-/// presence[i*n_bip .. (i+1)*n_bip]
-///     .zip(presence[j*n_bip .. (j+1)*n_bip])
-///     .filter(|(a,b)| a != b)
-///     .count()
-/// ```
+/// Snapshots are reconstructed from the on-disk presence matrix so callers can
+/// feed them directly into distance functions like [`crate::distances::pairwise_rf_matrix`].
 #[cfg(feature = "cli")]
 pub fn read_snap<P: AsRef<Path>>(path: P) -> io::Result<SnapReadResult> {
+    let (tree_names, taxa_names, n_bip, presence) = read_snap_raw(path)?;
+    let snapshots = snapshots_from_presence(tree_names.len(), n_bip, &presence);
+    Ok((tree_names, taxa_names, snapshots))
+}
+
+/// Read a `.snap` file produced by [`write_snap`] and return the raw presence matrix.
+#[cfg(feature = "cli")]
+pub fn read_snap_raw<P: AsRef<Path>>(path: P) -> io::Result<SnapRawReadResult> {
     use flate2::read::GzDecoder;
     use std::fs::File;
     use std::io::{BufReader, Read};
@@ -546,6 +553,30 @@ pub fn read_snap<P: AsRef<Path>>(path: P) -> io::Result<SnapReadResult> {
     r.read_exact(&mut presence)?;
 
     Ok((tree_names, taxa_names, n_bip, presence))
+}
+
+#[cfg(feature = "cli")]
+fn snapshots_from_presence(n_trees: usize, n_bip: usize, presence: &[u8]) -> Vec<TreeSnapshot> {
+    presence
+        .chunks_exact(n_bip)
+        .take(n_trees)
+        .map(|row| {
+            // Use compact token bitsets keyed by bipartition column index.
+            let parts: Vec<Bitset> = row
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, &v)| (v != 0).then_some(Bitset(vec![idx as u64])))
+                .collect();
+            TreeSnapshot {
+                lengths: vec![0.0; parts.len()],
+                parts,
+                root_children: Vec::new(),
+                words: 1,
+                num_leaves: 0,
+                rooted: false,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -662,7 +693,7 @@ mod snap_tests {
         let tmp = "/tmp/rt_names.snap";
 
         write_snap(tmp, &tree_names, &taxa_names, &snaps).unwrap();
-        let (rt_trees, rt_taxa, n_bip, presence) = read_snap(tmp).unwrap();
+        let (rt_trees, rt_taxa, n_bip, presence) = read_snap_raw(tmp).unwrap();
 
         assert_eq!(rt_trees, tree_names, "tree names changed");
         assert_eq!(rt_taxa, taxa_names, "taxa names changed");
@@ -679,7 +710,7 @@ mod snap_tests {
         let tmp = "/tmp/rt_dims.snap";
 
         write_snap(tmp, &tree_names, &taxa_names, &snaps).unwrap();
-        let (rt_trees, rt_taxa, n_bip, presence) = read_snap(tmp).unwrap();
+        let (rt_trees, rt_taxa, n_bip, presence) = read_snap_raw(tmp).unwrap();
 
         assert_eq!(rt_trees.len(), snaps.len(), "n_trees mismatch");
         assert_eq!(rt_taxa.len(), taxa_names.len(), "n_taxa mismatch");
@@ -695,7 +726,7 @@ mod snap_tests {
         let tmp = "/tmp/rt_rf.snap";
 
         write_snap(tmp, &tree_names, &taxa_names, &snaps).unwrap();
-        let (_, _, n_bip, presence) = read_snap(tmp).unwrap();
+        let (_, _, n_bip, presence) = read_snap_raw(tmp).unwrap();
 
         let direct = pairwise_rf_matrix(&snaps);
         let n = snaps.len();
@@ -722,7 +753,7 @@ mod snap_tests {
         let tmp = "/tmp/rt_diag.snap";
 
         write_snap(tmp, &tree_names, &taxa_names, &snaps).unwrap();
-        let (_, _, n_bip, presence) = read_snap(tmp).unwrap();
+        let (_, _, n_bip, presence) = read_snap_raw(tmp).unwrap();
 
         for i in 0..snaps.len() {
             let rf_self: usize = presence[i * n_bip..(i + 1) * n_bip]
@@ -744,7 +775,7 @@ mod snap_tests {
             .unwrap();
         gz.finish().unwrap();
 
-        let err = read_snap(tmp).unwrap_err();
+        let err = read_snap_raw(tmp).unwrap_err();
         assert!(
             err.to_string().contains("invalid snap magic"),
             "unexpected error: {err}"
@@ -759,7 +790,7 @@ mod snap_tests {
         gz.write_all(b"SNAP\x99").unwrap(); // version 153 — unsupported
         gz.finish().unwrap();
 
-        let err = read_snap(tmp).unwrap_err();
+        let err = read_snap_raw(tmp).unwrap_err();
         assert!(
             err.to_string().contains("unsupported snap version"),
             "unexpected error: {err}"
