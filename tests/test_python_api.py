@@ -6,6 +6,7 @@ against known reference values and checking error handling.
 """
 
 import pytest
+import numpy as np
 import hashlib
 from pathlib import Path
 
@@ -18,6 +19,20 @@ except ImportError:
 
 # Test data paths
 TEST_DATA = Path(__file__).parent / "data"
+
+# Small 3-tree fixture with known pairwise RF: [0,1]=4, [0,2]=2, [1,2]=2.
+# Trees are the first three from the phylip treedist reference set.
+FIXTURE_TREES = [
+    "(A:0.1,(B:0.1,(H:0.1,(D:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
+    "(A:0.1,(B:0.1,(D:0.1,((J:0.1,H:0.1):0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1);",
+    "(A:0.1,(B:0.1,(D:0.1,(H:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
+]
+FIXTURE_NAMES = ["t0", "t1", "t2"]
+# Empty translate map: taxa names are already real names in the newick strings
+FIXTURE_TRANSLATE = [{}]
+FIXTURE_MAP_INDICES = [0, 0, 0]
+# Known pairwise RF matrix for the 3 fixture trees
+FIXTURE_RF = [[0, 4, 2], [4, 0, 2], [2, 2, 0]]
 
 # Mark all tests to skip if module not available
 pytestmark = pytest.mark.skipif(
@@ -381,6 +396,185 @@ class TestRootedRF:
         _, matrix_explicit = rtd.pairwise_rf(paths, burnin_trees=1, rooted=False)
 
         assert matrix_default == matrix_explicit
+
+
+class TestPairwiseRFFromNewicks:
+    """Tests for pairwise_rf_from_newicks (newick list, no iterator)."""
+
+    def test_known_rf_values(self):
+        """Known pairwise RF values from the treedist reference set."""
+        names, matrix = rtd.pairwise_rf_from_newicks(
+            FIXTURE_NAMES, FIXTURE_TREES, FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES
+        )
+        assert names == FIXTURE_NAMES
+        for i in range(len(FIXTURE_RF)):
+            for j in range(len(FIXTURE_RF)):
+                assert matrix[i][j] == FIXTURE_RF[i][j], f"mismatch at [{i}][{j}]"
+
+    def test_symmetric_zero_diagonal(self):
+        """Matrix must be symmetric with a zero diagonal."""
+        _, matrix = rtd.pairwise_rf_from_newicks(
+            FIXTURE_NAMES, FIXTURE_TREES, FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES
+        )
+        n = len(matrix)
+        for i in range(n):
+            assert matrix[i][i] == 0
+        for i in range(n):
+            for j in range(n):
+                assert matrix[i][j] == matrix[j][i], f"not symmetric at [{i}][{j}]"
+
+    def test_rooted_ge_unrooted(self):
+        """Rooted RF must be >= unrooted RF for the same tree pair."""
+        _, unrooted = rtd.pairwise_rf_from_newicks(
+            FIXTURE_NAMES, FIXTURE_TREES, FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES, rooted=False
+        )
+        _, rooted = rtd.pairwise_rf_from_newicks(
+            FIXTURE_NAMES, FIXTURE_TREES, FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES, rooted=True
+        )
+        for i in range(len(rooted)):
+            for j in range(len(rooted)):
+                assert rooted[i][j] >= unrooted[i][j], f"rooted < unrooted at [{i}][{j}]"
+
+    def test_error_on_length_mismatch(self):
+        """Passing fewer newicks than names must raise ValueError."""
+        with pytest.raises(ValueError):
+            rtd.pairwise_rf_from_newicks(
+                FIXTURE_NAMES, FIXTURE_TREES[:2], FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES
+            )
+
+
+class TestPairwiseRFFromNewickIter:
+    """Tests for pairwise_rf_from_newick_iter (lazy iterator API)."""
+
+    def test_returns_bytes(self):
+        """rf_bytes must be a bytes object of size n*n*4."""
+        names, rf_bytes = rtd.pairwise_rf_from_newick_iter(
+            FIXTURE_NAMES, iter(FIXTURE_TREES), FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES
+        )
+        assert isinstance(rf_bytes, bytes)
+        assert len(rf_bytes) == len(FIXTURE_NAMES) ** 2 * 4
+
+    def test_known_rf_values(self):
+        """Decoded u32 matrix must match the known RF reference values."""
+        names, rf_bytes = rtd.pairwise_rf_from_newick_iter(
+            FIXTURE_NAMES, iter(FIXTURE_TREES), FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES
+        )
+        n = len(names)
+        matrix = np.frombuffer(rf_bytes, dtype=np.uint32).reshape(n, n)
+        for i in range(len(FIXTURE_RF)):
+            for j in range(len(FIXTURE_RF)):
+                assert matrix[i, j] == FIXTURE_RF[i][j], f"mismatch at [{i}][{j}]"
+
+    def test_matches_from_newicks(self):
+        """Iterator and list variants must produce identical matrices."""
+        _, matrix_list = rtd.pairwise_rf_from_newicks(
+            FIXTURE_NAMES, FIXTURE_TREES, FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES
+        )
+        _, rf_bytes = rtd.pairwise_rf_from_newick_iter(
+            FIXTURE_NAMES, iter(FIXTURE_TREES), FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES
+        )
+        n = len(FIXTURE_NAMES)
+        matrix_arr = np.frombuffer(rf_bytes, dtype=np.uint32).reshape(n, n)
+        for i in range(n):
+            for j in range(n):
+                assert int(matrix_arr[i, j]) == matrix_list[i][j]
+
+    def test_symmetric_zero_diagonal(self):
+        """Decoded matrix must be symmetric with a zero diagonal."""
+        names, rf_bytes = rtd.pairwise_rf_from_newick_iter(
+            FIXTURE_NAMES, iter(FIXTURE_TREES), FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES
+        )
+        n = len(names)
+        matrix = np.frombuffer(rf_bytes, dtype=np.uint32).reshape(n, n)
+        assert np.all(matrix == matrix.T), "matrix not symmetric"
+        assert np.all(np.diag(matrix) == 0), "diagonal not zero"
+
+    def test_deterministic(self):
+        """Two calls on identical input must return identical bytes."""
+        _, rf1 = rtd.pairwise_rf_from_newick_iter(
+            FIXTURE_NAMES, iter(FIXTURE_TREES), FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES
+        )
+        _, rf2 = rtd.pairwise_rf_from_newick_iter(
+            FIXTURE_NAMES, iter(FIXTURE_TREES), FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES
+        )
+        assert rf1 == rf2
+
+
+class TestPairwiseRFWithSnapshots:
+    """Tests for pairwise_rf_with_snapshots_from_newick_iter (5-tuple API)."""
+
+    def _call(self, **kwargs):
+        defaults = dict(
+            names=FIXTURE_NAMES,
+            newick_iter=iter(FIXTURE_TREES),
+            translate_maps=FIXTURE_TRANSLATE,
+            map_indices=FIXTURE_MAP_INDICES,
+        )
+        defaults.update(kwargs)
+        return rtd.pairwise_rf_with_snapshots_from_newick_iter(**defaults)
+
+    def test_returns_five_tuple(self):
+        """Function returns a 5-tuple with the correct types."""
+        result = self._call()
+        assert len(result) == 5
+        names, rf_bytes, leaf_names, n_bip, pres_bytes = result
+        assert isinstance(names, list)
+        assert isinstance(rf_bytes, bytes)
+        assert isinstance(leaf_names, list)
+        assert isinstance(n_bip, int)
+        assert isinstance(pres_bytes, bytes)
+
+    def test_rf_bytes_known_values(self):
+        """rf_bytes decodes to the known RF matrix."""
+        names, rf_bytes, *_ = self._call()
+        n = len(names)
+        matrix = np.frombuffer(rf_bytes, dtype=np.uint32).reshape(n, n)
+        for i in range(len(FIXTURE_RF)):
+            for j in range(len(FIXTURE_RF)):
+                assert matrix[i, j] == FIXTURE_RF[i][j], f"RF mismatch at [{i}][{j}]"
+
+    def test_presence_bytes_shape_and_range(self):
+        """presence_bytes encodes an n_trees × n_bip uint8 matrix of 0s and 1s."""
+        names, _, _, n_bip, pres_bytes = self._call()
+        n = len(names)
+        assert len(pres_bytes) == n * n_bip
+        presence = np.frombuffer(pres_bytes, dtype=np.uint8).reshape(n, n_bip)
+        assert set(presence.flatten().tolist()) <= {0, 1}
+
+    def test_xor_identity(self):
+        """sum(presence[i] XOR presence[j]) equals RF(i, j) for every pair."""
+        names, rf_bytes, _, n_bip, pres_bytes = self._call()
+        n = len(names)
+        rf = np.frombuffer(rf_bytes, dtype=np.uint32).reshape(n, n)
+        presence = np.frombuffer(pres_bytes, dtype=np.uint8).reshape(n, n_bip).astype(np.int32)
+        for i in range(n):
+            for j in range(n):
+                xor_sum = int(np.sum(np.abs(presence[i] - presence[j])))
+                assert xor_sum == int(rf[i, j]), f"XOR identity failed at [{i},{j}]"
+
+    def test_rf_bytes_matches_iter(self):
+        """rf_bytes matches the output of pairwise_rf_from_newick_iter."""
+        names_s, rf_bytes_s, *_ = self._call()
+        names_i, rf_bytes_i = rtd.pairwise_rf_from_newick_iter(
+            FIXTURE_NAMES, iter(FIXTURE_TREES), FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES
+        )
+        assert names_s == names_i
+        assert rf_bytes_s == rf_bytes_i
+
+    def test_leaf_names_sorted(self):
+        """Returned leaf names must be sorted alphabetically."""
+        _, _, leaf_names, _, _ = self._call()
+        assert leaf_names == sorted(leaf_names)
+
+    def test_deterministic(self):
+        """Two calls on identical input must return identical results."""
+        r1 = self._call()
+        r2 = self._call()
+        assert r1[0] == r2[0]  # names
+        assert r1[1] == r2[1]  # rf_bytes
+        assert r1[2] == r2[2]  # leaf_names
+        assert r1[3] == r2[3]  # n_bip
+        assert r1[4] == r2[4]  # presence_bytes
 
 
 if __name__ == "__main__":

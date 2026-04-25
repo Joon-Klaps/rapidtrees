@@ -14,6 +14,7 @@
 
 use crate::snapshot::TreeSnapshot;
 use phylotree::tree::{Tree as PhyloTree, TreeError};
+use rayon::prelude::*;
 
 #[cfg(test)]
 use itertools::Itertools;
@@ -231,6 +232,55 @@ pub fn kf_from_snapshots(a: &TreeSnapshot, b: &TreeSnapshot) -> f64 {
     }
 
     sum_squared.sqrt()
+}
+
+/// Returns a parallel iterator over all unique (i, j) index pairs where i < j.
+fn upper_triangle_pairs(n: usize) -> impl ParallelIterator<Item = (usize, usize)> {
+    (0..n)
+        .into_par_iter()
+        .flat_map_iter(move |i| (i + 1..n).map(move |j| (i, j)))
+}
+
+/// Generic symmetric pairwise matrix computation over any `Copy + Default + Send` distance type.
+///
+/// Computes `metric(a, b)` for all upper-triangle pairs in parallel, then mirrors the result
+/// into the lower triangle. The diagonal is left at `T::default()` (zero).
+fn pairwise_symmetric<T, F>(snapshots: &[TreeSnapshot], metric: F) -> Vec<Vec<T>>
+where
+    T: Copy + Default + Send,
+    F: Fn(&TreeSnapshot, &TreeSnapshot) -> T + Sync,
+{
+    let n = snapshots.len();
+    let pairs: Vec<(usize, usize, T)> = upper_triangle_pairs(n)
+        .map(|(i, j)| (i, j, metric(&snapshots[i], &snapshots[j])))
+        .collect();
+    let mut matrix = vec![vec![T::default(); n]; n];
+    for (i, j, dist) in pairs {
+        matrix[i][j] = dist;
+        matrix[j][i] = dist;
+    }
+    matrix
+}
+
+/// Compute all pairwise RF distances and return as a symmetric 2D matrix.
+///
+/// Uses parallel computation via rayon.
+pub fn pairwise_rf_matrix(snapshots: &[TreeSnapshot]) -> Vec<Vec<usize>> {
+    pairwise_symmetric(snapshots, rf_from_snapshots)
+}
+
+/// Compute all pairwise Weighted RF distances and return as a symmetric 2D matrix.
+///
+/// Uses parallel computation via rayon.
+pub fn pairwise_wrf_matrix(snapshots: &[TreeSnapshot]) -> Vec<Vec<f64>> {
+    pairwise_symmetric(snapshots, weighted_rf_from_snapshots)
+}
+
+/// Compute all pairwise Kuhner-Felsenstein distances and return as a symmetric 2D matrix.
+///
+/// Uses parallel computation via rayon.
+pub fn pairwise_kf_matrix(snapshots: &[TreeSnapshot]) -> Vec<Vec<f64>> {
+    pairwise_symmetric(snapshots, kf_from_snapshots)
 }
 
 #[test]
@@ -675,5 +725,189 @@ fn kuhner_felsenstein_treedist() {
         );
 
         assert_eq!(kuhner_felsenstein(&t0, &t1).unwrap(), rfs[i0][i1])
+    }
+}
+
+#[cfg(test)]
+mod pairwise_tests {
+    use super::*;
+
+    // First three trees from the treedist fixture.
+    // Known pairwise RF: [0,1]=4, [0,2]=2, [1,2]=2.
+    const T0: &str = "(A:0.1,(B:0.1,(H:0.1,(D:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);";
+    const T1: &str = "(A:0.1,(B:0.1,(D:0.1,((J:0.1,H:0.1):0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1);";
+    const T2: &str = "(A:0.1,(B:0.1,(D:0.1,(H:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);";
+
+    fn three_snaps() -> Vec<TreeSnapshot> {
+        [T0, T1, T2]
+            .iter()
+            .map(|nwk| {
+                let tree = PhyloTree::from_newick(nwk).unwrap();
+                TreeSnapshot::from_tree(&tree, false).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pairwise_rf_matrix_known_values() {
+        let snaps = three_snaps();
+        let mat = pairwise_rf_matrix(&snaps);
+
+        assert_eq!(mat[0][1], 4, "RF(T0,T1) should be 4");
+        assert_eq!(mat[0][2], 2, "RF(T0,T2) should be 2");
+        assert_eq!(mat[1][2], 2, "RF(T1,T2) should be 2");
+        for (i, row) in mat.iter().enumerate().take(3) {
+            assert_eq!(row[i], 0, "diagonal should be 0");
+            for (j, value) in row.iter().enumerate().take(3) {
+                assert_eq!(*value, mat[j][i], "RF matrix not symmetric at [{i}][{j}]");
+            }
+        }
+    }
+
+    #[test]
+    fn pairwise_wrf_matrix_symmetric_zero_diagonal() {
+        let snaps = three_snaps();
+        let mat = pairwise_wrf_matrix(&snaps);
+
+        for (i, row) in mat.iter().enumerate() {
+            assert_eq!(row[i], 0.0, "WRF diagonal [{i}][{i}] should be 0");
+            for (j, value) in row.iter().enumerate() {
+                assert!(
+                    (*value - mat[j][i]).abs() < f64::EPSILON,
+                    "WRF matrix not symmetric at [{i}][{j}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pairwise_kf_matrix_symmetric_zero_diagonal() {
+        let snaps = three_snaps();
+        let mat = pairwise_kf_matrix(&snaps);
+
+        for (i, row) in mat.iter().enumerate() {
+            assert_eq!(row[i], 0.0, "KF diagonal [{i}][{i}] should be 0");
+            for (j, value) in row.iter().enumerate() {
+                assert!(
+                    (*value - mat[j][i]).abs() < f64::EPSILON,
+                    "KF matrix not symmetric at [{i}][{j}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pairwise_kf_differs_from_wrf() {
+        let snaps = three_snaps();
+        let wrf = pairwise_wrf_matrix(&snaps);
+        let kf = pairwise_kf_matrix(&snaps);
+        let n = wrf.len();
+
+        // KF uses squared branch-length differences; WRF uses absolute — values must differ
+        let any_different = (0..n)
+            .flat_map(|i| (i + 1..n).map(move |j| (i, j)))
+            .any(|(i, j)| (kf[i][j] - wrf[i][j]).abs() > f64::EPSILON);
+        assert!(
+            any_different,
+            "KF and WRF produced identical values — expected differences"
+        );
+    }
+}
+
+#[cfg(test)]
+mod snapshot_vs_direct_tests {
+    use super::*;
+
+    // Reuse the same 12-tree fixture from the existing tests so we get
+    // a mix of both identical and very different tree pairs.
+    const TREES: &[&str] = &[
+        "(A:0.1,(B:0.1,(H:0.1,(D:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
+        "(A:0.1,(B:0.1,(D:0.1,((J:0.1,H:0.1):0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1);",
+        "(A:0.1,(B:0.1,(D:0.1,(H:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
+        "(A:0.1,(B:0.1,(E:0.1,(G:0.1,((F:0.1,I:0.1):0.1,((J:0.1,(H:0.1,D:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
+        "(A:0.1,(B:0.1,(E:0.1,(G:0.1,((F:0.1,I:0.1):0.1,(((J:0.1,H:0.1):0.1,D:0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
+        "(A:0.1,(B:0.1,(E:0.1,((F:0.1,I:0.1):0.1,(G:0.1,((J:0.1,(H:0.1,D:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
+    ];
+
+    fn build_snapshots() -> (Vec<PhyloTree>, Vec<TreeSnapshot>) {
+        let trees: Vec<PhyloTree> = TREES
+            .iter()
+            .map(|nwk| PhyloTree::from_newick(nwk).unwrap())
+            .collect();
+
+        let snapshots: Vec<TreeSnapshot> = trees
+            .iter()
+            .map(|t| TreeSnapshot::from_tree(t, false).unwrap())
+            .collect();
+
+        (trees, snapshots)
+    }
+
+    #[test]
+    fn rf_matrix_matches_direct() {
+        let (trees, snapshots) = build_snapshots();
+        let mat = pairwise_rf_matrix(&snapshots);
+
+        for i in 0..trees.len() {
+            for j in 0..trees.len() {
+                let direct = robinson_foulds(&trees[i], &trees[j]).unwrap();
+                assert_eq!(
+                    mat[i][j], direct,
+                    "RF matrix[{i}][{j}] = {} but direct = {}",
+                    mat[i][j], direct
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wrf_matrix_matches_direct() {
+        let (trees, snapshots) = build_snapshots();
+        let mat = pairwise_wrf_matrix(&snapshots);
+
+        for i in 0..trees.len() {
+            for j in 0..trees.len() {
+                let direct = weighted_robinson_foulds(&trees[i], &trees[j]).unwrap();
+                assert!(
+                    (mat[i][j] - direct).abs() < f64::EPSILON,
+                    "WRF matrix[{i}][{j}] = {} but direct = {}",
+                    mat[i][j],
+                    direct
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kf_matrix_matches_direct() {
+        let (trees, snapshots) = build_snapshots();
+        let mat = pairwise_kf_matrix(&snapshots);
+
+        for i in 0..trees.len() {
+            for j in 0..trees.len() {
+                let direct = kuhner_felsenstein(&trees[i], &trees[j]).unwrap();
+                assert!(
+                    (mat[i][j] - direct).abs() < f64::EPSILON,
+                    "KF matrix[{i}][{j}] = {} but direct = {}",
+                    mat[i][j],
+                    direct
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_matrices_agree_on_diagonal() {
+        let (_, snapshots) = build_snapshots();
+        let rf = pairwise_rf_matrix(&snapshots);
+        let wrf = pairwise_wrf_matrix(&snapshots);
+        let kf = pairwise_kf_matrix(&snapshots);
+        let n = snapshots.len();
+
+        for i in 0..n {
+            assert_eq!(rf[i][i], 0, "RF diagonal [{i}] should be 0");
+            assert_eq!(wrf[i][i], 0.0, "WRF diagonal [{i}] should be 0.0");
+            assert_eq!(kf[i][i], 0.0, "KF diagonal [{i}] should be 0.0");
+        }
     }
 }
