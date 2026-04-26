@@ -94,7 +94,7 @@ jobs:
                   pip install maturin pytest
 
             - name: Build and install package
-              run: pip install -e . --verbose
+              run: pip install -e .[dev] --verbose
               env:
                   RUST_BACKTRACE: 1
 

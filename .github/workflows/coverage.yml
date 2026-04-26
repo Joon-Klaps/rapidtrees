@@ -62,7 +62,7 @@ jobs:
                   pip install maturin pytest pytest-cov
 
             - name: Build and install package
-              run: pip install -e . --verbose
+              run: pip install -e .[dev] --verbose
 
             - name: Run Python tests with coverage
               run: pytest tests/test_python_api.py -v --cov=rapidtrees --cov-report=xml:python-coverage.xml
