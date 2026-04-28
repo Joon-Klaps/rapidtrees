@@ -1,7 +1,6 @@
 use clap::{Parser, ValueEnum};
-use phylotree::tree::Tree;
 use rapidtrees::distances::{pairwise_kf_matrix, pairwise_rf_matrix, pairwise_wrf_matrix};
-use rapidtrees::io::{read_beast_trees, read_snap, write_matrix_tsv, write_snap};
+use rapidtrees::io::{load_beast_trees, load_snapshots, write_matrix_tsv, write_snap};
 use rapidtrees::snapshot::TreeSnapshot;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -87,10 +86,55 @@ fn main() {
 
     let quiet = args.quiet;
 
-    let (names, distance_input) = match &args.snap_input {
-        Some(path) => load_from_snap(path, quiet),
-        None => load_from_beast(&args, quiet),
+    let t = Instant::now();
+    let (taxon_map, trees) = match &args.snap_input {
+        Some(path) => load_snapshots(path).unwrap_or_else(|e| {
+            eprintln!("Failed to load trees: {e}");
+            std::process::exit(1);
+        }),
+        None => load_beast_trees(
+            args.input.as_ref().unwrap(),
+            args.burnin_trees,
+            args.burnin_states,
+            args.use_real_taxa,
+            args.rooted,
+        ),
     };
+
+    let (names, snapshots): (Vec<String>, Vec<TreeSnapshot>) = trees.into_iter().unzip();
+
+    log_if(
+        quiet,
+        format!(
+            "Loaded {} trees from {} in {:.3}s",
+            names.len(),
+            if let Some(path) = &args.snap_input {
+                format!("snap {path:?}")
+            } else {
+                "BEAST file".to_string()
+            },
+            t.elapsed().as_secs_f64()
+        ),
+    );
+
+    // If --export-snap is specified, write the snapshots to a .snap file and exit
+    if let Some(snap_path) = args.export_snap {
+        let t = Instant::now();
+        let mut taxa_names: Vec<String> = taxon_map.values().cloned().collect();
+        taxa_names.sort_unstable();
+        if let Err(e) = write_snap(&snap_path, &names, &taxa_names, &snapshots) {
+            eprintln!("Failed to write snap {snap_path:?}: {e}");
+            std::process::exit(5);
+        }
+        log_if(
+            quiet,
+            format!(
+                "Exported snapshots to snap {snap_path:?} in {:.3}s",
+                t.elapsed().as_secs_f64()
+            ),
+        );
+        return;
+    }
 
     let n_pairs = names.len() * (names.len() - 1) / 2;
     let metric_label = metric_label(args.metric);
@@ -100,7 +144,7 @@ fn main() {
     );
 
     let t = Instant::now();
-    let mat = compute_matrix(args.metric, &distance_input);
+    let mat = compute_matrix(args.metric, &DistanceInput::Snapshots(snapshots));
     log_if(
         quiet,
         format!(
@@ -119,104 +163,6 @@ fn main() {
         format!(
             "Wrote matrix to {} in {:.3}s",
             args.output.display(),
-            t.elapsed().as_secs_f64()
-        ),
-    );
-}
-
-fn load_from_snap(path: &PathBuf, quiet: bool) -> (Vec<String>, DistanceInput) {
-    let t = Instant::now();
-    let (names, _taxa_names, snapshots) = read_snap(path).unwrap_or_else(|e| {
-        eprintln!("Failed to read snap {path:?}: {e}");
-        std::process::exit(2);
-    });
-    log_if(
-        quiet,
-        format!(
-            "Read snap with {} trees in {:.3}s",
-            names.len(),
-            t.elapsed().as_secs_f64()
-        ),
-    );
-    (names, DistanceInput::Snapshots(snapshots))
-}
-
-fn load_from_beast(args: &Args, quiet: bool) -> (Vec<String>, DistanceInput) {
-    let path = args
-        .input
-        .as_ref()
-        .expect("clap guarantees either --input or --snap-input");
-
-    let t = Instant::now();
-    let (taxons, named_trees) = read_beast_trees(
-        path,
-        args.burnin_trees,
-        args.burnin_states,
-        args.use_real_taxa,
-    );
-    if named_trees.is_empty() {
-        eprintln!("No trees parsed from {path:?}.");
-        std::process::exit(2);
-    }
-    log_if(
-        quiet,
-        format!(
-            "Read {} trees ({} taxa) from BEAST file in {:.3}s",
-            named_trees.len(),
-            taxons.len(),
-            t.elapsed().as_secs_f64()
-        ),
-    );
-
-    let (names, trees): (Vec<String>, Vec<_>) = named_trees.into_iter().unzip();
-
-    let t = Instant::now();
-    let snaps: Vec<TreeSnapshot> = trees
-        .iter()
-        .map(|t| TreeSnapshot::from_tree(t, args.rooted))
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to build snapshots: {e}");
-            std::process::exit(3);
-        });
-    log_if(
-        quiet,
-        format!("Built tree snapshots in {:.3}s", t.elapsed().as_secs_f64()),
-    );
-
-    if let Some(snap_path) = &args.export_snap {
-        export_snap(snap_path, &names, &trees, &snaps, quiet);
-    }
-
-    (names, DistanceInput::Snapshots(snaps))
-}
-
-fn export_snap(
-    snap_path: &PathBuf,
-    names: &[String],
-    trees: &[Tree],
-    snaps: &[TreeSnapshot],
-    quiet: bool,
-) {
-    let mut taxa_names: Vec<String> = trees[0]
-        .get_leaves()
-        .iter()
-        .filter_map(|&id| trees[0].get(&id).ok()?.name.clone())
-        .collect();
-    taxa_names.sort_unstable();
-
-    let t = Instant::now();
-    if let Err(e) = write_snap(snap_path, names, &taxa_names, snaps) {
-        eprintln!("Failed to write snap {snap_path:?}: {e}");
-        std::process::exit(5);
-    }
-    log_if(
-        quiet,
-        format!(
-            "Exported snap ({} trees, {} taxa) to {} in {:.3}s",
-            snaps.len(),
-            taxa_names.len(),
-            snap_path.display(),
             t.elapsed().as_secs_f64()
         ),
     );

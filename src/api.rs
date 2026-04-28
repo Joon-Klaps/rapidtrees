@@ -4,17 +4,14 @@
 //! contains only the PyO3-specific glue: iterating Python iterators, wrapping
 //! byte buffers into `PyBytes`, and registering functions in the Python module.
 
-use phylotree::tree::Tree as PhyloTree;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyIterator};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 
 use crate::bitset::Bitset;
 use crate::distances::{pairwise_kf_matrix, pairwise_rf_matrix, pairwise_wrf_matrix};
-use crate::io::{
-    read_and_snapshot_trees, rename_leaf_nodes, snapshot_newicks, strip_beast_annotations,
-};
+use crate::io::{load_beast_trees, parse_and_snapshot_newicks};
 use crate::snapshot::TreeSnapshot;
 
 type PyRfSnapshotResult = (Vec<String>, Py<PyAny>, Vec<String>, usize, Py<PyAny>);
@@ -140,18 +137,38 @@ fn pairwise_rf_from_newicks(
             newicks.len()
         )));
     }
-    let (snapshots, _leaf_names) =
-        snapshot_newicks(&newicks, &translate_maps, &map_indices, rooted)
-            .map_err(PyValueError::new_err)?;
+    validate_iter_args(names.len(), &map_indices, &translate_maps)?;
+    let entries = newicks
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), &translate_maps[map_indices[i]]));
+    let (snapshots, _) =
+        parse_and_snapshot_newicks(entries, rooted).map_err(PyValueError::new_err)?;
     Ok((names, pairwise_rf_matrix(&snapshots)))
+}
+
+/// Load and snapshot trees from multiple BEAST/NEXUS files in a single flat pass.
+fn read_and_snapshot_trees(
+    paths: &[String],
+    burnin_trees: usize,
+    burnin_states: usize,
+    use_real_taxa: bool,
+    rooted: bool,
+) -> Result<(Vec<String>, Vec<TreeSnapshot>), String> {
+    let (names, snapshots): (Vec<_>, Vec<_>) = paths
+        .iter()
+        .flat_map(|p| load_beast_trees(p, burnin_trees, burnin_states, use_real_taxa, rooted).1)
+        .unzip();
+    if snapshots.len() < 2 {
+        return Err("Need at least 2 trees to compute pairwise distances".into());
+    }
+    Ok((names, snapshots))
 }
 
 /// Collect tree snapshots from a lazy Python iterator of newick strings.
 ///
-/// This mirrors `snapshot_newicks`, but it must validate incrementally because a
-/// lazy Python iterator cannot be batch-validated through the shared `io.rs` helper.
-///
-/// This function must live in `api.rs` because it consumes a `Bound<'_, PyIterator>`.
+/// Validates that exactly `n` strings are yielded, then delegates to
+/// [`parse_and_snapshot_newicks`] for parsing and leaf-set validation.
 fn collect_snapshots_from_iter(
     n: usize,
     newick_iter: Bound<'_, PyIterator>,
@@ -159,82 +176,30 @@ fn collect_snapshots_from_iter(
     map_indices: &[usize],
     rooted: bool,
 ) -> PyResult<(Vec<TreeSnapshot>, Vec<String>)> {
-    let mut snapshots: Vec<TreeSnapshot> = Vec::with_capacity(n);
-    let mut sorted_leaf_names: Vec<String> = Vec::new();
-    let mut reference_leaves: Option<HashSet<String>> = None;
-    let mut tree_count: usize = 0;
-
-    for item in newick_iter {
-        let item = item?;
-        let newick: String = item.extract()?;
-
-        if tree_count >= n {
-            return Err(PyValueError::new_err(format!(
-                "Iterator yielded more than {} newick strings (expected {})",
-                n, n
-            )));
-        }
-
-        let map_idx = map_indices[tree_count];
-        let clean = strip_beast_annotations(&newick);
-        let mut tree = PhyloTree::from_newick(&clean).map_err(|e| {
-            PyValueError::new_err(format!(
-                "Failed to parse newick at index {}: {}",
-                tree_count, e
-            ))
-        })?;
-        rename_leaf_nodes(&mut tree, &translate_maps[map_idx]);
-
-        let leaves: HashSet<String> = tree
-            .get_leaves()
-            .iter()
-            .filter_map(|&id| tree.get(&id).ok()?.name.clone())
-            .collect();
-
-        match &reference_leaves {
-            None => {
-                let mut sorted: Vec<String> = leaves.iter().cloned().collect();
-                sorted.sort_unstable();
-                sorted_leaf_names = sorted;
-                reference_leaves = Some(leaves);
+    let newicks: Vec<String> = newick_iter
+        .enumerate()
+        .map(|(i, item)| -> PyResult<String> {
+            if i >= n {
+                return Err(PyValueError::new_err(format!(
+                    "Iterator yielded more than {n} newick strings (expected {n})"
+                )));
             }
-            Some(ref_leaves) => {
-                if leaves.len() != ref_leaves.len() {
-                    return Err(PyValueError::new_err(format!(
-                        "Tree {} has {} leaves, but tree 0 has {} leaves. All trees must have the same number of leaves.",
-                        tree_count,
-                        leaves.len(),
-                        ref_leaves.len()
-                    )));
-                }
-                if leaves != *ref_leaves {
-                    return Err(PyValueError::new_err(format!(
-                        "Tree {} has different leaf set than tree 0. All trees must have the same taxa.",
-                        tree_count
-                    )));
-                }
-            }
-        }
+            item?.extract()
+        })
+        .collect::<PyResult<_>>()?;
 
-        let snapshot = TreeSnapshot::from_tree(&tree, rooted).map_err(|e| {
-            PyValueError::new_err(format!(
-                "Failed to create tree snapshot at index {}: {}",
-                tree_count, e
-            ))
-        })?;
-        snapshots.push(snapshot);
-        tree_count += 1;
-        // `newick` and `tree` are dropped here — only the snapshot is retained
-    }
-
-    if tree_count != n {
+    if newicks.len() != n {
         return Err(PyValueError::new_err(format!(
-            "Iterator yielded {} newick strings, but names has {} entries",
-            tree_count, n
+            "Iterator yielded {} newick strings, but names has {n} entries",
+            newicks.len()
         )));
     }
 
-    Ok((snapshots, sorted_leaf_names))
+    let entries = newicks
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), &translate_maps[map_indices[i]]));
+    parse_and_snapshot_newicks(entries, rooted).map_err(PyValueError::new_err)
 }
 
 /// Validate argument consistency for iterator-based functions.
@@ -417,4 +382,71 @@ fn rapidtrees(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::parse_and_snapshot_newicks;
+
+    fn empty_map() -> HashMap<String, String> {
+        HashMap::new()
+    }
+
+    #[test]
+    fn test_parse_and_snapshot_newicks_basic() {
+        let newicks = [
+            "((A:1,B:1):1,(C:1,D:1):1);".to_string(),
+            "((A:1,C:1):1,(B:1,D:1):1);".to_string(),
+        ];
+        let maps = [empty_map(), empty_map()];
+        let indices = [0usize, 1usize];
+        let entries = newicks
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.as_str(), &maps[indices[i]]));
+        let (snaps, leaf_names) = parse_and_snapshot_newicks(entries, false).unwrap();
+        assert_eq!(snaps.len(), 2);
+        assert_eq!(leaf_names, vec!["A", "B", "C", "D"]);
+    }
+
+    #[test]
+    fn test_parse_and_snapshot_newicks_mismatched_leaves_errors() {
+        let newicks = [
+            "((A:1,B:1):1,(C:1,D:1):1);".to_string(),
+            "((A:1,B:1):1,(C:1,E:1):1);".to_string(), // E instead of D
+        ];
+        let maps = [empty_map(), empty_map()];
+        let indices = [0usize, 1usize];
+        let entries = newicks
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.as_str(), &maps[indices[i]]));
+        assert!(parse_and_snapshot_newicks(entries, false).is_err());
+    }
+
+    #[test]
+    fn test_parse_and_snapshot_newicks_leaf_names_sorted() {
+        // Leaves provided in non-alphabetical order in the newick
+        let newicks = ["((D:1,C:1):1,(B:1,A:1):1);".to_string()];
+        let maps = [empty_map()];
+        let entries = newicks
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.as_str(), &maps[i]));
+        let (_, leaf_names) = parse_and_snapshot_newicks(entries, false).unwrap();
+        assert_eq!(
+            leaf_names,
+            vec!["A", "B", "C", "D"],
+            "leaf names must be sorted"
+        );
+    }
+
+    #[test]
+    fn test_read_and_snapshot_trees_insufficient_trees_errors() {
+        // Non-existent paths produce empty results → fewer than 2 trees → error
+        let result =
+            read_and_snapshot_trees(&["nonexistent.trees".to_string()], 0, 0, false, false);
+        assert!(result.is_err());
+    }
 }
