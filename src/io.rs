@@ -208,6 +208,9 @@ pub fn rename_leaf_nodes(
     phylo_tree: &mut Tree,
     translate: &std::collections::HashMap<String, String>,
 ) {
+    if translate.is_empty() {
+        return;
+    }
     for leaf_id in phylo_tree.get_leaves() {
         if let Ok(node) = phylo_tree.get_mut(&leaf_id) {
             node.name = node.name.as_ref().and_then(|n| translate.get(n).cloned());

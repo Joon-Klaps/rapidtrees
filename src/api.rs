@@ -159,6 +159,9 @@ fn read_and_snapshot_trees(
         .iter()
         .flat_map(|p| load_beast_trees(p, burnin_trees, burnin_states, use_real_taxa, rooted).1)
         .unzip();
+    if snapshots.is_empty() {
+        return Err("No trees found after applying burnin filters".into());
+    }
     if snapshots.len() < 2 {
         return Err("Need at least 2 trees to compute pairwise distances".into());
     }
