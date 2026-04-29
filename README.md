@@ -17,6 +17,7 @@
   <a href="#-installing">Installing</a> •
   <a href="#-usage">Usage</a> •
   <a href="#-python-api">Python API</a> •
+  <a href="#-snap-format">Snap Format</a> •
   <a href="#%EF%B8%8F-benchmarks">Benchmarks</a>
 </p>
 
@@ -24,7 +25,7 @@
 
 ## 🗺️ Overview
 
-`rapidtrees` computes pairwise tree distances from [BEAST](https://beast.community/)/NEXUS `.trees` files and writes a labeled distance matrix. Three metrics are supported:
+`rapidtrees` computes pairwise tree distances from [BEAST](https://beast.community/)/NEXUS `.trees` files or from precomputed `.snap` files and writes a labeled distance matrix. Three metrics are supported:
 
 | Metric             | Flag                | Output  | Description                                   |
 | ------------------ | ------------------- | ------- | --------------------------------------------- |
@@ -85,7 +86,7 @@ pip install -e .        # Python bindings (requires Rust toolchain + maturin)
 
 ```bash
 rapidtrees \
-  --input <path/to/file.trees> \
+  (--input <path/to/file.trees> | --snap-input <path/to/file.snap>) \
   --output <path/to/output.tsv[.gz]> \
   [--burnin-trees <N>] \
   [--burnin-states <STATE>] \
@@ -97,6 +98,7 @@ rapidtrees \
 | Flag                          | Description                                                        |
 | ----------------------------- | ------------------------------------------------------------------ |
 | `-i, --input <INPUT>`         | Path to BEAST `.trees` (NEXUS) file                                |
+| `--snap-input <SNAP_INPUT>`   | Path to `.snap` file (currently supports only `--metric rf`)       |
 | `-o, --output <OUTPUT>`       | Output path. Use `.gz` suffix for gzip compression; `-` for stdout |
 | `-t, --burnin-trees <N>`      | Drop the first N trees (default: `0`)                              |
 | `-s, --burnin-states <STATE>` | Keep only trees with `STATE > STATE` (default: `0`)                |
@@ -146,6 +148,22 @@ rapidtrees \
 
 </details>
 
+<details>
+<summary><strong>Compute RF matrix directly from a snapshot file</strong></summary>
+
+```bash
+rapidtrees \
+  --snap-input out/hiv1.snap \
+  -o out/hiv1_rf_from_snap.tsv.gz \
+  --metric rf
+
+# Read snap with 21 trees and 2193 bipartitions in 0.001s
+# Determined distances using RF in 0.000s
+# Writing to out/hiv1_rf_from_snap.tsv.gz in 0.000s
+```
+
+</details>
+
 ---
 
 ## 🐍 Python API
@@ -180,6 +198,83 @@ print(f"RF distance between tree 0 and 1: {rf_matrix[0][1]}")
 ```
 
 ---
+
+## 📦 Snap Format
+
+`rapidtrees` can export tree snapshots to a compressed binary `.snap` file for downstream analyses (ESS computation, ASDSF, convergence diagnostics) on HPC clusters without re-parsing the original `.trees` files. The CLI can also compute RF distance matrices directly from `.snap` files via `--snap-input`.
+
+### What is a snapshot?
+
+A **tree snapshot** is a compact bitset representation of a phylogenetic tree. Each bipartition (split) is encoded as a bitset over leaf indices. The full set of snapshots for a tree collection captures everything needed for RF-family distance computations and convergence diagnostics — without storing the original Newick strings.
+
+> **Note:** Snapshots are not human-readable and are not intended for general interchange. They are an internal format optimized for fast distance calculations and cannot be convert to it's original newick-style format.
+
+### File layout
+
+A `.snap` file is a **gzip-compressed** binary stream with the following sections in order:
+
+```
+┌─────────────────────────────────────────────────────┐
+│  HEADER                                              │
+│  4 bytes  magic        "SNAP" (0x534E4150)          │
+│  1 byte   version      format version (currently 1) │
+│  8 bytes  n_trees      u64 LE — number of trees     │
+│  8 bytes  n_taxa       u64 LE — number of leaf taxa │
+│  8 bytes  n_bip        u64 LE — number of unique    │
+│                         bipartitions across all trees│
+├─────────────────────────────────────────────────────┤
+│  TAXA NAMES                                          │
+│  For each of n_taxa:                                 │
+│    4 bytes  length     u32 LE — byte length of name │
+│    N bytes  name       UTF-8 string                  │
+├─────────────────────────────────────────────────────┤
+│  TREE NAMES                                          │
+│  For each of n_trees:                                │
+│    4 bytes  length     u32 LE — byte length of name │
+│    N bytes  name       UTF-8 string                  │
+├─────────────────────────────────────────────────────┤
+│  PRESENCE MATRIX                                     │
+│  n_trees × n_bip bytes, row-major uint8             │
+│  presence[i][j] = 1 if bipartition j is in tree i  │
+│                   0 otherwise                        │
+└─────────────────────────────────────────────────────┘
+```
+
+Bipartition column order is **deterministic**: columns are sorted in ascending `Bitset` order (lexicographic over `u64` words, i.e. by leaf-index bit pattern), so the same tree set always produces the same column indices regardless of parse order.
+
+### What the presence matrix gives you
+
+The presence matrix is sufficient for all major convergence diagnostics:
+
+| Diagnostic              | What you need                    |
+| ----------------------- | -------------------------------- |
+| **Pseudo ESS**          | `presence.mean(axis=0)` per chain |
+| **ASDSF**               | Per-chain split frequencies       |
+| **Fréchet ESS**         | RF distances via XOR of rows      |
+| **WRF / KF distances**  | Branch lengths *(future section)* |
+
+Note: `sum(presence[i] XOR presence[j]) == RF(tree_i, tree_j)` exactly.
+
+### Loading in Python
+
+```python
+import rapidtrees
+import numpy as np
+
+tree_names, taxa_names, n_bip, pres_bytes = rapidtrees.load_snap("run1.snap")
+n = len(tree_names)
+presence = np.frombuffer(pres_bytes, dtype=np.uint8).reshape(n, n_bip).copy()
+
+# Global split frequencies (for Pseudo ESS / ASDSF)
+global_freq = presence.mean(axis=0)
+
+# RF distance between any two trees — no recomputation needed
+rf_01 = int((presence[0] ^ presence[1]).sum())
+```
+
+---
+
+
 
 ## ⏱️ Benchmarks
 
