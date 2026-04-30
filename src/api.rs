@@ -11,6 +11,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::bitset::Bitset;
 use crate::distances::{pairwise_kf_matrix, pairwise_rf_matrix, pairwise_wrf_matrix};
+use crate::interned::{InternedSnapshots, pairwise_rf_matrix_interned};
 use crate::io::{load_beast_trees, parse_and_snapshot_newicks};
 use crate::snapshot::TreeSnapshot;
 
@@ -372,6 +373,86 @@ fn pairwise_rf_with_snapshots_from_newick_iter(
     ))
 }
 
+/// Compute pairwise RF distances and export tree snapshots in a single pass,
+/// **using bitset interning** for the heavy lifting.
+///
+/// Identical input/output contract to [`pairwise_rf_with_snapshots_from_newick_iter`]
+/// — same 5-tuple shape, byte-identical RF matrix, byte-identical presence
+/// matrix, same XOR identity. The only difference is internal: this function
+/// builds an [`InternedSnapshots`] table so each tree becomes a sorted
+/// `Vec<u32>` of split IDs, and the RF inner loop runs on integers instead of
+/// multi-word `Bitset` cmp.
+///
+/// At small taxa counts (≲300) the two functions perform similarly. The
+/// interned variant pulls ahead at the 1000+ taxa scale where bitsets are
+/// 16+ words and the per-cmp memcmp + working-set overhead dominate.
+///
+/// Both functions coexist on the same wheel so they can be benchmarked
+/// side-by-side without recompiling.
+#[pyfunction]
+#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false))]
+fn pairwise_rf_with_snapshots_interned_from_newick_iter(
+    py: Python<'_>,
+    names: Vec<String>,
+    newick_iter: Bound<'_, PyIterator>,
+    translate_maps: Vec<HashMap<String, String>>,
+    map_indices: Vec<usize>,
+    rooted: bool,
+) -> PyResult<PyRfSnapshotResult> {
+    let n = names.len();
+    validate_iter_args(n, &map_indices, &translate_maps)?;
+
+    let (snapshots, leaf_names) =
+        collect_snapshots_from_iter(n, newick_iter, &translate_maps, &map_indices, rooted)?;
+
+    if snapshots.len() < 2 {
+        return Err(PyValueError::new_err(
+            "Need at least 2 trees to compute pairwise distances",
+        ));
+    }
+
+    // Build the global interning table: every distinct bipartition gets a u32
+    // ID, each snapshot becomes a sorted Vec<u32>. RF then runs on integers.
+    let n_trees = snapshots.len();
+    let interned = InternedSnapshots::from_snapshots(snapshots, leaf_names);
+
+    let rf_matrix = pairwise_rf_matrix_interned(&interned);
+    let rf_bytes: Vec<u8> = rf_matrix
+        .iter()
+        .flat_map(|row| row.iter().flat_map(|&v| (v as u32).to_ne_bytes()))
+        .collect();
+
+    // Presence-matrix columns are sorted by Bitset for API parity with the
+    // bitset-based variant. Interning produced bipartitions in insertion
+    // order; remap to sorted order via a single u32 -> column-index lookup.
+    let n_bipartitions = interned.bipartitions.len();
+    let mut sorted_id_order: Vec<u32> = (0..n_bipartitions as u32).collect();
+    sorted_id_order
+        .sort_unstable_by(|&a, &b| interned.bipartitions[a as usize].cmp(&interned.bipartitions[b as usize]));
+    let mut id_to_col = vec![0u32; n_bipartitions];
+    for (col, &old_id) in sorted_id_order.iter().enumerate() {
+        id_to_col[old_id as usize] = col as u32;
+    }
+
+    let mut presence_vec = vec![0u8; n_trees * n_bipartitions];
+    for (i, snap) in interned.snapshots.iter().enumerate() {
+        let row_off = i * n_bipartitions;
+        for &id in &snap.split_ids {
+            presence_vec[row_off + id_to_col[id as usize] as usize] = 1;
+        }
+    }
+
+    let py_rf = PyBytes::new(py, &rf_bytes);
+    let py_pres = PyBytes::new(py, &presence_vec);
+    Ok((
+        names,
+        py_rf.into(),
+        interned.leaf_names,
+        n_bipartitions,
+        py_pres.into(),
+    ))
+}
+
 /// Python module definition
 #[pymodule]
 fn rapidtrees(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -382,6 +463,10 @@ fn rapidtrees(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pairwise_rf_from_newick_iter, m)?)?;
     m.add_function(wrap_pyfunction!(
         pairwise_rf_with_snapshots_from_newick_iter,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        pairwise_rf_with_snapshots_interned_from_newick_iter,
         m
     )?)?;
     Ok(())
