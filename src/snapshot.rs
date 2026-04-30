@@ -24,6 +24,19 @@
 use crate::bitset::Bitset;
 use phylotree::tree::{Tree as PhyloTree, TreeError};
 use rustc_hash::FxHashMap;
+use std::cell::RefCell;
+
+thread_local! {
+    /// Per-thread FxHashMap reused across `TreeSnapshot::from_tree` calls.
+    ///
+    /// Building snapshots in a tight loop (sequential or rayon-parallel) was
+    /// allocating a fresh FxHashMap per tree — at 5000 trees that's 5000
+    /// hashmap allocations + drops, plus their internal node arrays. Each
+    /// rayon worker keeps its own TLS slot, so this avoids cross-thread
+    /// synchronization while still reusing capacity across calls.
+    static BITSET_CACHE: RefCell<FxHashMap<usize, Bitset>> =
+        RefCell::new(FxHashMap::default());
+}
 
 /// An immutable snapshot of all partitions in a phylogenetic tree.
 ///
@@ -107,34 +120,36 @@ impl TreeSnapshot {
             .map(|(idx, &(node_id, _))| (node_id, idx))
             .collect();
 
-        // Step 3: Perform DFS to build bitsets for each node
+        // Step 3: Perform DFS to build bitsets for each node.
+        // Cache is borrowed from a thread-local pool: clear (drops accumulated
+        // entries) and reserve (ensure capacity matches this tree's node count).
         let root_id = tree.get_root()?;
-        // Cache to store computed bitsets
-        // Key: node_id, Value: Bitset of leaves under this node
-        // Node_id, allows us to get a branch length associated with the partition
-        let mut cache: FxHashMap<usize, Bitset> =
-            FxHashMap::with_capacity_and_hasher(num_leaves * 2, Default::default());
-        Self::compute_bitsets(root_id, tree, &node_id_to_leaf_index, words, &mut cache);
+        BITSET_CACHE.with(|cell| -> Result<TreeSnapshot, TreeError> {
+            let mut cache = cell.borrow_mut();
+            cache.clear();
+            cache.reserve(num_leaves * 2);
+            Self::compute_bitsets(root_id, tree, &node_id_to_leaf_index, words, &mut cache);
 
-        // Step 4: Collect partitions (with or without trivial partitions)
-        let (parts, lengths) = Self::collect_partitions(tree, root_id, &cache)?;
+            // Step 4: Collect partitions (with or without trivial partitions)
+            let (parts, lengths) = Self::collect_partitions(tree, root_id, &cache)?;
 
-        // Step 5: Canonicalize partitions
-        // rooted_mode=false: bipartitions (canonicalized, deduped, trivial-filtered)
-        // rooted_mode=true:  clades (raw subtree bitsets, just sorted)
-        let (parts_canonical, lengths_canonical) =
-            Self::canonicalize_partitions(parts, lengths, words, num_leaves, rooted_mode);
+            // Step 5: Canonicalize partitions
+            // rooted_mode=false: bipartitions (canonicalized, deduped, trivial-filtered)
+            // rooted_mode=true:  clades (raw subtree bitsets, just sorted)
+            let (parts_canonical, lengths_canonical) =
+                Self::canonicalize_partitions(parts, lengths, words, num_leaves, rooted_mode);
 
-        // Step 6: Record root's children for rooted tree adjustment
-        let root_children = Self::get_root_children(tree, root_id, &cache)?;
+            // Step 6: Record root's children for rooted tree adjustment
+            let root_children = Self::get_root_children(tree, root_id, &cache)?;
 
-        Ok(TreeSnapshot {
-            parts: parts_canonical,
-            lengths: lengths_canonical,
-            root_children,
-            words,
-            num_leaves,
-            rooted,
+            Ok(TreeSnapshot {
+                parts: parts_canonical,
+                lengths: lengths_canonical,
+                root_children,
+                words,
+                num_leaves,
+                rooted,
+            })
         })
     }
 
