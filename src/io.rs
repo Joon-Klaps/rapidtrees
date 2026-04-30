@@ -3,6 +3,7 @@ use crate::bitset::Bitset;
 use crate::snapshot::TreeSnapshot;
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use phylotree::tree::Tree;
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -43,45 +44,75 @@ pub fn strip_beast_annotations(newick: &str) -> String {
 ///
 /// All entries must share the same leaf set; the first tree establishes the
 /// reference and subsequent trees are validated against it.
+///
+/// Tree 0 is parsed sequentially to establish the reference leaf set; all
+/// remaining trees are parsed in parallel via rayon. Each worker only reads
+/// the shared `reference_leaves` (via `&HashSet`), so no synchronization is
+/// needed beyond rayon's own join. Output order matches input order — `par_iter`
+/// + `collect::<Result<Vec<_>>>` preserves indexing, which downstream RF
+/// computation relies on.
 pub fn parse_and_snapshot_newicks<'a>(
     entries: impl Iterator<Item = (&'a str, &'a HashMap<String, String>)>,
     rooted: bool,
 ) -> Result<(Vec<TreeSnapshot>, Vec<String>), String> {
-    let mut snapshots = Vec::new();
-    let mut reference_leaves: Option<HashSet<String>> = None;
-    let mut sorted_leaf_names = Vec::new();
+    let entries: Vec<(&'a str, &'a HashMap<String, String>)> = entries.collect();
+    if entries.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
 
-    // iter & enum & map & collect is a bit cleaner than a for loop with manual indexing and error messages
-    for (i, (newick, translate)) in entries.enumerate() {
-        let clean = strip_beast_annotations(newick);
-        let mut tree = Tree::from_newick(&clean)
-            .map_err(|e| format!("Failed to parse newick at index {i}: {e}"))?;
-        rename_leaf_nodes(&mut tree, translate);
+    // Phase 1 — sequentially process tree 0 to establish the reference leaf
+    // set + sorted_leaf_names. Required because the parallel section needs
+    // a fixed reference to validate against.
+    let (first_newick, first_translate) = entries[0];
+    let first_clean = strip_beast_annotations(first_newick);
+    let mut first_tree = Tree::from_newick(&first_clean)
+        .map_err(|e| format!("Failed to parse newick at index 0: {e}"))?;
+    rename_leaf_nodes(&mut first_tree, first_translate);
 
-        let leaves: HashSet<String> = tree
-            .get_leaves()
-            .iter()
-            .filter_map(|&id| tree.get(&id).ok()?.name.clone())
-            .collect();
+    let reference_leaves: HashSet<String> = first_tree
+        .get_leaves()
+        .iter()
+        .filter_map(|&id| first_tree.get(&id).ok()?.name.clone())
+        .collect();
+    let mut sorted_leaf_names: Vec<String> = reference_leaves.iter().cloned().collect();
+    sorted_leaf_names.sort_unstable();
 
-        if let Some(ref_leaves) = &reference_leaves {
-            if leaves != *ref_leaves {
+    let first_snapshot = TreeSnapshot::from_tree(&first_tree, rooted)
+        .map_err(|e| format!("Failed to create tree snapshot at index 0: {e}"))?;
+    drop(first_tree); // free before launching the parallel workers
+
+    // Phase 2 — parse + validate + snapshot the remaining trees in parallel.
+    // `par_iter` over the slice yields `&(&str, &HashMap)`; the `&(n, t)` pattern
+    // destructures the reference because the inner tuple is Copy.
+    let rest: Vec<TreeSnapshot> = entries[1..]
+        .par_iter()
+        .enumerate()
+        .map(|(j, &(newick, translate))| {
+            let i = j + 1; // original (caller-facing) index for error messages
+            let clean = strip_beast_annotations(newick);
+            let mut tree = Tree::from_newick(&clean)
+                .map_err(|e| format!("Failed to parse newick at index {i}: {e}"))?;
+            rename_leaf_nodes(&mut tree, translate);
+
+            let leaves: HashSet<String> = tree
+                .get_leaves()
+                .iter()
+                .filter_map(|&id| tree.get(&id).ok()?.name.clone())
+                .collect();
+            if leaves != reference_leaves {
                 return Err(format!(
                     "Tree {i} has different leaf set than tree 0. All trees must have the same taxa."
                 ));
             }
-        } else {
-            let mut sorted: Vec<String> = leaves.iter().cloned().collect();
-            sorted.sort_unstable();
-            sorted_leaf_names = sorted;
-            reference_leaves = Some(leaves);
-        }
 
-        snapshots.push(
             TreeSnapshot::from_tree(&tree, rooted)
-                .map_err(|e| format!("Failed to create tree snapshot at index {i}: {e}"))?,
-        );
-    }
+                .map_err(|e| format!("Failed to create tree snapshot at index {i}: {e}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut snapshots = Vec::with_capacity(entries.len());
+    snapshots.push(first_snapshot);
+    snapshots.extend(rest);
 
     Ok((snapshots, sorted_leaf_names))
 }
