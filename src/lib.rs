@@ -5,12 +5,14 @@
 //! - `io`: reading and parsing BEAST/NEXUS tree files.
 //! - `bitset`: compact bitset representation for tree partitions.
 //! - `snapshot`: tree snapshot for efficient distance calculations.
+//! - `interned`: globally-deduped split-ID representation of snapshots.
 //! - `api`: Python bindings via `pyo3` (gated behind "python" feature).
 //!
 //! Public API kept stable by re-exporting key items from the new modules.
 
 pub mod bitset;
 pub mod distances;
+pub mod interned;
 pub mod io;
 pub mod snapshot;
 
