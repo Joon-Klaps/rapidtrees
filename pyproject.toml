@@ -56,6 +56,6 @@ test-rust = { cmd = "cargo test --lib", description = "Run Rust unit tests" }
 test-python = { cmd = "pytest tests/test_python_api.py -v", description = "Run Python API tests" }
 test-python-cov = { cmd = "pytest tests/test_python_api.py -v --cov=rapidtrees --cov-report=xml:python-coverage.xml", description = "Run Python tests with coverage" }
 fmt = { cmd = "cargo fmt --check", description = "Check Rust formatting" }
-clippy = { cmd = "cargo clippy -- -D warnings", description = "Run Clippy linter" }
+clippy = { cmd = "cargo clippy --all-targets --all-features -- -D warnings", description = "Run Clippy linter" }
 bench = { cmd = "cargo bench", description = "Run performance benchmarks" }
 pre-commit = { cmd = "prek run --config .pre-commit-config.yaml --all-files" }

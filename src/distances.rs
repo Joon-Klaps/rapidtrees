@@ -778,9 +778,9 @@ mod tests {
         for i in 0..n {
             for j in 0..n {
                 for k in 0..n {
-                    let d_ij = mat[i * n + j] as f64;
-                    let d_jk = mat[j * n + k] as f64;
-                    let d_ik = mat[i * n + k] as f64;
+                    let d_ij = mat[i * n + j];
+                    let d_jk = mat[j * n + k];
+                    let d_ik = mat[i * n + k];
                     // Add a small epsilon for floats (WRF/KF)
                     assert!(
                         d_ik <= d_ij + d_jk + 1e-10,
@@ -803,9 +803,9 @@ mod tests {
         for i in 0..n {
             for j in 0..n {
                 for k in 0..n {
-                    let d_ij = mat[i * n + j] as f64;
-                    let d_jk = mat[j * n + k] as f64;
-                    let d_ik = mat[i * n + k] as f64;
+                    let d_ij = mat[i * n + j];
+                    let d_jk = mat[j * n + k];
+                    let d_ik = mat[i * n + k];
                     // Add a small epsilon for floats (WRF/KF)
                     assert!(
                         d_ik <= d_ij + d_jk + 1e-10,
