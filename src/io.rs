@@ -1,12 +1,24 @@
-use crate::bitset::Bitset;
-use crate::snapshot::{InternSnap, Snapshots};
-use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+use crate::snapshot::Snapshots;
 use phylotree::tree::Tree;
-use rustc_hash::FxHashMap;
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::fs;
+
 use std::path::Path;
+
+#[cfg(feature = "cli")]
+use crate::bitset::Bitset;
+#[cfg(feature = "cli")]
+use crate::snapshot::InternSnap;
+#[cfg(feature = "cli")]
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+#[cfg(feature = "cli")]
+use rustc_hash::FxHashMap;
+#[cfg(feature = "cli")]
+use std::fs::File;
+#[cfg(feature = "cli")]
+use std::io;
+#[cfg(feature = "cli")]
+use std::io::{BufReader, BufWriter, Read, Write};
 
 /// Strip BEAST `[&...]` annotations from a Newick string.
 pub(crate) fn strip_beast_annotations(newick: &str) -> String {
@@ -309,13 +321,14 @@ pub fn load_snapshots<P: AsRef<Path>>(path: P) -> io::Result<(Vec<String>, Snaps
 }
 
 // ── Private helpers ────────────────────────────────────────────────────────────
-
+#[cfg(feature = "cli")]
 fn snap_read_u64<R: io::Read>(r: &mut R) -> io::Result<u64> {
     let mut buf = [0u8; 8];
     r.read_exact(&mut buf)?;
     Ok(u64::from_le_bytes(buf))
 }
 
+#[cfg(feature = "cli")]
 fn snap_read_strings<R: io::Read>(r: &mut R, n: usize) -> io::Result<Vec<String>> {
     (0..n)
         .map(|_| {
