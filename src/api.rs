@@ -24,6 +24,12 @@ fn collect_snapshots_from_iter(
         .map(|item| item?.extract::<String>())
         .collect::<PyResult<_>>()?;
 
+    if newicks.len() < 2 {
+        return Err(PyValueError::new_err(
+            "Need at least 2 trees to compute pairwise distances",
+        ));
+    }
+
     let entries = newicks
         .iter()
         .zip(map_indices.iter())
@@ -33,23 +39,26 @@ fn collect_snapshots_from_iter(
 
 /// Validate argument consistency for iterator-based functions.
 fn validate_iter_args(
-    n: usize,
+    names: &[String],
     map_indices: &[usize],
     translate_maps: &[HashMap<String, String>],
 ) -> PyResult<()> {
-    if n < 2 {
+    let n_names = names.len();
+
+    if n_names < 2 {
         return Err(PyValueError::new_err(
             "Need at least 2 trees to compute pairwise distances",
         ));
     }
 
-    if n != map_indices.len() {
+    if n_names != map_indices.len() {
         return Err(PyValueError::new_err(format!(
             "names length ({}) must equal map_indices length ({})",
-            n,
+            n_names,
             map_indices.len()
         )));
     }
+
     for (i, &idx) in map_indices.iter().enumerate() {
         if idx >= translate_maps.len() {
             return Err(PyValueError::new_err(format!(
@@ -87,6 +96,8 @@ fn pairwise_rf_from_newick_iter(
     map_indices: Vec<usize>,
     rooted: bool,
 ) -> PyResult<(Vec<String>, Py<PyAny>)> {
+    validate_iter_args(&names, &map_indices, &translate_maps)?;
+
     let snaps = collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted)?;
 
     let rf_matrix = snaps.pairwise_rf();
@@ -136,8 +147,7 @@ fn pairwise_rf_with_snapshots_from_newick_iter(
     map_indices: Vec<usize>,
     rooted: bool,
 ) -> PyResult<PyRfSnapshotResult> {
-    let n = names.len();
-    validate_iter_args(n, &map_indices, &translate_maps)?;
+    validate_iter_args(&names, &map_indices, &translate_maps)?;
 
     let snaps = collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted)?;
 
@@ -185,8 +195,7 @@ fn pairwise_wrf_from_newick_iter(
     map_indices: Vec<usize>,
     rooted: bool,
 ) -> PyResult<(Vec<String>, Vec<f64>)> {
-    let n = names.len();
-    validate_iter_args(n, &map_indices, &translate_maps)?;
+    validate_iter_args(&names, &map_indices, &translate_maps)?;
 
     let snaps = collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted)?;
 
@@ -216,8 +225,7 @@ fn pairwise_kf_from_newick_iter(
     map_indices: Vec<usize>,
     rooted: bool,
 ) -> PyResult<(Vec<String>, Vec<f64>)> {
-    let n = names.len();
-    validate_iter_args(n, &map_indices, &translate_maps)?;
+    validate_iter_args(&names, &map_indices, &translate_maps)?;
 
     let snaps = collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted)?;
 
