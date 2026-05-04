@@ -1,11 +1,65 @@
 use cpu_time::ProcessTime;
-use memory_stats::memory_stats;
-use phylotree::tree::Tree as PhyloTree;
-use rapidtrees::distances::rf_from_snapshots;
-use rapidtrees::snapshot::TreeSnapshot;
-use rayon::prelude::*;
+use rapidtrees::{Bitset, Snapshots};
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::mem;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+// ---------------------------------------------------------------------------
+// Tracking allocator
+// ---------------------------------------------------------------------------
+
+static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+
+struct TrackingAllocator;
+
+unsafe impl GlobalAlloc for TrackingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        unsafe {
+            let ptr = System.alloc(layout);
+            if !ptr.is_null() {
+                ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed);
+            }
+            ptr
+        }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe {
+            System.dealloc(ptr, layout);
+            ALLOCATED.fetch_sub(layout.size(), Ordering::Relaxed);
+        }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        unsafe {
+            let ptr = System.alloc_zeroed(layout);
+            if !ptr.is_null() {
+                ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed);
+            }
+            ptr
+        }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        unsafe {
+            let new_ptr = System.realloc(ptr, layout, new_size);
+            if !new_ptr.is_null() {
+                // Subtract old size, add new size
+                ALLOCATED.fetch_sub(layout.size(), Ordering::Relaxed);
+                ALLOCATED.fetch_add(new_size, Ordering::Relaxed);
+            }
+            new_ptr
+        }
+    }
+}
+
+#[global_allocator]
+static GLOBAL: TrackingAllocator = TrackingAllocator;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 fn generate_balanced_newick(start_index: usize, num_leaves: usize) -> String {
     if num_leaves == 1 {
@@ -61,26 +115,72 @@ fn format_count(count: u64) -> String {
     }
 }
 
-fn estimate_size(snap: &TreeSnapshot) -> usize {
-    let mut size = mem::size_of::<TreeSnapshot>();
+/// Estimate heap memory used by a `Snapshots` collection.
+///
+/// Since the internal `Vec<InternSnap>` is not public, the per-tree split storage
+/// is approximated: for each tree we assume `n_bip` split IDs (u32) and `n_bip`
+/// branch lengths (f64). This is exact when all trees share the same topology
+/// (as in this benchmark).
+fn estimate_size(snaps: &Snapshots) -> usize {
+    let n_bip = snaps.bipartitions.len();
+    let n_trees = snaps.len();
+    let words = snaps.words_per_bitset;
 
-    // parts: Vec<Bitset>
-    size += snap.parts.capacity() * mem::size_of::<rapidtrees::bitset::Bitset>();
-    for part in &snap.parts {
-        // Bitset is a wrapper around Vec<u64>
-        size += part.0.capacity() * mem::size_of::<u64>();
+    // Struct overhead (Vec headers, usize fields)
+    let struct_size = mem::size_of::<Snapshots>();
+
+    // bipartitions: Vec<Bitset>, each Bitset has a Vec<u64> on the heap
+    let bip_vec_size =
+        snaps.bipartitions.capacity() * (mem::size_of::<Bitset>() + words * mem::size_of::<u64>());
+
+    // bipartition_index: FxHashMap — each entry stores a cloned Bitset key + u32 value
+    // Add ~32 bytes per entry for HashMap bucket/metadata overhead
+    let index_size = n_bip
+        * (mem::size_of::<Bitset>() + words * mem::size_of::<u64>() + mem::size_of::<u32>() + 32);
+
+    // snapshots (Vec<InternSnap>): per tree = split_ids Vec<u32> + lengths Vec<f64>
+    // Vec header (24 bytes) + actual data for each
+    let snap_size =
+        n_trees * (24 + n_bip * mem::size_of::<u32>() + 24 + n_bip * mem::size_of::<f64>());
+
+    // leaf_names: Vec<String>
+    let names_size = snaps
+        .leaf_names
+        .iter()
+        .map(|n| mem::size_of::<String>() + n.len())
+        .sum::<usize>();
+
+    struct_size + bip_vec_size + index_size + snap_size + names_size
+}
+
+fn from_newicks_or_skip(newicks: &[String], rooted: bool, label: &str) -> Option<Snapshots> {
+    let refs: Vec<&str> = newicks.iter().map(|s| s.as_str()).collect();
+    match Snapshots::from_newicks(&refs, rooted) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("Failed to parse {label}: {e}");
+            None
+        }
+    }
+}
+
+fn bar_log(value: f64, max: f64, width: usize) -> String {
+    if value <= 0.0 {
+        return "░".repeat(width);
     }
 
-    // lengths: Vec<f64>
-    size += snap.lengths.capacity() * mem::size_of::<f64>();
+    let ratio = (value.ln() / max.ln()).clamp(0.0, 1.0);
+    let filled = (ratio * width as f64).round() as usize;
 
-    // root_children: Vec<Bitset>
-    size += snap.root_children.capacity() * mem::size_of::<rapidtrees::bitset::Bitset>();
-    for part in &snap.root_children {
-        size += part.0.capacity() * mem::size_of::<u64>();
-    }
+    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+}
 
-    size
+fn mem_bar(bytes: usize, width: usize, max: usize) -> String {
+    bar_log(bytes as f64, max as f64, width)
+}
+
+fn time_bar(d: Duration, width: usize, max: Duration) -> String {
+    bar_log(d.as_secs_f64(), max.as_secs_f64(), width)
 }
 
 fn main() {
@@ -94,17 +194,25 @@ fn main() {
     let taxa_counts = [10, 100, 500, 1000, 2000, 5000];
     let tree_counts = [100, 1000, 10_000, 100_000];
     const MEMORY_LIMIT: usize = 30 * 1024 * 1024 * 1024; // 30 GB
-    const MAX_COMPARISONS: usize = 200_000_000;
+    const TIME_LIMIT: Duration = Duration::from_secs(60 * 60); // 1 hour
+    const BAR_WIDTH: usize = 10;
+    const MAX_COMPARISONS: u64 = 200_000_000_000;
 
     for &n in &taxa_counts {
         let newick = format!("{};", generate_balanced_newick(0, n));
-        let tree = PhyloTree::from_newick(&newick).expect("Failed to parse generated tree");
-        let snap = TreeSnapshot::from_tree(&tree, false).expect("Failed to create snapshot");
-        let size_per_tree = estimate_size(&snap);
 
         for &t in &tree_counts {
+            // --- size estimate from a small sample ---
+            let subset_size = t.min(100);
+            let subset_newicks: Vec<String> = (0..subset_size).map(|_| newick.clone()).collect();
+
+            let Some(interned) = from_newicks_or_skip(&subset_newicks, false, "size-sample") else {
+                continue;
+            };
+
+            let size_per_tree = estimate_size(&interned) / subset_size.max(1);
             let total_est_size = size_per_tree * t;
-            let total_comparisons = (t as u64) * (t as u64);
+            let total_comparisons = (t as u64) * (t as u64) / 2;
             let combs_str = format_count(total_comparisons);
             let est_mem_str = format_size(total_est_size);
 
@@ -116,17 +224,25 @@ fn main() {
                 continue;
             }
 
-            // Measure Memory
-            let start_mem = memory_stats().map(|s| s.physical_mem).unwrap_or(0);
+            // --- measure actual allocation with tracking allocator ---
+            let full_newicks: Vec<String> = (0..t).map(|_| newick.clone()).collect();
 
-            // Allocate trees
-            let trees: Vec<TreeSnapshot> = (0..t).map(|_| snap.clone()).collect();
+            let before = ALLOCATED.load(Ordering::Relaxed);
+            let Some(full_interned) = from_newicks_or_skip(&full_newicks, false, "full-parse")
+            else {
+                println!(
+                    "| {:<8} | {:<9} | {:<12} | {:<11} | {:<13} | {:<9} | {:<8} |",
+                    n, t, combs_str, est_mem_str, "Parse error", "-", "-"
+                );
+                continue;
+            };
+            let after = ALLOCATED.load(Ordering::Relaxed);
+            // after >= before guaranteed: we only just allocated, nothing freed yet
+            let actual_mem = after.saturating_sub(before);
+            let actual_mem_bar = mem_bar(actual_mem, BAR_WIDTH, MEMORY_LIMIT);
+            let actual_mem_str = format!("{} {}", actual_mem_bar, format_size(actual_mem));
 
-            let end_mem = memory_stats().map(|s| s.physical_mem).unwrap_or(0);
-            let mem_diff = end_mem.saturating_sub(start_mem);
-            let actual_mem_str = format_size(mem_diff);
-
-            if mem_diff > MEMORY_LIMIT {
+            if actual_mem > MEMORY_LIMIT {
                 println!(
                     "| {:<8} | {:<9} | {:<12} | {:<11} | {:<13} | {:<9} | {:<8} |",
                     n,
@@ -137,45 +253,34 @@ fn main() {
                     "Skipped",
                     "-"
                 );
+                drop(full_interned);
                 continue;
             }
 
-            // Benchmark Time
-            // Determine subset size to keep comparisons under MAX_COMPARISONS
-            // We want subset_size * subset_size <= MAX_COMPARISONS
+            // --- benchmark pairwise distances on a capped subset ---
             let max_subset = (MAX_COMPARISONS as f64).sqrt() as usize;
-            let subset_size = if t > max_subset { max_subset } else { t };
-
-            let slice = &trees[0..subset_size];
-
-            // Pre-allocate matrix (like in main.rs)
-            let mut mat = vec![vec![0.0f64; subset_size]; subset_size];
+            let bench_size = t.min(max_subset);
+            let bench_newicks: Vec<String> = (0..bench_size).map(|_| newick.clone()).collect();
+            let bench_snaps =
+                from_newicks_or_skip(&bench_newicks, false, "bench").expect("bench parse failed");
 
             let start_wall = Instant::now();
             let start_cpu = ProcessTime::now();
-
-            // Parallel execution using Rayon (matching main.rs logic)
-            mat.par_iter_mut().enumerate().for_each(|(i, row)| {
-                for j in (i + 1)..subset_size {
-                    let dist = rf_from_snapshots(&slice[i], &slice[j]);
-                    row[j] = dist as f64;
-                }
-            });
-
+            let _mat = bench_snaps.pairwise_rf();
             let wall_duration = start_wall.elapsed();
             let cpu_duration = start_cpu.elapsed();
 
-            // Extrapolate
-            let run_comparisons = (subset_size as f64) * (subset_size as f64);
+            let run_comparisons = (bench_size as f64) * (bench_size as f64);
             let ratio = (total_comparisons as f64) / run_comparisons;
 
             let est_wall = wall_duration.mul_f64(ratio);
+            let wall_bar = time_bar(est_wall, BAR_WIDTH, TIME_LIMIT);
             let est_cpu = cpu_duration.mul_f64(ratio);
 
             let wall_str = if ratio > 1.01 {
-                format!("{} (est)", format_duration(est_wall))
+                format!("{} {} (est)", wall_bar, format_duration(est_wall))
             } else {
-                format_duration(est_wall)
+                format!("{} {}", wall_bar, format_duration(est_wall))
             };
             let cpu_str = if ratio > 1.01 {
                 format!("{} (est)", format_duration(est_cpu))
@@ -187,6 +292,8 @@ fn main() {
                 "| {:<8} | {:<9} | {:<12} | {:<11} | {:<13} | {:<9} | {:<8} |",
                 n, t, combs_str, est_mem_str, actual_mem_str, wall_str, cpu_str
             );
+
+            drop(full_interned);
         }
     }
 }

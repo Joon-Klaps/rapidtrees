@@ -28,23 +28,14 @@ jobs:
               with:
                   toolchain: ${{ matrix.rust }}
 
-            - name: Cache cargo registry
+            - name: Cache cargo
               uses: actions/cache@v4
               with:
-                  path: ~/.cargo/registry
-                  key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-            - name: Cache cargo index
-              uses: actions/cache@v4
-              with:
-                  path: ~/.cargo/git
-                  key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-
-            - name: Cache cargo build
-              uses: actions/cache@v4
-              with:
-                  path: target
-                  key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+                  path: |
+                      ~/.cargo/registry
+                      ~/.cargo/git
+                      target
+                  key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
             - name: Check formatting
               run: cargo fmt --all -- --check
@@ -62,22 +53,18 @@ jobs:
               run: cargo build --release --verbose
 
     python-test:
-        name: Python API Tests
+        name: Python API Tests (${{ matrix.os }}, ${{ matrix.environment }})
         runs-on: ${{ matrix.os }}
         strategy:
+            fail-fast: true
             matrix:
                 os: [ubuntu-latest, macos-latest]
-                python-version: ["3.10", "3.11", "3.12"]
+                environment: [py310, py311, py312]
 
         steps:
             - uses: actions/checkout@v4
               with:
                   lfs: true
-
-            - name: Setup Python
-              uses: actions/setup-python@v5
-              with:
-                  python-version: ${{ matrix.python-version }}
 
             - name: Setup Rust
               uses: dtolnay/rust-toolchain@stable
@@ -85,21 +72,18 @@ jobs:
             - name: Cache cargo build
               uses: actions/cache@v4
               with:
-                  path: target
-                  key: ${{ runner.os }}-cargo-build-target-py${{ matrix.python-version }}-${{ hashFiles('**/Cargo.lock') }}
+                  path: |
+                      ~/.cargo/registry
+                      ~/.cargo/git
+                      target
+                  key: ${{ runner.os }}-${{ matrix.environment }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-            - name: Install dependencies
-              run: |
-                  pip install --upgrade pip
-                  pip install maturin pytest
-
-            - name: Build and install package
-              run: pip install -e . --verbose
-              env:
-                  RUST_BACKTRACE: 1
-
-            - name: Test Python import
-              run: python -c "import rapidtrees; print('Import successful!')"
+            - name: Setup pixi
+              uses: prefix-dev/setup-pixi@v0
+              with:
+                  pixi-version: latest
+                  locked: true
+                  environments: ${{ matrix.environment }}
 
             - name: Run Python API tests
-              run: pytest tests/test_python_api.py -v
+              run: pixi run -e ${{ matrix.environment }} test-python

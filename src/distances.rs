@@ -1,72 +1,35 @@
-//! Tree distance metrics using bitset-based snapshots.
+//! Tree distance functions.
 //!
-//! This module implements three phylogenetic tree distance measures:
+//! # Public API
+//! - [`rf_distance`], [`wrf_distance`], [`kf_distance`] — compare two standalone
+//!   [`crate::snapshot::Snapshot`]s (use bitset sorted-merge; panics if leaf sets differ).
 //!
-//! 1. **Robinson-Foulds (RF)**: Counts the number of bipartitions that differ
-//!    between two trees. Range: [0, 2n-6] where n is the number of leaves.
-//!
-//! 2. **Weighted Robinson-Foulds**: Like RF but considers branch lengths.
-//!    For shared partitions, adds |length_a - length_b|.
-//!    For unique partitions, adds the full branch length.
-//!
-//! 3. **Kuhner-Felsenstein (Branch Score)**: Similar to weighted RF but uses
-//!    squared differences: sqrt(Σ(length_a - length_b)²)
+//! # Bulk pairwise computation
+//! Call [`crate::snapshot::Snapshots::pairwise_rf`] etc. — these use the fast
+//! interned-integer path internally via the `pub(crate)` helpers in this module.
 
-use crate::snapshot::TreeSnapshot;
-use phylotree::tree::{Tree as PhyloTree, TreeError};
+use crate::snapshot::{InternSnap, Snapshot, Snapshots};
+use rayon::prelude::*;
 
 #[cfg(test)]
 use itertools::Itertools;
 
-/// Compute Robinson-Foulds distance between two trees.
-///
-/// # Algorithm
-/// RF = |A ∪ B| - |A ∩ B| = |A| + |B| - 2|A ∩ B|
-///
-/// Where A and B are the sets of bipartitions in each tree.
-///
-/// Since snapshots have sorted canonical bitsets, we use a linear merge
-/// (O(m+n)) instead of hash lookups (O(m*n)).
-///
-/// # Rooted Tree Adjustment
-/// For rooted trees, if the root position differs, we add 2 to the distance.
-/// This accounts for the two extra bipartitions created by moving the root.
-///
-/// # Example
-/// ```text
-/// Tree 1:  ((A,B),(C,D))     Partitions: {A,B}, {C,D}
-/// Tree 2:  ((A,C),(B,D))     Partitions: {A,C}, {B,D}
-///
-/// Intersection: 0 partitions match
-/// RF = 2 + 2 - 2*0 = 4
-/// ```
-///
-/// # Errors
-/// Returns `TreeError` if trees have different leaf sets or are malformed.
-pub fn robinson_foulds(tree_a: &PhyloTree, tree_b: &PhyloTree) -> Result<usize, TreeError> {
-    let snap_a = TreeSnapshot::from_tree(tree_a, false)?;
-    let snap_b = TreeSnapshot::from_tree(tree_b, false)?;
+// ─── Public: Snapshot-based distance functions ────────────────────────────────
 
-    Ok(rf_from_snapshots(&snap_a, &snap_b))
-}
-
-/// Compute Robinson-Foulds distance from two pre-computed snapshots.
+/// Robinson–Foulds distance between two snapshots.
 ///
-/// This is the core RF algorithm using sorted merge for O(m+n) performance.
+/// Uses a sorted-merge on `Vec<Bitset>`. RF = |A| + |B| − 2|A ∩ B|.
 ///
-/// # Algorithm (O(m+n) using sorted merge)
-/// ```text
-/// Since parts are sorted, use two-pointer merge to count intersection
-/// RF = len(A) + len(B) - 2 * len(intersection)
-/// ```
-///
-#[inline]
-pub fn rf_from_snapshots(a: &TreeSnapshot, b: &TreeSnapshot) -> usize {
-    // Sorted merge intersection count - O(m+n) with excellent cache locality
+/// # Panics
+/// Panics if `a` and `b` have different leaf sets — that is a caller error.
+pub fn rf_distance(a: &Snapshot, b: &Snapshot) -> usize {
+    assert_eq!(
+        a.leaf_names, b.leaf_names,
+        "rf_distance: leaf sets differ — cannot compare snapshots from different taxa"
+    );
     let mut inter = 0;
     let mut i = 0;
     let mut j = 0;
-
     while i < a.parts.len() && j < b.parts.len() {
         match a.parts[i].cmp(&b.parts[j]) {
             std::cmp::Ordering::Equal => {
@@ -78,179 +41,222 @@ pub fn rf_from_snapshots(a: &TreeSnapshot, b: &TreeSnapshot) -> usize {
             std::cmp::Ordering::Greater => j += 1,
         }
     }
-
     a.parts.len() + b.parts.len() - 2 * inter
 }
 
-/// Compute Weighted Robinson-Foulds distance between two trees.
+/// Weighted Robinson–Foulds distance between two snapshots.
 ///
-/// # Algorithm
-/// For each partition:
-/// - If in both trees: add |length_a - length_b|
-/// - If only in A: add length_a
-/// - If only in B: add length_b
+/// For each bipartition:
+/// - Shared: contributes `|len_a − len_b|`.
+/// - Only in A: contributes `len_a`.
+/// - Only in B: contributes `len_b`.
 ///
-/// Total: Sum of all branch length differences
-///
-/// # Example
-/// ```text
-/// Tree 1: ((A:1.0,B:1.0):2.0,(C:1.0,D:1.0):2.0);
-/// Tree 2: ((A:1.5,B:1.0):3.0,(C:0.5,D:1.0):2.0);
-///
-/// Shared partition {A,B}: |2.0 - 3.0| = 1.0
-/// Shared partition {C,D}: |2.0 - 2.0| = 0.0
-/// Different leaf branches contribute their full lengths
-/// ```
-///
-/// # Errors
-/// Returns `TreeError` if trees have different leaf sets or are malformed.
-pub fn weighted_robinson_foulds(tree_a: &PhyloTree, tree_b: &PhyloTree) -> Result<f64, TreeError> {
-    let snap_a = TreeSnapshot::from_tree(tree_a, false)?;
-    let snap_b = TreeSnapshot::from_tree(tree_b, false)?;
-
-    Ok(weighted_rf_from_snapshots(&snap_a, &snap_b))
-}
-
-/// Compute Weighted RF distance from two pre-computed snapshots.
-///
-/// Uses sorted merge for O(m+n) performance with excellent cache locality.
-/// Direct array indexing (no HashMap lookups) for branch lengths.
-pub fn weighted_rf_from_snapshots(a: &TreeSnapshot, b: &TreeSnapshot) -> f64 {
-    let mut distance = 0.0;
+/// # Panics
+/// Panics if `a` and `b` have different leaf sets.
+pub fn wrf_distance(a: &Snapshot, b: &Snapshot) -> f64 {
+    assert_eq!(
+        a.leaf_names, b.leaf_names,
+        "wrf_distance: leaf sets differ — cannot compare snapshots from different taxa"
+    );
+    let mut dist = 0.0;
     let mut i = 0;
     let mut j = 0;
-
-    // Sorted merge through both partition lists
     while i < a.parts.len() && j < b.parts.len() {
         match a.parts[i].cmp(&b.parts[j]) {
             std::cmp::Ordering::Equal => {
-                // Partition in both: add absolute difference
-                // Direct array access - no hash lookup! 10-20× faster!
-                distance += (a.lengths[i] - b.lengths[j]).abs();
+                dist += (a.lengths[i] - b.lengths[j]).abs();
                 i += 1;
                 j += 1;
             }
             std::cmp::Ordering::Less => {
-                // Partition only in A: add full length
-                distance += a.lengths[i];
+                dist += a.lengths[i];
                 i += 1;
             }
             std::cmp::Ordering::Greater => {
-                // Partition only in B: add full length
-                distance += b.lengths[j];
+                dist += b.lengths[j];
                 j += 1;
             }
         }
     }
-
-    // Handle remaining partitions in A
-    while i < a.parts.len() {
-        distance += a.lengths[i];
-        i += 1;
-    }
-
-    // Handle remaining partitions in B
-    while j < b.parts.len() {
-        distance += b.lengths[j];
-        j += 1;
-    }
-
-    distance
+    dist += a.lengths[i..].iter().sum::<f64>();
+    dist += b.lengths[j..].iter().sum::<f64>();
+    dist
 }
 
-/// Compute Kuhner-Felsenstein (Branch Score) distance between two trees.
+/// Kuhner–Felsenstein (Branch Score) distance between two snapshots.
 ///
-/// # Algorithm
-/// Like Weighted RF but uses squared differences:
-/// distance = sqrt(Σ (length_a - length_b)²)
+/// Like WRF but uses squared differences: `sqrt(Σ (len_a − len_b)²)`.
+/// More sensitive to large branch-length differences; a Euclidean metric in
+/// branch-length space.
 ///
-/// For each partition:
-/// - If in both trees: add (length_a - length_b)²
-/// - If only in A: add length_a²
-/// - If only in B: add length_b²
-///
-/// Then take the square root of the sum.
-///
-/// # Properties
-/// - More sensitive to large branch length differences
-/// - Euclidean metric in branch length space
-/// - Range: [0, ∞)
-///
-/// # Errors
-/// Returns `TreeError` if trees have different leaf sets or are malformed.
-pub fn kuhner_felsenstein(tree_a: &PhyloTree, tree_b: &PhyloTree) -> Result<f64, TreeError> {
-    let snap_a = TreeSnapshot::from_tree(tree_a, false)?;
-    let snap_b = TreeSnapshot::from_tree(tree_b, false)?;
-
-    Ok(kf_from_snapshots(&snap_a, &snap_b))
-}
-
-/// Compute Kuhner-Felsenstein distance from two pre-computed snapshots.
-///
-/// Uses sorted merge for O(m+n) performance, accumulating squared differences.
-/// Direct array indexing (no HashMap lookups) for branch lengths.
-pub fn kf_from_snapshots(a: &TreeSnapshot, b: &TreeSnapshot) -> f64 {
-    let mut sum_squared: f64 = 0.0;
+/// # Panics
+/// Panics if `a` and `b` have different leaf sets.
+pub fn kf_distance(a: &Snapshot, b: &Snapshot) -> f64 {
+    assert_eq!(
+        a.leaf_names, b.leaf_names,
+        "kf_distance: leaf sets differ — cannot compare snapshots from different taxa"
+    );
+    let mut sum_sq = 0.0;
     let mut i = 0;
     let mut j = 0;
-
-    // Sorted merge through both partition lists
     while i < a.parts.len() && j < b.parts.len() {
         match a.parts[i].cmp(&b.parts[j]) {
             std::cmp::Ordering::Equal => {
-                // Partition in both: add (diff)²
-                // Direct array access - no hash lookup!
-                let diff = a.lengths[i] - b.lengths[j];
-                sum_squared += diff * diff;
+                let d = a.lengths[i] - b.lengths[j];
+                sum_sq += d * d;
                 i += 1;
                 j += 1;
             }
             std::cmp::Ordering::Less => {
-                // Partition only in A: add length²
-                sum_squared += a.lengths[i] * a.lengths[i];
+                sum_sq += a.lengths[i] * a.lengths[i];
                 i += 1;
             }
             std::cmp::Ordering::Greater => {
-                // Partition only in B: add length²
-                sum_squared += b.lengths[j] * b.lengths[j];
+                sum_sq += b.lengths[j] * b.lengths[j];
                 j += 1;
             }
         }
     }
-
-    // Handle remaining partitions in A
-    while i < a.parts.len() {
-        sum_squared += a.lengths[i] * a.lengths[i];
-        i += 1;
-    }
-
-    // Handle remaining partitions in B
-    while j < b.parts.len() {
-        sum_squared += b.lengths[j] * b.lengths[j];
-        j += 1;
-    }
-
-    sum_squared.sqrt()
+    sum_sq += a.lengths[i..].iter().map(|&l| l * l).sum::<f64>();
+    sum_sq += b.lengths[j..].iter().map(|&l| l * l).sum::<f64>();
+    sum_sq.sqrt()
 }
+
+// ─── pub(crate): fast interned-integer paths used by Snapshots::pairwise_* ──
+
+/// RF distance on two interned snapshots (integer sorted-merge, no leaf check).
+#[inline]
+pub(crate) fn rf_distance_fast(a: &InternSnap, b: &InternSnap) -> usize {
+    let mut inter = 0;
+    let mut i = 0;
+    let mut j = 0;
+    while i < a.split_ids.len() && j < b.split_ids.len() {
+        match a.split_ids[i].cmp(&b.split_ids[j]) {
+            std::cmp::Ordering::Equal => {
+                inter += 1;
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+        }
+    }
+    a.split_ids.len() + b.split_ids.len() - 2 * inter
+}
+
+/// WRF distance on two interned snapshots.
+#[inline]
+pub(crate) fn wrf_distance_fast(a: &InternSnap, b: &InternSnap) -> f64 {
+    let mut dist = 0.0;
+    let mut i = 0;
+    let mut j = 0;
+    while i < a.split_ids.len() && j < b.split_ids.len() {
+        match a.split_ids[i].cmp(&b.split_ids[j]) {
+            std::cmp::Ordering::Equal => {
+                dist += (a.lengths[i] - b.lengths[j]).abs();
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Less => {
+                dist += a.lengths[i];
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                dist += b.lengths[j];
+                j += 1;
+            }
+        }
+    }
+    dist += a.lengths[i..].iter().sum::<f64>();
+    dist += b.lengths[j..].iter().sum::<f64>();
+    dist
+}
+
+/// KF distance on two interned snapshots.
+#[inline]
+pub(crate) fn kf_distance_fast(a: &InternSnap, b: &InternSnap) -> f64 {
+    let mut sum_sq = 0.0;
+    let mut i = 0;
+    let mut j = 0;
+    while i < a.split_ids.len() && j < b.split_ids.len() {
+        match a.split_ids[i].cmp(&b.split_ids[j]) {
+            std::cmp::Ordering::Equal => {
+                let d = a.lengths[i] - b.lengths[j];
+                sum_sq += d * d;
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Less => {
+                sum_sq += a.lengths[i] * a.lengths[i];
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                sum_sq += b.lengths[j] * b.lengths[j];
+                j += 1;
+            }
+        }
+    }
+    sum_sq += a.lengths[i..].iter().map(|&l| l * l).sum::<f64>();
+    sum_sq += b.lengths[j..].iter().map(|&l| l * l).sum::<f64>();
+    sum_sq.sqrt()
+}
+
+/// Generic symmetric pairwise matrix computation over all trees in a [`Snapshots`].
+///
+/// Computes `metric(a, b)` for every upper-triangle pair in parallel via rayon,
+/// then mirrors into the lower triangle. The diagonal stays at `T::default()`.
+pub(crate) fn pairwise_symmetric<T, F>(snaps: &Snapshots, metric: F) -> Vec<T>
+where
+    T: Copy + Default + Send,
+    F: Fn(&InternSnap, &InternSnap) -> T + Sync,
+{
+    let n = snaps.snapshots.len();
+
+    // 1. Single contiguous allocation
+    let mut matrix = vec![T::default(); n * n];
+
+    // 2. Safely divide the flat array into mutable chunks (rows)
+    matrix.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
+        for (j, dist) in row.iter_mut().enumerate().take(n).skip(i + 1) {
+            *dist = metric(&snaps.snapshots[i], &snaps.snapshots[j]);
+        }
+    });
+
+    // 3. Sequential mirroring
+    for i in 0..n {
+        for j in (i + 1)..n {
+            matrix[j * n + i] = matrix[i * n + j];
+        }
+    }
+
+    matrix
+}
+
+/// Twelve 10-taxon trees from the PHYLIP treedist reference suite.
+///
+/// Ground-truth RF, WRF, and KF distances verified against
+/// https://evolution.genetics.washington.edu/phylip/doc/treedist.html
+#[cfg(test)]
+const TREEDIST_TREES: [&str; 12] = [
+    "(A:0.1,(B:0.1,(H:0.1,(D:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
+    "(A:0.1,(B:0.1,(D:0.1,((J:0.1,H:0.1):0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1);",
+    "(A:0.1,(B:0.1,(D:0.1,(H:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
+    "(A:0.1,(B:0.1,(E:0.1,(G:0.1,((F:0.1,I:0.1):0.1,((J:0.1,(H:0.1,D:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
+    "(A:0.1,(B:0.1,(E:0.1,(G:0.1,((F:0.1,I:0.1):0.1,(((J:0.1,H:0.1):0.1,D:0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
+    "(A:0.1,(B:0.1,(E:0.1,((F:0.1,I:0.1):0.1,(G:0.1,((J:0.1,(H:0.1,D:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
+    "(A:0.1,(B:0.1,(E:0.1,((F:0.1,I:0.1):0.1,(G:0.1,(((J:0.1,H:0.1):0.1,D:0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
+    "(A:0.1,(B:0.1,(E:0.1,((G:0.1,(F:0.1,I:0.1):0.1):0.1,((J:0.1,(H:0.1,D:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1);",
+    "(A:0.1,(B:0.1,(E:0.1,((G:0.1,(F:0.1,I:0.1):0.1):0.1,(((J:0.1,H:0.1):0.1,D:0.1):0.1,C:0.1):0.1):0.1):0.1):0.1);",
+    "(A:0.1,(B:0.1,(E:0.1,(G:0.1,((F:0.1,I:0.1):0.1,((J:0.1,(H:0.1,D:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
+    "(A:0.1,(B:0.1,(D:0.1,(H:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
+    "(A:0.1,(B:0.1,(E:0.1,((G:0.1,(F:0.1,I:0.1):0.1):0.1,((J:0.1,(H:0.1,D:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1);",
+];
 
 #[test]
-// Robinson foulds distances according to
+// Robinson–Foulds distances according to
 // https://evolution.genetics.washington.edu/phylip/doc/treedist.html
 fn robinson_foulds_treedist() {
-    let trees = [
-        "(A:0.1,(B:0.1,(H:0.1,(D:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(D:0.1,((J:0.1,H:0.1):0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(D:0.1,(H:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(E:0.1,(G:0.1,((F:0.1,I:0.1):0.1,((J:0.1,(H:0.1,D:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(E:0.1,(G:0.1,((F:0.1,I:0.1):0.1,(((J:0.1,H:0.1):0.1,D:0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(E:0.1,((F:0.1,I:0.1):0.1,(G:0.1,((J:0.1,(H:0.1,D:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(E:0.1,((F:0.1,I:0.1):0.1,(G:0.1,(((J:0.1,H:0.1):0.1,D:0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(E:0.1,((G:0.1,(F:0.1,I:0.1):0.1):0.1,((J:0.1,(H:0.1,D:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(E:0.1,((G:0.1,(F:0.1,I:0.1):0.1):0.1,(((J:0.1,H:0.1):0.1,D:0.1):0.1,C:0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(E:0.1,(G:0.1,((F:0.1,I:0.1):0.1,((J:0.1,(H:0.1,D:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(D:0.1,(H:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(E:0.1,((G:0.1,(F:0.1,I:0.1):0.1):0.1,((J:0.1,(H:0.1,D:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1);",
-    ];
+    let trees = TREEDIST_TREES;
     let rfs = [
         vec![0, 4, 2, 10, 10, 10, 10, 10, 10, 10, 2, 10],
         vec![4, 0, 2, 10, 8, 10, 8, 10, 8, 10, 2, 10],
@@ -266,35 +272,28 @@ fn robinson_foulds_treedist() {
         vec![10, 10, 10, 2, 4, 2, 4, 0, 2, 2, 10, 0],
     ];
 
-    for indices in (0..trees.len()).combinations(2) {
-        let (i0, i1) = (indices[0], indices[1]);
-
-        let t0 = PhyloTree::from_newick(trees[i0]).unwrap();
-        let t1 = PhyloTree::from_newick(trees[i1]).unwrap();
-
-        assert_eq!(robinson_foulds(&t0, &t1).unwrap(), rfs[i0][i1])
-    }
+    trees.iter().combinations(2).for_each(|pair| {
+        let (t0, t1) = (pair[0], pair[1]);
+        let (i0, i1) = (
+            trees.iter().position(|&t| t == *t0).unwrap(),
+            trees.iter().position(|&t| t == *t1).unwrap(),
+        );
+        let s0 = Snapshot::from_newick(t0, false).unwrap();
+        let s1 = Snapshot::from_newick(t1, false).unwrap();
+        assert_eq!(
+            rf_distance(&s0, &s1),
+            rfs[i0][i1],
+            "RF mismatch at [{i0}, {i1}]"
+        );
+    });
 }
 
 #[test]
-// Robinson foulds distances according to
+// Weighted Robinson–Foulds distances according to
 // https://evolution.genetics.washington.edu/phylip/doc/treedist.html
 fn weighted_robinson_foulds_treedist() {
-    let trees = [
-        "(A:0.1,(B:0.1,(H:0.1,(D:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(D:0.1,((J:0.1,H:0.1):0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(D:0.1,(H:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(E:0.1,(G:0.1,((F:0.1,I:0.1):0.1,((J:0.1,(H:0.1,D:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(E:0.1,(G:0.1,((F:0.1,I:0.1):0.1,(((J:0.1,H:0.1):0.1,D:0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(E:0.1,((F:0.1,I:0.1):0.1,(G:0.1,((J:0.1,(H:0.1,D:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(E:0.1,((F:0.1,I:0.1):0.1,(G:0.1,(((J:0.1,H:0.1):0.1,D:0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(E:0.1,((G:0.1,(F:0.1,I:0.1):0.1):0.1,((J:0.1,(H:0.1,D:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(E:0.1,((G:0.1,(F:0.1,I:0.1):0.1):0.1,(((J:0.1,H:0.1):0.1,D:0.1):0.1,C:0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(E:0.1,(G:0.1,((F:0.1,I:0.1):0.1,((J:0.1,(H:0.1,D:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(D:0.1,(H:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(E:0.1,((G:0.1,(F:0.1,I:0.1):0.1):0.1,((J:0.1,(H:0.1,D:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1);",
-    ];
-    let rfs = [
+    let trees = TREEDIST_TREES;
+    let expected = [
         [
             0.,
             0.4,
@@ -465,34 +464,27 @@ fn weighted_robinson_foulds_treedist() {
         ],
     ];
 
-    for indices in (0..trees.len()).combinations(2) {
-        let (i0, i1) = (indices[0], indices[1]);
-        let t0 = PhyloTree::from_newick(trees[i0]).unwrap();
-        let t1 = PhyloTree::from_newick(trees[i1]).unwrap();
-
-        assert!((weighted_robinson_foulds(&t0, &t1).unwrap() - rfs[i0][i1]).abs() <= f64::EPSILON)
-    }
+    trees.iter().combinations(2).for_each(|pair| {
+        let (t0, t1) = (pair[0], pair[1]);
+        let (i0, i1) = (
+            trees.iter().position(|&t| t == *t0).unwrap(),
+            trees.iter().position(|&t| t == *t1).unwrap(),
+        );
+        let s0 = Snapshot::from_newick(t0, false).unwrap();
+        let s1 = Snapshot::from_newick(t1, false).unwrap();
+        assert!(
+            (wrf_distance(&s0, &s1) - expected[i0][i1]).abs() <= f64::EPSILON,
+            "WRF mismatch at [{i0}, {i1}]"
+        );
+    });
 }
 
 #[test]
 // Branch score distances according to
 // https://evolution.genetics.washington.edu/phylip/doc/treedist.html
 fn kuhner_felsenstein_treedist() {
-    let trees = [
-        "(A:0.1,(B:0.1,(H:0.1,(D:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(D:0.1,((J:0.1,H:0.1):0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(D:0.1,(H:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(E:0.1,(G:0.1,((F:0.1,I:0.1):0.1,((J:0.1,(H:0.1,D:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(E:0.1,(G:0.1,((F:0.1,I:0.1):0.1,(((J:0.1,H:0.1):0.1,D:0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(E:0.1,((F:0.1,I:0.1):0.1,(G:0.1,((J:0.1,(H:0.1,D:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(E:0.1,((F:0.1,I:0.1):0.1,(G:0.1,(((J:0.1,H:0.1):0.1,D:0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(E:0.1,((G:0.1,(F:0.1,I:0.1):0.1):0.1,((J:0.1,(H:0.1,D:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(E:0.1,((G:0.1,(F:0.1,I:0.1):0.1):0.1,(((J:0.1,H:0.1):0.1,D:0.1):0.1,C:0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(E:0.1,(G:0.1,((F:0.1,I:0.1):0.1,((J:0.1,(H:0.1,D:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(D:0.1,(H:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
-        "(A:0.1,(B:0.1,(E:0.1,((G:0.1,(F:0.1,I:0.1):0.1):0.1,((J:0.1,(H:0.1,D:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1);",
-    ];
-    let rfs = [
+    let trees = TREEDIST_TREES;
+    let expected = [
         [
             0.,
             0.2,
@@ -663,17 +655,185 @@ fn kuhner_felsenstein_treedist() {
         ],
     ];
 
-    for indices in (0..trees.len()).combinations(2) {
-        let (i0, i1) = (indices[0], indices[1]);
-        let t0 = PhyloTree::from_newick(trees[i0]).unwrap();
-        let t1 = PhyloTree::from_newick(trees[i1]).unwrap();
-
-        println!(
-            "[{i0}, {i1}] c:{:?} ==? t:{}",
-            kuhner_felsenstein(&t0, &t1).unwrap(),
-            rfs[i0][i1]
+    trees.iter().combinations(2).for_each(|pair| {
+        let (t0, t1) = (pair[0], pair[1]);
+        let (i0, i1) = (
+            trees.iter().position(|&t| t == *t0).unwrap(),
+            trees.iter().position(|&t| t == *t1).unwrap(),
         );
+        let s0 = Snapshot::from_newick(t0, false).unwrap();
+        let s1 = Snapshot::from_newick(t1, false).unwrap();
+        assert!(
+            (kf_distance(&s0, &s1) - expected[i0][i1]).abs() <= f64::EPSILON,
+            "KF mismatch at [{i0}, {i1}]"
+        );
+    });
+}
 
-        assert_eq!(kuhner_felsenstein(&t0, &t1).unwrap(), rfs[i0][i1])
+#[cfg(test)]
+mod tests {
+    use crate::snapshot::Snapshots;
+
+    const T0: &str = "(A:0.1,(B:0.1,(H:0.1,(D:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);";
+    const T1: &str = "(A:0.1,(B:0.1,(D:0.1,((J:0.1,H:0.1):0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1);";
+    const T2: &str = "(A:0.1,(B:0.1,(D:0.1,(H:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);";
+
+    fn three_snapshots() -> Snapshots {
+        Snapshots::from_newicks(&[T0, T1, T2], false).unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::erasing_op)] // Keep O*n for clarity of the flattened matrix indexing
+    fn rf_known_values() {
+        let snaps = three_snapshots();
+        let n = snaps.snapshots.len(); // n = 3
+        let mat = snaps.pairwise_rf();
+        assert_eq!(mat[0 * n + 1], 4, "RF(T0,T1)");
+        assert_eq!(mat[0 * n + 2], 2, "RF(T0,T2)");
+        assert_eq!(mat[n + 2], 2, "RF(T1,T2)");
+        for i in 0..n {
+            assert_eq!(mat[i * n + i], 0, "diagonal [{i}]");
+            for j in 0..n {
+                assert_eq!(mat[i * n + j], mat[j * n + i], "RF symmetry [{i}][{j}]");
+            }
+        }
+    }
+
+    #[test]
+    fn wrf_symmetric_zero_diagonal() {
+        let snaps = three_snapshots();
+        let n = snaps.snapshots.len();
+        let mat = snaps.pairwise_wrf();
+
+        for (i, row) in mat.chunks(n).enumerate() {
+            assert_eq!(row[i], 0.0, "WRF diagonal [{i}]");
+            for (j, v) in row.iter().enumerate() {
+                assert!(
+                    (v - mat[j * n + i]).abs() < f64::EPSILON,
+                    "WRF symmetry [{i}][{j}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kf_symmetric_zero_diagonal() {
+        let snaps = three_snapshots();
+        let n = snaps.snapshots.len();
+        let mat = snaps.pairwise_kf();
+        for (i, row) in mat.chunks(n).enumerate() {
+            assert_eq!(row[i], 0.0, "KF diagonal [{i}]");
+            for (j, v) in row.iter().enumerate() {
+                assert!(
+                    (v - mat[j * n + i]).abs() < f64::EPSILON,
+                    "KF symmetry [{i}][{j}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kf_differs_from_wrf() {
+        let snaps = three_snapshots();
+        let wrf = snaps.pairwise_wrf();
+        let kf = snaps.pairwise_kf();
+        let n = snaps.snapshots.len();
+        let any_different = (0..n)
+            .flat_map(|i| (i + 1..n).map(move |j| (i, j)))
+            .any(|(i, j)| (kf[i * n + j] - wrf[i * n + j]).abs() > f64::EPSILON);
+        assert!(any_different, "KF and WRF should produce different values");
+    }
+
+    #[test]
+    fn metrics_satisfy_triangle_inequality_rf() {
+        let snaps = three_snapshots();
+        let n = snaps.snapshots.len();
+        let mat = snaps.pairwise_rf();
+
+        for i in 0..n {
+            for j in 0..n {
+                for k in 0..n {
+                    let d_ij = mat[i * n + j] as f64;
+                    let d_jk = mat[j * n + k] as f64;
+                    let d_ik = mat[i * n + k] as f64;
+                    // Add a small epsilon for floats (WRF/KF)
+                    assert!(
+                        d_ik <= d_ij + d_jk + 1e-10,
+                        "Triangle inequality failed for indices {}, {}, {}",
+                        i,
+                        j,
+                        k
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn metrics_satisfy_triangle_inequality_wrf() {
+        let snaps = three_snapshots();
+        let n = snaps.snapshots.len();
+        let mat = snaps.pairwise_wrf();
+
+        for i in 0..n {
+            for j in 0..n {
+                for k in 0..n {
+                    let d_ij = mat[i * n + j];
+                    let d_jk = mat[j * n + k];
+                    let d_ik = mat[i * n + k];
+                    // Add a small epsilon for floats (WRF/KF)
+                    assert!(
+                        d_ik <= d_ij + d_jk + 1e-10,
+                        "Triangle inequality failed for indices {}, {}, {}",
+                        i,
+                        j,
+                        k
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn metrics_satisfy_triangle_inequality_kf() {
+        let snaps = three_snapshots();
+        let n = snaps.snapshots.len();
+        let mat = snaps.pairwise_kf();
+
+        for i in 0..n {
+            for j in 0..n {
+                for k in 0..n {
+                    let d_ij = mat[i * n + j];
+                    let d_jk = mat[j * n + k];
+                    let d_ik = mat[i * n + k];
+                    // Add a small epsilon for floats (WRF/KF)
+                    assert!(
+                        d_ik <= d_ij + d_jk + 1e-10,
+                        "Triangle inequality failed for indices {}, {}, {}",
+                        i,
+                        j,
+                        k
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn split_ids_sorted_per_snapshot() {
+        let snaps = three_snapshots();
+        for snap in &snaps.snapshots {
+            for w in snap.split_ids.windows(2) {
+                assert!(w[0] < w[1], "split_ids must be strictly ascending");
+            }
+        }
+    }
+
+    #[test]
+    fn lengths_aligned_with_split_ids() {
+        let snaps = three_snapshots();
+        for snap in &snaps.snapshots {
+            assert_eq!(snap.split_ids.len(), snap.lengths.len());
+        }
     }
 }

@@ -1,13 +1,8 @@
 use clap::{Parser, ValueEnum};
-use rapidtrees::distances::{kf_from_snapshots, rf_from_snapshots, weighted_rf_from_snapshots};
-use rapidtrees::io::{read_beast_trees, write_matrix_tsv};
-use rapidtrees::snapshot::TreeSnapshot;
-use rayon::prelude::*;
+use rapidtrees::io::{load_beast_trees, load_snapshots, write_matrix_tsv, write_snap};
 use std::path::PathBuf;
 use std::time::Instant;
 
-/// Compute pairwise Robinson–Foulds distances from a BEAST/NEXUS tree file
-/// and write a labeled distance matrix (TSV) where row/column names are tree names.
 #[derive(Parser, Debug)]
 #[command(
     name = "rapidtrees",
@@ -16,8 +11,21 @@ use std::time::Instant;
 )]
 struct Args {
     /// Path to BEAST .trees (NEXUS) file
-    #[arg(short = 'i', long = "input")]
-    input: PathBuf,
+    #[arg(
+        short = 'i',
+        long = "input",
+        required_unless_present = "snap_input",
+        conflicts_with = "snap_input"
+    )]
+    input: Option<PathBuf>,
+
+    /// Path to compressed .snap file
+    #[arg(
+        long = "snap-input",
+        required_unless_present = "input",
+        conflicts_with = "input"
+    )]
+    snap_input: Option<PathBuf>,
 
     /// Burn-in by number of trees (drop first N trees)
     #[arg(short = 't', long = "burnin-trees", default_value_t = 0)]
@@ -28,8 +36,11 @@ struct Args {
     burnin_states: usize,
 
     /// Output path for TSV distance matrix
-    #[arg(short = 'o', long = "output")]
-    output: PathBuf,
+    #[arg(short = 'o', long = "output", required_unless_present = "export_snap")]
+    output: Option<PathBuf>,
+
+    #[arg(long = "export-snap")]
+    export_snap: Option<PathBuf>,
 
     /// Use TRANSLATE block to map taxon IDs to labels when available
     #[arg(long = "use-real-taxa", default_value_t = false)]
@@ -55,109 +66,137 @@ enum MetricArg {
     Kf,
 }
 
+impl PartialEq for MetricArg {
+    fn eq(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (MetricArg::Rf, MetricArg::Rf)
+                | (MetricArg::Weighted, MetricArg::Weighted)
+                | (MetricArg::Kf, MetricArg::Kf)
+        )
+    }
+}
+
 fn main() {
     let args = Args::parse();
 
-    // Read trees with names
-    let t0 = Instant::now();
-    let (taxons, named_trees) = read_beast_trees(
-        &args.input,
-        args.burnin_trees,
-        args.burnin_states,
-        args.use_real_taxa,
+    if args.snap_input.is_some() && args.export_snap.is_some() {
+        eprintln!("--export-snap cannot be used together with --snap-input");
+        std::process::exit(7);
+    }
+
+    if args.snap_input.is_some() && (args.metric != MetricArg::Rf) {
+        eprintln!("--snap-input only supports RF distances.");
+        std::process::exit(8);
+    }
+
+    let quiet = args.quiet;
+    let t_total = Instant::now();
+    let t = Instant::now();
+
+    let (names, interned) = match &args.snap_input {
+        Some(path) => load_snapshots(path).unwrap_or_else(|e| {
+            eprintln!("Failed to load trees: {e}");
+            std::process::exit(1);
+        }),
+        None => load_beast_trees(
+            args.input.as_ref().unwrap(),
+            args.burnin_trees,
+            args.burnin_states,
+            args.use_real_taxa,
+            args.rooted,
+        ),
+    };
+
+    log_if(
+        quiet,
+        format!(
+            "Loaded {} trees in {:.3}s",
+            names.len(),
+            t.elapsed().as_secs_f64()
+        ),
     );
-    if named_trees.is_empty() {
-        eprintln!("No trees parsed from {:?}.", args.input);
+
+    if names.len() < 2 {
+        eprintln!("Need at least 2 trees to compute pairwise distances");
         std::process::exit(2);
     }
-    let read_s = t0.elapsed().as_secs_f64();
-    log_if(!args.quiet, format!("Read beast trees in {read_s:.3}s"));
-    log_if(
-        !args.quiet,
-        format!(
-            "Read in {} taxons for {} trees",
-            taxons.len(),
-            named_trees.len()
-        ),
-    );
-    let (names, trees): (Vec<String>, Vec<_>) = named_trees.into_iter().unzip();
 
-    // Build bitset snapshots once
-    let t1 = Instant::now();
-    let snaps: Vec<TreeSnapshot> = trees
-        .iter()
-        .map(|t| TreeSnapshot::from_tree(t, args.rooted))
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to build snapshots: {e}");
-            std::process::exit(3);
-        });
-
-    let snap_s = t1.elapsed().as_secs_f64();
-    log_if(
-        !args.quiet,
-        format!("Created tree bit snapshots in {snap_s:.3}s"),
-    );
-
-    let t2 = Instant::now();
-    let (metric_label, metric_fn): (&str, fn(&TreeSnapshot, &TreeSnapshot) -> f64) =
-        match args.metric {
-            // rf is the only one that returns usize, so cast to f64
-            MetricArg::Rf => ("RF", |a, b| rf_from_snapshots(a, b) as f64),
-            MetricArg::Weighted => ("Weighted", weighted_rf_from_snapshots),
-            MetricArg::Kf => ("KF", kf_from_snapshots),
-        };
-
-    log_if(
-        !args.quiet,
-        format!(
-            "Determining distances using {metric_label} for {} combinations",
-            names.len() * (names.len() - 1) / 2
-        ),
-    );
-
-    let n = names.len();
-
-    // Pre-allocate matrix for better performance
-    let mut mat = vec![vec![0.0f64; n]; n];
-
-    // Compute distances in parallel using work-stealing for perfect load balance
-    // Each row is independent, Rayon handles distribution automatically
-    mat.par_iter_mut().enumerate().for_each(|(i, row)| {
-        for j in (i + 1)..n {
-            let dist = metric_fn(&snaps[i], &snaps[j]);
-            row[j] = dist;
+    if let Some(snap_path) = args.export_snap {
+        let t = Instant::now();
+        if let Err(e) = write_snap(&snap_path, &names, &interned) {
+            eprintln!("Failed to write snap {snap_path:?}: {e}");
+            std::process::exit(5);
         }
-    });
-
-    // Fill lower triangle (symmetric matrix)
-    #[allow(clippy::needless_range_loop)]
-    for i in 0..n {
-        for j in (i + 1)..n {
-            mat[j][i] = mat[i][j];
-        }
+        log_if(
+            quiet,
+            format!(
+                "Exported snapshots to {snap_path:?} in {:.3}s",
+                t.elapsed().as_secs_f64()
+            ),
+        );
+        return;
     }
 
-    let comp_s = t2.elapsed().as_secs_f64();
+    let n_pairs = names.len() * (names.len() - 1) / 2;
+    let metric_label = metric_label(args.metric);
     log_if(
-        !args.quiet,
-        format!("Determined distances using {metric_label} in {comp_s:.3}s"),
+        quiet,
+        format!("Determining {metric_label} distances for {n_pairs} pairs"),
     );
 
-    let t3 = Instant::now();
-    if let Err(e) = write_matrix_tsv(&args.output, &names, &mat) {
-        eprintln!("Failed to write output {:?}: {e}", args.output);
+    let t = Instant::now();
+    let mat: Vec<f64> = match args.metric {
+        MetricArg::Rf => interned
+            .pairwise_rf()
+            .into_iter()
+            .map(|dist| dist as f64)
+            .collect(),
+        MetricArg::Weighted => interned.pairwise_wrf(),
+        MetricArg::Kf => interned.pairwise_kf(),
+    };
+    log_if(
+        quiet,
+        format!(
+            "Computed {metric_label} distances in {:.3}s",
+            t.elapsed().as_secs_f64()
+        ),
+    );
+
+    let t = Instant::now();
+    let output_path = args
+        .output
+        .as_deref()
+        .expect("output is required when not exporting snap");
+    if let Err(e) = write_matrix_tsv(output_path, &names, &mat, interned.len()) {
+        eprintln!("Failed to write output {}: {e}", output_path.display());
         std::process::exit(4);
     }
-    let write_s = t3.elapsed().as_secs_f64();
     log_if(
-        !args.quiet,
-        format!("Writing to {} in {write_s:.3}s", args.output.display()),
+        quiet,
+        format!(
+            "Wrote matrix to {} in {:.3}s",
+            output_path.display(),
+            t.elapsed().as_secs_f64()
+        ),
+    );
+
+    log_if(
+        quiet,
+        format!("Total runtime: {:.3}s", t_total.elapsed().as_secs_f64()),
     );
 }
 
-fn log_if(show: bool, msg: String) {
-    if show {
-        println!("{}", msg);
+fn metric_label(metric: MetricArg) -> &'static str {
+    match metric {
+        MetricArg::Rf => "RF",
+        MetricArg::Weighted => "Weighted RF",
+        MetricArg::Kf => "KF",
+    }
+}
+
+fn log_if(quiet: bool, msg: String) {
+    if !quiet {
+        println!("{msg}");
     }
 }

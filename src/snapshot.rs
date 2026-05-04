@@ -1,140 +1,169 @@
-//! Extract partition snapshots from phylogenetic trees.
+//! Tree snapshot types and bulk-collection constructors.
 //!
-//! # Overview
-//! A TreeSnapshot captures all the bipartitions (splits) in a tree along with
-//! their branch lengths. This immutable snapshot can be safely compared with
-//! other snapshots in parallel.
+//! # Types
+//! - [`Snapshot`]: one tree's bipartitions as sorted `Vec<Bitset>` + branch lengths.
+//!   Can be compared directly with [`crate::distances::rf_distance`] etc.
+//! - [`Snapshots`]: a collection of trees in an interned split-ID representation for
+//!   fast, cache-friendly pairwise distance computation at scale.
 //!
 //! # What is a bipartition?
 //! Each internal branch in a tree divides the leaves into two groups.
-//! For example:
 //! ```text
 //!      root
 //!     /    \
-//!   {A,B}  {C,D}  ← This branch creates partition {A,B}
+//!   {A,B}  {C,D}  ← This branch creates split {A,B}|{C,D}
 //! ```
+//! We store one canonical side per split (the side not containing leaf 0).
 //!
-//! We only store one side of each partition (the smaller side by convention).
+//! # Why taxon names, not node IDs
+//! Node IDs are assigned at parse time and differ across files.
+//! Leaves are sorted alphabetically by name so identical taxa always map to
+//! the same bit positions across all trees in a dataset.
 //!
-//! # CRITICAL: Why we use taxon NAMES not node IDs
-//! Node IDs are assigned during tree parsing and differ across files.
-//! Taxon names are consistent. We sort leaves alphabetically by name
-//! to ensure identical taxa always map to the same bit positions.
+//! # Bulk interning
+//!
+//! `Snapshots::from_newick_iter` builds per-tree `Vec<Bitset>` via DFS, then
+//! assigns each unique bipartition a monotonically-increasing `u32` ID.
+//! Subsequent pairwise distance computation works on `Vec<u32>` — each
+//! comparison is a single integer compare — and the working set of a large
+//! analysis typically fits in L2 cache instead of requiring DRAM.
 
 use crate::bitset::Bitset;
 use phylotree::tree::{Tree as PhyloTree, TreeError};
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
+use std::collections::{HashMap, HashSet};
 
-/// An immutable snapshot of all partitions in a phylogenetic tree.
+use std::cell::RefCell;
+
+thread_local! {
+    /// Per-thread FxHashMap reused across `Snapshot::from_tree` calls.
+    ///
+    /// Building snapshots in a tight loop (sequential or rayon-parallel) was
+    /// allocating a fresh FxHashMap per tree — at 5000 trees that's 5000
+    /// hashmap allocations + drops, plus their internal node arrays. Each
+    /// rayon worker keeps its own TLS slot, so this avoids cross-thread
+    /// synchronization while still reusing capacity across calls.
+    static BITSET_CACHE: RefCell<FxHashMap<usize, Bitset>> =
+        RefCell::new(FxHashMap::default());
+}
+
+/// An immutable snapshot of all bipartitions in one phylogenetic tree.
+///
+/// Stores sorted `Vec<Bitset>` + parallel `Vec<f64>` branch lengths so any
+/// two `Snapshot`s with the same leaf set can be directly compared via
+/// [`crate::distances::rf_distance`], [`crate::distances::wrf_distance`], or
+/// [`crate::distances::kf_distance`].
+///
+/// Passing snapshots with different leaf sets to a distance function will
+/// panic — that is a programming error.
 ///
 /// # Fields
-/// - `parts`: All bipartitions, **canonicalized** (stored in a HashSet for O(1) lookup)
-/// - `lengths`: Branch lengths for each partition (HashMap keyed by Bitset)
-/// - `root_children`: Bitsets for immediate children of root (for rooted RF)
-/// - `words`: Number of u64 words needed for bitsets
-/// - `num_leaves`: Total number of leaves (needed for canonicalization)
-/// - `rooted`: Whether the tree is rooted
+/// - `parts`: bipartitions, canonicalized and sorted ascending for O(m+n) merge
+/// - `lengths`: branch lengths parallel to `parts`
+/// - `leaf_names`: alphabetically sorted taxon names (defines the bit ordering)
+/// - `words`: number of u64 words per bitset
 ///
 /// # Canonicalization
-/// Each bipartition can be represented two ways: {A,B}|{C,D} or {C,D}|{A,B}.
-/// We canonicalize by always storing the side that does NOT contain leaf with index 0.
-/// This ensures identical partitions have identical bitset representations.
-///
-/// # Performance
-/// Using HashSet and HashMap allows O(1) average-case lookups for Robinson-Foulds
-/// and weighted distance calculations, instead of O(n log n) with sorted vectors.
+/// Each bipartition can be represented as two complementary bitsets.
+/// We always store the side that does NOT contain the first leaf (index 0)
+/// so identical splits always have identical bitset representations.
 #[derive(Debug, Clone)]
-pub struct TreeSnapshot {
-    /// All partitions in the tree, canonicalized and SORTED for fast merge-based intersection
-    pub parts: Vec<Bitset>,
+pub struct Snapshot {
+    /// All bipartitions, canonicalized and sorted ascending.
+    pub(crate) parts: Vec<Bitset>,
 
-    /// Branch lengths parallel to parts - same index = same partition!
-    /// This avoids HashMap lookups (O(1) but with hash overhead)
-    /// Direct array indexing is 10-20× faster!
-    pub lengths: Vec<f64>,
+    /// Branch lengths, parallel to `parts`.
+    pub(crate) lengths: Vec<f64>,
 
-    /// Bitsets of root's immediate children (for rooted tree adjustment)
-    pub root_children: Vec<Bitset>,
+    /// Alphabetically sorted taxon names — defines the bit ordering.
+    pub leaf_names: Vec<String>,
 
-    /// Number of u64 words in each bitset
-    pub words: usize,
+    /// Number of u64 words per bitset.
+    pub(crate) words: usize,
 
-    /// Total number of leaves (needed for computing complements)
-    pub num_leaves: usize,
-
-    /// Whether this tree is rooted
+    /// Whether the tree was treated as rooted when snapshotted.
     pub rooted: bool,
 }
 
-impl TreeSnapshot {
-    /// Extract a snapshot from a phylogenetic tree.
+impl Snapshot {
+    /// Parse a Newick string and extract a snapshot of its bipartitions.
     ///
-    /// # Parameters
-    /// - `tree`: The phylogenetic tree to extract partitions from
+    /// The tree must be a plain Newick string (no BEAST annotations). For
+    /// BEAST-format files use `Snapshots::from_newick_iter` which handles
+    /// annotation stripping and taxon renaming automatically.
+    ///
+    /// # Errors
+    /// Returns an error string if the string cannot be parsed or the tree is malformed.
+    pub fn from_newick(newick: &str, rooted: bool) -> Result<Self, String> {
+        let tree = PhyloTree::from_newick(newick).map_err(|e| e.to_string())?;
+        Snapshot::from_tree(&tree, rooted).map_err(|e| e.to_string())
+    }
+
+    /// Extract a snapshot from an already-parsed tree.
     ///
     /// # Algorithm
     /// 1. Extract leaf names and sort them alphabetically for consistency
     /// 2. Map each leaf name to a compact index [0..n)
-    /// 3. DFS (Depth-First Search) from root, building bitsets bottom-up using leaf names
+    /// 3. DFS (Depth-First Search) from root, building bitsets bottom-up
     /// 4. For each internal node, merge child bitsets with OR
-    /// 5. Collect partitions (optionally including trivial single-leaf partitions)
+    /// 5. Collect partitions excluding trivial single-leaf splits
     /// 6. Canonicalize partitions (always store side without leaf with index 0)
     ///
     /// # Errors
     /// Returns `TreeError` if the tree is empty, malformed, or has unnamed leaves.
-    pub fn from_tree(tree: &PhyloTree, rooted_mode: bool) -> Result<Self, TreeError> {
+    pub(crate) fn from_tree(tree: &PhyloTree, rooted_mode: bool) -> Result<Self, TreeError> {
         let rooted = tree.is_rooted()?;
         // Step 1: Extract leaf names and sort them alphabetically
-        let mut leaf_names: Vec<(usize, String)> = tree
+        let mut leaf_id_names: Vec<(usize, String)> = tree
             .get_leaves()
             .iter()
-            .map(|leaf_id| {
-                let leaf_name = tree.get(leaf_id).unwrap().name.clone().unwrap_or_default();
-                (*leaf_id, leaf_name)
+            .map(|leaf_id| -> Result<_, TreeError> {
+                let name = tree.get(leaf_id)?.name.clone().unwrap_or_default();
+                Ok((*leaf_id, name))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
 
         // Sort by taxon name (alphabetically) for consistent ordering
-        leaf_names.sort_by(|a, b| a.1.cmp(&b.1));
+        leaf_id_names.sort_unstable_by(|a, b| a.1.cmp(&b.1));
 
-        let num_leaves = leaf_names.len();
+        let sorted_leaf_names: Vec<String> = leaf_id_names.iter().map(|(_, n)| n.clone()).collect();
+        let num_leaves = leaf_id_names.len();
         let words = num_leaves.div_ceil(64);
 
         // Step 2: Create mapping: node_id → bit_index (based on sorted names)
-        let node_id_to_leaf_index: FxHashMap<usize, usize> = leaf_names
+        let node_id_to_leaf_index: FxHashMap<usize, usize> = leaf_id_names
             .iter()
             .enumerate()
             .map(|(idx, &(node_id, _))| (node_id, idx))
             .collect();
 
-        // Step 3: Perform DFS to build bitsets for each node
+        // Step 3: Perform DFS to build bitsets for each node.
+        // Cache is borrowed from a thread-local pool: clear (drops accumulated
+        // entries) and reserve (ensure capacity matches this tree's node count).
         let root_id = tree.get_root()?;
-        // Cache to store computed bitsets
-        // Key: node_id, Value: Bitset of leaves under this node
-        // Node_id, allows us to get a branch length associated with the partition
-        let mut cache: FxHashMap<usize, Bitset> =
-            FxHashMap::with_capacity_and_hasher(num_leaves * 2, Default::default());
-        Self::compute_bitsets(root_id, tree, &node_id_to_leaf_index, words, &mut cache);
+        BITSET_CACHE.with(|cell| -> Result<Snapshot, TreeError> {
+            let mut cache = cell.borrow_mut();
+            cache.clear();
+            cache.reserve(num_leaves * 2);
+            Self::compute_bitsets(root_id, tree, &node_id_to_leaf_index, words, &mut cache)?;
 
-        // Step 4: Collect partitions (with or without trivial partitions)
-        let (parts, lengths) = Self::collect_partitions(tree, root_id, &cache)?;
+            // Step 4: Collect partitions (with or without trivial partitions)
+            let (parts, lengths) = Self::collect_partitions(tree, root_id, &cache)?;
 
-        // Step 5: Canonicalize partitions
-        // rooted_mode=false: bipartitions (canonicalized, deduped, trivial-filtered)
-        // rooted_mode=true:  clades (raw subtree bitsets, just sorted)
-        let (parts_canonical, lengths_canonical) =
-            Self::canonicalize_partitions(parts, lengths, words, num_leaves, rooted_mode);
+            // Step 5: Canonicalize partitions
+            // rooted_mode=false: bipartitions (canonicalized, deduped, trivial-filtered)
+            // rooted_mode=true:  clades (raw subtree bitsets, just sorted)
+            let (parts_canonical, lengths_canonical) =
+                Self::canonicalize_partitions(parts, lengths, words, num_leaves, rooted_mode);
 
-        // Step 6: Record root's children for rooted tree adjustment
-        let root_children = Self::get_root_children(tree, root_id, &cache)?;
-
-        Ok(TreeSnapshot {
-            parts: parts_canonical,
-            lengths: lengths_canonical,
-            root_children,
-            words,
-            num_leaves,
-            rooted,
+            Ok(Snapshot {
+                parts: parts_canonical,
+                lengths: lengths_canonical,
+                leaf_names: sorted_leaf_names,
+                words,
+                rooted,
+            })
         })
     }
 
@@ -151,34 +180,32 @@ impl TreeSnapshot {
         node_id_to_leaf_index: &FxHashMap<usize, usize>,
         words: usize,
         cache: &mut FxHashMap<usize, Bitset>,
-    ) -> Bitset {
-        // Return cached result if available
+    ) -> Result<Bitset, TreeError> {
         if let Some(bitset) = cache.get(&node_id) {
-            return bitset.clone();
+            return Ok(bitset.clone());
         }
 
-        let node = tree.get(&node_id).expect("valid node");
+        let node = tree.get(&node_id)?;
 
-        // Base case: leaf node
         if node.children.is_empty() {
             let mut bitset = Bitset::zeros(words);
-            let leaf_idx = *node_id_to_leaf_index.get(&node_id).expect("leaf mapped");
+            let leaf_idx = *node_id_to_leaf_index
+                .get(&node_id)
+                .ok_or(TreeError::NodeNotFound(node_id))?;
             bitset.set(leaf_idx);
             cache.insert(node_id, bitset.clone());
-            return bitset;
+            return Ok(bitset);
         }
 
-        // Recursive case: internal node
-        // Merge all child bitsets with OR
         let mut bitset = Bitset::zeros(words);
         for &child_id in &node.children {
             let child_bitset =
-                Self::compute_bitsets(child_id, tree, node_id_to_leaf_index, words, cache);
+                Self::compute_bitsets(child_id, tree, node_id_to_leaf_index, words, cache)?;
             bitset.or_assign(&child_bitset);
         }
 
         cache.insert(node_id, bitset.clone());
-        bitset
+        Ok(bitset)
     }
 
     /// Collect all non-trivial partitions and their branch lengths.
@@ -198,32 +225,15 @@ impl TreeSnapshot {
         root_id: usize,
         cache: &FxHashMap<usize, Bitset>,
     ) -> Result<(Vec<Bitset>, Vec<f64>), TreeError> {
-        let mut parts = Vec::new();
-        let mut lengths = Vec::new();
-
-        // Unless it becomes a bottleneck, we can parallelize this loop later
-        for (&node_id, bitset) in cache.iter() {
-            // Skip root (doesn't create a partition)
-            if node_id == root_id {
-                continue;
-            }
-
-            // Skip trivial partitions (single leaf) unless explicitly requested
-            if bitset.count_ones() <= 1 {
-                continue;
-            }
-
-            // Add this partition
-            parts.push(bitset.clone());
-
-            // Get branch length leading TO this node (creates the partition)
-            // This is the edge from parent to this node, not the sum of child edges
-            let node = tree.get(&node_id)?;
-            let length: f64 = node.parent_edge.unwrap_or(0.0);
-            lengths.push(length);
-        }
-
-        Ok((parts, lengths))
+        cache
+            .iter()
+            .filter(|(node_id, bitset)| **node_id != root_id && bitset.count_ones() > 1)
+            .map(|(node_id, bitset)| {
+                let length = tree.get(node_id)?.parent_edge.unwrap_or(0.0);
+                Ok((bitset.clone(), length))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|v| v.into_iter().unzip())
     }
 
     /// Canonicalize partitions to ensure consistent representation.
@@ -346,49 +356,263 @@ impl TreeSnapshot {
 
     /// Compute the bitwise complement of a partition.
     ///
-    /// Flips all bits up to num_leaves, keeping remaining bits as 0.
+    /// Flips all bits up to `num_leaves` using word-level NOT, then masks the
+    /// trailing garbage bits in the final word.
     ///
     /// # Example
     /// Input:  0b0011 (4 leaves) → Output: 0b1100
-    /// Input:  0b1100 (4 leaves) → Output: 0b0011
     fn compute_complement(bitset: &Bitset, words: usize, num_leaves: usize) -> Bitset {
-        let mut complement = Bitset::zeros(words);
-
-        for i in 0..num_leaves {
-            let word = i >> 6;
-            let bit = i & 63;
-
-            // Check if bit i is set in original
-            let is_set = (bitset.0[word] & (1u64 << bit)) != 0;
-
-            // Set bit i in complement if NOT set in original
-            if !is_set {
-                complement.0[word] |= 1u64 << bit;
-            }
+        let mut complement = Bitset(bitset.0.iter().map(|&w| !w).collect());
+        let used = num_leaves % 64;
+        if used != 0 {
+            complement.0[words - 1] &= (1u64 << used) - 1;
         }
-
         complement
     }
+}
 
-    /// Sort partitions lexicographically for edge length matching later.
-    /// Get bitsets for root's immediate children (for rooted RF adjustment).
+/// One tree's bipartitions in interned form (private implementation detail of [`Snapshots`]).
+///
+/// `split_ids` is sorted ascending so the RF sorted-merge can run on integers.
+/// `lengths[i]` is the branch length of `split_ids[i]` (parallel arrays).
+#[derive(Debug, Clone)]
+pub(crate) struct InternSnap {
+    pub(crate) split_ids: Vec<u32>,
+    pub(crate) lengths: Vec<f64>,
+}
+
+/// A bulk collection of tree snapshots in an interned split-ID representation.
+///
+/// All trees in the set share a single bipartition table: each unique split is
+/// assigned a `u32` ID once. Pairwise distance computation then works on
+/// `Vec<u32>` instead of `Vec<Bitset>`, which is faster and more cache-friendly.
+///
+/// # Construction
+/// - [`Snapshots::from_newick_iter`] — main constructor for BEAST/NEXUS inputs
+/// - [`Snapshots::from_newicks`] — convenience constructor for plain Newick slices
+///
+/// # Pairwise distances
+/// - [`Snapshots::pairwise_rf`], [`Snapshots::pairwise_wrf`], [`Snapshots::pairwise_kf`]
+#[derive(Debug)]
+pub struct Snapshots {
+    pub(crate) snapshots: Vec<InternSnap>,
+    /// The bipartition at index `i` corresponds to split ID `i`.
+    pub bipartitions: Vec<Bitset>,
+    /// Reverse map: bipartition bitset → split ID.
+    pub bipartition_index: FxHashMap<Bitset, u32>,
+    pub words_per_bitset: usize,
+    /// Alphabetically sorted taxon names shared by all trees in this set.
+    pub leaf_names: Vec<String>,
+}
+
+impl Snapshots {
+    /// Build a `Snapshots` collection from a lazy iterator of `(newick, translate_map)` pairs.
     ///
-    /// In rooted trees, we need to know if two trees have the same root
-    /// position to apply the correct RF distance adjustment.
-    fn get_root_children(
-        tree: &PhyloTree,
-        root_id: usize,
-        cache: &FxHashMap<usize, Bitset>,
-    ) -> Result<Vec<Bitset>, TreeError> {
-        let root = tree.get(&root_id)?;
-        let mut root_children: Vec<Bitset> = root
-            .children
+    /// Each `newick` may contain BEAST-format `[&...]` annotations — they are stripped
+    /// automatically. The `translate_map` is applied to rename leaf labels (pass an empty
+    /// map for plain Newick files with no BEAST translate block).
+    ///
+    /// All trees must share the same leaf set; an error is returned if any tree differs.
+    ///
+    /// # Errors
+    /// Returns `Err(String)` if any newick fails to parse or leaf sets are inconsistent.
+    pub fn from_newick_iter<'a>(
+        entries: impl IntoIterator<Item = (&'a str, &'a HashMap<String, String>)>,
+        rooted: bool,
+    ) -> Result<Self, String> {
+        let entries: Vec<_> = entries.into_iter().collect();
+        if entries.is_empty() {
+            return Ok(Self::empty());
+        }
+
+        // Parse the first tree to establish the reference leaf set.
+        let (first_newick, first_translate) = entries[0];
+        let first_clean = crate::io::strip_beast_annotations(first_newick);
+        let mut first_tree = PhyloTree::from_newick(&first_clean)
+            .map_err(|e| format!("Failed to parse newick at index 0: {e}"))?;
+        crate::io::rename_leaf_nodes(&mut first_tree, first_translate);
+
+        //sanity check: ensure all leaf names are unique within the first tree
+        let first_leaves = first_tree.get_leaves();
+        if first_leaves.len() != first_leaves.iter().collect::<HashSet<_>>().len() {
+            return Err(
+                "Trees have duplicate leaf names. All leaf names must be unique.".to_string(),
+            );
+        }
+
+        let mut sorted_leaf_names: Vec<String> = first_leaves
             .iter()
-            .filter_map(|&child_id| cache.get(&child_id).cloned())
+            .filter_map(|&id| first_tree.get(&id).ok()?.name.clone())
+            .collect();
+        sorted_leaf_names.sort_unstable();
+        sorted_leaf_names.dedup();
+        let reference_leaves: HashSet<String> = sorted_leaf_names.iter().cloned().collect();
+
+        let first_snap = Snapshot::from_tree(&first_tree, rooted)
+            .map_err(|e| format!("Failed to snapshot tree at index 0: {e}"))?;
+        drop(first_tree);
+
+        // Parse all remaining trees in parallel, validating leaf sets.
+        let rest: Vec<Snapshot> = entries[1..]
+            .par_iter()
+            .enumerate()
+            .map(|(j, &(newick, translate))| {
+                let i = j + 1;
+                let clean = crate::io::strip_beast_annotations(newick);
+                let mut tree = PhyloTree::from_newick(&clean)
+                    .map_err(|e| format!("Failed to parse newick at index {i}: {e}"))?;
+                crate::io::rename_leaf_nodes(&mut tree, translate);
+
+                let leaves: HashSet<String> = tree
+                    .get_leaves()
+                    .iter()
+                    .filter_map(|&id| tree.get(&id).ok()?.name.clone())
+                    .collect();
+                if leaves != reference_leaves {
+                    return Err(format!(
+                        "Tree {i} has a different leaf set than tree 0. All trees must share the same taxa."
+                    ));
+                }
+                Snapshot::from_tree(&tree, rooted)
+                    .map_err(|e| format!("Failed to snapshot tree at index {i}: {e}"))
+            })
+            .collect::<Result<_, _>>()?;
+
+        let mut snaps = Vec::with_capacity(entries.len());
+        snaps.push(first_snap);
+        snaps.extend(rest);
+
+        Ok(Self::intern(snaps, sorted_leaf_names))
+    }
+
+    /// Build a `Snapshots` collection from a slice of plain Newick strings.
+    ///
+    /// No BEAST annotation stripping or taxon renaming is performed — the strings
+    /// must already be in standard Newick format.
+    ///
+    /// # Errors
+    /// Returns `Err(String)` if any newick fails to parse or leaf sets differ.
+    pub fn from_newicks(newicks: &[&str], rooted: bool) -> Result<Self, String> {
+        let empty: HashMap<String, String> = HashMap::new();
+        Self::from_newick_iter(newicks.iter().map(|&n| (n, &empty)), rooted)
+    }
+
+    /// Number of trees in this collection.
+    pub fn len(&self) -> usize {
+        self.snapshots.len()
+    }
+
+    /// Returns `true` if the collection contains no trees.
+    pub fn is_empty(&self) -> bool {
+        self.snapshots.is_empty()
+    }
+
+    /// Map each split ID to its column position in ascending `Bitset` order.
+    ///
+    /// Returns a `Vec<usize>` where `result[split_id]` = column index.
+    pub fn sorted_bip_id_to_col(&self) -> Vec<usize> {
+        let n = self.bipartitions.len();
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_unstable_by(|&a, &b| self.bipartitions[a].cmp(&self.bipartitions[b]));
+        let mut id_to_col = vec![0usize; n];
+        for (col, &orig_id) in order.iter().enumerate() {
+            id_to_col[orig_id] = col;
+        }
+        id_to_col
+    }
+
+    /// Build a flat row-major presence matrix `(n_trees × n_bip)` as `Vec<u8>`.
+    ///
+    /// Columns are in ascending `Bitset` order (stable across calls on the same tree set).
+    /// Each byte is `1` if the split is present in that tree, `0` otherwise.
+    pub fn build_presence_matrix(&self) -> Vec<u8> {
+        let id_to_col = self.sorted_bip_id_to_col();
+        let n_trees = self.snapshots.len();
+        let n_bip = self.bipartitions.len();
+        let mut presence = vec![0u8; n_trees * n_bip];
+
+        if n_bip == 0 {
+            return presence; // No splits, return empty matrix
+        }
+
+        // Safely divide the mutable slice into row-sized chunks across threads
+        presence
+            .par_chunks_mut(n_bip)
+            .zip(&self.snapshots) // Pair each chunk with its corresponding snapshot
+            .for_each(|(row, snap)| {
+                for &split_id in &snap.split_ids {
+                    // Write directly into the final memory location
+                    row[id_to_col[split_id as usize]] = 1;
+                }
+            });
+
+        presence
+    }
+
+    /// Compute all pairwise Robinson–Foulds distances as a symmetric n×n matrix.
+    pub fn pairwise_rf(&self) -> Vec<usize> {
+        crate::distances::pairwise_symmetric(self, crate::distances::rf_distance_fast)
+    }
+
+    /// Compute all pairwise Weighted Robinson–Foulds distances as a symmetric n×n matrix.
+    pub fn pairwise_wrf(&self) -> Vec<f64> {
+        crate::distances::pairwise_symmetric(self, crate::distances::wrf_distance_fast)
+    }
+
+    /// Compute all pairwise Kuhner–Felsenstein distances as a symmetric n×n matrix.
+    pub fn pairwise_kf(&self) -> Vec<f64> {
+        crate::distances::pairwise_symmetric(self, crate::distances::kf_distance_fast)
+    }
+
+    /// Build the interning table from a `Vec<Snapshot>` (internal helper).
+    fn intern(snaps: Vec<Snapshot>, leaf_names: Vec<String>) -> Self {
+        let words = snaps.first().map(|s| s.words).unwrap_or(0);
+        let mut index: FxHashMap<Bitset, u32> = FxHashMap::default();
+        let mut bipartitions: Vec<Bitset> = Vec::new();
+
+        let interned: Vec<InternSnap> = snaps
+            .into_iter()
+            .map(|snap| {
+                let mut paired: Vec<(u32, f64)> = snap
+                    .parts
+                    .into_iter()
+                    .zip(snap.lengths)
+                    .map(|(b, length)| {
+                        let next_id = bipartitions.len() as u32;
+                        let id = if let Some(&id) = index.get(&b) {
+                            id
+                        } else {
+                            index.insert(b.clone(), next_id);
+                            bipartitions.push(b);
+                            next_id
+                        };
+                        (id, length)
+                    })
+                    .collect();
+
+                paired.sort_unstable_by_key(|&(id, _)| id);
+                let (split_ids, lengths): (Vec<u32>, Vec<f64>) = paired.into_iter().unzip();
+                InternSnap { split_ids, lengths }
+            })
             .collect();
 
-        root_children.sort_unstable();
-        Ok(root_children)
+        Self {
+            snapshots: interned,
+            bipartitions,
+            bipartition_index: index,
+            words_per_bitset: words,
+            leaf_names,
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
+            snapshots: Vec::new(),
+            bipartitions: Vec::new(),
+            bipartition_index: FxHashMap::default(),
+            words_per_bitset: 0,
+            leaf_names: Vec::new(),
+        }
     }
 }
 
@@ -396,62 +620,24 @@ impl TreeSnapshot {
 mod tests {
     use super::*;
 
-    /// Complete example: Tree with depth 3 and multiple partitions
+    /// A symmetric 4-leaf tree produces a single bipartition after canonicalization.
     ///
     /// ```text
-    ///           root
-    ///          /    \
-    ///      node1     node2
-    ///      /   \     /   \
-    ///     A     B   C    node3
-    ///                    /   \
-    ///                   D     E
+    ///        root
+    ///       /    \
+    ///   node1    node2
+    ///   /   \    /   \
+    ///  A     B  C     D
     /// ```
     ///
-    /// After sorting leaves alphabetically: A=0, B=1, C=2, D=3, E=4
+    /// Leaves sorted: A=0, B=1, C=2, D=3.
     ///
-    /// # Step 1: Extract all partitions (bottom-up DFS)
+    /// node1's subtree = {A,B} = 0b0011 — contains A (bit 0), so flip to {C,D} = 0b1100.
+    /// node2's subtree = {C,D} = 0b1100 — no A, keep as-is.
     ///
-    /// | Node  | Leaves Below | Raw Bitset | Binary    |
-    /// |-------|--------------|------------|-----------|
-    /// | node3 | {D, E}       | 0b11000    | bits 3,4  |
-    /// | node2 | {C, D, E}    | 0b11100    | bits 2,3,4|
-    /// | node1 | {A, B}       | 0b00011    | bits 0,1  |
-    /// | root  | {A,B,C,D,E}  | 0b11111    | (skipped) |
-    ///
-    /// We skip root (no partition above it).
-    ///
-    /// # Step 2: Canonicalize (flip if leaf 0=A is present)
-    ///
-    /// | Partition | Raw Bitset | Has A? | Action | Canonical |
-    /// |-----------|------------|--------|--------|-----------|
-    /// | node3: {D,E}   | 0b11000 | NO  | Keep   | 0b11000   |
-    /// | node2: {C,D,E} | 0b11100 | NO  | Keep   | 0b11100   |
-    /// | node1: {A,B}   | 0b00011 | YES | Flip!  | 0b11100   |
-    ///
-    /// Wait! node1 flipped becomes {C,D,E} = 0b11100, same as node2!
-    /// That's WRONG - they're different partitions!
-    ///
-    /// # The Real Issue: Need Better Example
-    ///
-    /// Let me show a tree where partitions DON'T overlap:
-    ///
-    /// ```text
-    ///           root
-    ///          /    \
-    ///      node1    node2
-    ///      /   \    /   \
-    ///     A     B  C     D
-    /// ```
-    ///
-    /// Leaves sorted: A=0, B=1, C=2, D=3
-    ///
-    /// | Node  | Leaves    | Raw Bitset | Has A? | Canonical |
-    /// |-------|-----------|------------|--------|-----------|
-    /// | node1 | {A, B}    | 0b0011     | YES    | 0b1100 (flip to {C,D}) |
-    /// | node2 | {C, D}    | 0b1100     | NO     | 0b1100 (keep)          |
-    ///
-    /// Now both become 0b1100! That's STILL wrong - they're different branches!
+    /// Both sides of the root bipartition canonicalize to the same bitset because they
+    /// represent the **same split** viewed from either side. `canonicalize_partitions`
+    /// deduplicates them into one entry and sums the branch lengths.
     #[test]
     fn test_depth3_tree_partitions() {
         // This test reveals a conceptual issue...
@@ -488,7 +674,7 @@ mod tests {
         let parts = vec![part_ab, part_cd];
         let lengths = vec![1.0, 2.0];
         let (canon_parts, canon_lengths) =
-            TreeSnapshot::canonicalize_partitions(parts, lengths, 1, 4, false);
+            Snapshot::canonicalize_partitions(parts, lengths, 1, 4, false);
         assert_eq!(
             canon_parts.len(),
             1,
@@ -514,7 +700,7 @@ mod tests {
         // Tree: ((A:1,B:1):1,(C:1,D:1):1);
         // Root has two internal children - classic root bipartition duplication case
         let tree = PhyloTree::from_newick("((A:1,B:1):1,(C:1,D:1):1);").unwrap();
-        let snap = TreeSnapshot::from_tree(&tree, false).unwrap();
+        let snap = Snapshot::from_tree(&tree, false).unwrap();
 
         // For 4 leaves, an unrooted binary tree has L-3 = 1 non-trivial bipartition.
         // With dedup, the rooted tree should also have 1 (not 2).
@@ -529,44 +715,37 @@ mod tests {
     /// Test rooted vs unrooted mode partition counts and RF distances.
     #[test]
     fn test_rooted_vs_unrooted_partitions() {
-        use crate::distances::rf_from_snapshots;
         use phylotree::tree::Tree as PhyloTree;
+
+        let rf_pair = |a: &Snapshot, b: &Snapshot| -> usize { crate::distances::rf_distance(a, b) };
 
         let tree1 = PhyloTree::from_newick("((A:1,B:1):1,(C:1,D:1):1);").unwrap();
         let tree2 = PhyloTree::from_newick("((A:1,C:1):1,(B:1,D:1):1);").unwrap();
 
         // Unrooted mode: L-3 = 1 bipartition per tree
-        let snap1_u = TreeSnapshot::from_tree(&tree1, false).unwrap();
-        let snap2_u = TreeSnapshot::from_tree(&tree2, false).unwrap();
+        let snap1_u = Snapshot::from_tree(&tree1, false).unwrap();
+        let snap2_u = Snapshot::from_tree(&tree2, false).unwrap();
         assert_eq!(
             snap1_u.parts.len(),
             1,
             "Unrooted: 1 bipartition for 4-leaf tree"
         );
         assert_eq!(snap2_u.parts.len(), 1);
-        assert_eq!(rf_from_snapshots(&snap1_u, &snap2_u), 2, "Unrooted RF = 2");
+        assert_eq!(rf_pair(&snap1_u, &snap2_u), 2, "Unrooted RF = 2");
 
         // Rooted mode: L-2 = 2 clades per tree
-        let snap1_r = TreeSnapshot::from_tree(&tree1, true).unwrap();
-        let snap2_r = TreeSnapshot::from_tree(&tree2, true).unwrap();
+        let snap1_r = Snapshot::from_tree(&tree1, true).unwrap();
+        let snap2_r = Snapshot::from_tree(&tree2, true).unwrap();
         assert_eq!(snap1_r.parts.len(), 2, "Rooted: 2 clades for 4-leaf tree");
         assert_eq!(snap2_r.parts.len(), 2);
-        assert_eq!(rf_from_snapshots(&snap1_r, &snap2_r), 4, "Rooted RF = 4");
+        assert_eq!(rf_pair(&snap1_r, &snap2_r), 4, "Rooted RF = 4");
 
         // Same topology: both modes give RF = 0
         let tree1b = PhyloTree::from_newick("((B:2,A:2):2,(D:2,C:2):2);").unwrap();
-        let snap1b_u = TreeSnapshot::from_tree(&tree1b, false).unwrap();
-        let snap1b_r = TreeSnapshot::from_tree(&tree1b, true).unwrap();
-        assert_eq!(
-            rf_from_snapshots(&snap1_u, &snap1b_u),
-            0,
-            "Unrooted same topo = 0"
-        );
-        assert_eq!(
-            rf_from_snapshots(&snap1_r, &snap1b_r),
-            0,
-            "Rooted same topo = 0"
-        );
+        let snap1b_u = Snapshot::from_tree(&tree1b, false).unwrap();
+        let snap1b_r = Snapshot::from_tree(&tree1b, true).unwrap();
+        assert_eq!(rf_pair(&snap1_u, &snap1b_u), 0, "Unrooted same topo = 0");
+        assert_eq!(rf_pair(&snap1_r, &snap1b_r), 0, "Rooted same topo = 0");
     }
 
     /// Better example: Asymmetric tree with distinct partitions

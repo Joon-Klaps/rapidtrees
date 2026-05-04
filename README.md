@@ -17,6 +17,7 @@
   <a href="#-installing">Installing</a> •
   <a href="#-usage">Usage</a> •
   <a href="#-python-api">Python API</a> •
+  <a href="#-snap-format">Snap Format</a> •
   <a href="#%EF%B8%8F-benchmarks">Benchmarks</a>
 </p>
 
@@ -24,7 +25,7 @@
 
 ## 🗺️ Overview
 
-`rapidtrees` computes pairwise tree distances from [BEAST](https://beast.community/)/NEXUS `.trees` files and writes a labeled distance matrix. Three metrics are supported:
+`rapidtrees` computes pairwise tree distances from [BEAST](https://beast.community/)/NEXUS `.trees` files or from precomputed `.snap` files and writes a labeled distance matrix. Three metrics are supported:
 
 | Metric             | Flag                | Output  | Description                                   |
 | ------------------ | ------------------- | ------- | --------------------------------------------- |
@@ -42,13 +43,13 @@
 
 ### 🚀 Performance
 
-Benchmarked on a ZIKA dataset (283 taxa · 4 000 trees · ~8 M comparisons):
+Benchmarked on a ZIKA dataset (283 taxa · 4 000 trees · ~8 M comparisons) (non-gzipped output):
 
 | Metric             | Total time | Throughput                 |
 | ------------------ | ---------- | -------------------------- |
-| Robinson-Foulds    | ~3.5 s     | **~2.3 M comparisons/sec** |
-| Weighted RF        | ~3.5 s     | **~2.3 M comparisons/sec** |
-| Kuhner-Felsenstein | ~3.5 s     | **~2.3 M comparisons/sec** |
+| Robinson-Foulds    | ~2.7 s     | **~3.0 M comparisons/sec** |
+| Weighted RF        | ~3.4 s     | **~2.3 M comparisons/sec** |
+| Kuhner-Felsenstein | ~3.3 s     | **~2.3 M comparisons/sec** |
 
 ---
 
@@ -72,11 +73,27 @@ cargo install rapidtrees
 
 ### 🛠️ From source
 
+#### Prerequisites
+- [Rust toolchain](https://rustup.rs/) — for building the Rust core
+- [pixi](https://pixi.sh/) — for managing Python and R dependencies
+
+#### Setup
+
 ```bash
 git clone https://github.com/Joon-Klaps/rapidtrees.git
 cd rapidtrees
-cargo build --release   # CLI binary → target/release/rapidtrees
-pip install -e .        # Python bindings (requires Rust toolchain + maturin)
+# Set up environment — installs Python, R (with phangorn), and builds the package
+pixi install
+```
+
+#### Development tasks
+
+```bash
+# Run Python API tests (includes R/phangorn cross-validation)
+pixi run test-python
+
+# Run Rust unit tests
+pixi run test-rust
 ```
 
 ---
@@ -85,7 +102,7 @@ pip install -e .        # Python bindings (requires Rust toolchain + maturin)
 
 ```bash
 rapidtrees \
-  --input <path/to/file.trees> \
+  (--input <path/to/file.trees> | --snap-input <path/to/file.snap>) \
   --output <path/to/output.tsv[.gz]> \
   [--burnin-trees <N>] \
   [--burnin-states <STATE>] \
@@ -97,6 +114,7 @@ rapidtrees \
 | Flag                          | Description                                                        |
 | ----------------------------- | ------------------------------------------------------------------ |
 | `-i, --input <INPUT>`         | Path to BEAST `.trees` (NEXUS) file                                |
+| `--snap-input <SNAP_INPUT>`   | Path to `.snap` file (currently supports only `--metric rf`)       |
 | `-o, --output <OUTPUT>`       | Output path. Use `.gz` suffix for gzip compression; `-` for stdout |
 | `-t, --burnin-trees <N>`      | Drop the first N trees (default: `0`)                              |
 | `-s, --burnin-states <STATE>` | Keep only trees with `STATE > STATE` (default: `0`)                |
@@ -146,40 +164,140 @@ rapidtrees \
 
 </details>
 
+<details>
+<summary><strong>Compute RF matrix directly from a snapshot file</strong></summary>
+
+```bash
+rapidtrees \
+  --snap-input out/hiv1.snap \
+  -o out/hiv1_rf_from_snap.tsv.gz \
+  --metric rf
+
+# Read snap with 21 trees and 2193 bipartitions in 0.001s
+# Determined distances using RF in 0.000s
+# Writing to out/hiv1_rf_from_snap.tsv.gz in 0.000s
+```
+
+</details>
+
 ---
 
 ## 🐍 Python API
 
-`rapidtrees` ships Python bindings for seamless integration into Python workflows.
+`rapidtrees` exposes four functions from its Rust core. All accept a Python **iterator** of newick strings, keeping memory constant regardless of tree count.
+
+| Function | Returns |
+| --- | --- |
+| `pairwise_rf_from_newick_iter` | `(names, bytes)` — RF matrix as flat `uint32` bytes, row-major |
+| `pairwise_rf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes)` — RF + bipartition presence matrix |
+| `pairwise_wrf_from_newick_iter` | `(names, list[float])` — Weighted RF, flat row-major |
+| `pairwise_kf_from_newick_iter` | `(names, list[float])` — Kuhner-Felsenstein, flat row-major |
 
 ```python
 import rapidtrees as rtd
+import numpy as np
 
-# Robinson-Foulds distances
-tree_names, rf_matrix = rtd.pairwise_rf(
-    paths=["file1.trees", "file2.trees"],
-    burnin_trees=10,    # skip first 10 trees per file
-    burnin_states=0,    # skip trees with STATE < 0
-    use_real_taxa=True  # use TRANSLATE block when merging multiple files
+trees = [
+    "(A:0.1,(B:0.1,C:0.1):0.1);",
+    "(A:0.1,(C:0.1,B:0.1):0.1);",
+    "((A:0.1,B:0.1):0.1,C:0.1);",
+]
+names = ["t1", "t2", "t3"]
+
+tree_names, rf_bytes = rtd.pairwise_rf_from_newick_iter(
+    names, iter(trees), [{}], [0, 0, 0]
 )
+rf = np.frombuffer(rf_bytes, dtype=np.uint32).reshape(len(tree_names), -1)
+```
 
-# Weighted RF (considers branch lengths)
-tree_names, wrf_matrix = rtd.pairwise_weighted_rf(
-    paths=["file1.trees"],
-    burnin_trees=10
+For BEAST `.trees` files, translate maps, the snapshot API, and multi-file usage see **[docs/python-api.md](docs/python-api.md)**.
+
+---
+
+## 📦 Snap Format
+
+`rapidtrees` can export tree snapshots to a compressed binary `.snap` file for downstream analyses (ESS computation, ASDSF, convergence diagnostics) on HPC clusters without re-parsing the original `.trees` files. The CLI can also compute RF distance matrices directly from `.snap` files via `--snap-input`.
+
+### What is a snapshot?
+
+A **tree snapshot** is a compact bitset representation of a phylogenetic tree. Each bipartition (split) is encoded as a bitset over leaf indices. The full set of snapshots for a tree collection captures everything needed for RF-family distance computations and convergence diagnostics — without storing the original Newick strings.
+
+> **Note:** Snapshots are not human-readable and are not intended for general interchange. They are an internal format optimized for fast distance calculations and cannot be convert to it's original newick-style format.
+
+### File layout
+
+A `.snap` file is a **gzip-compressed** binary stream with the following sections in order:
+
+```
+┌─────────────────────────────────────────────────────┐
+│  HEADER                                              │
+│  4 bytes  magic        "SNAP" (0x534E4150)          │
+│  1 byte   version      format version (currently 2) │
+│  8 bytes  n_trees      u64 LE — number of trees     │
+│  8 bytes  n_taxa       u64 LE — number of leaf taxa │
+│  8 bytes  n_bip        u64 LE — number of unique    │
+│                         bipartitions across all trees│
+├─────────────────────────────────────────────────────┤
+│  TAXA NAMES                                          │
+│  For each of n_taxa:                                 │
+│    4 bytes  length     u32 LE — byte length of name │
+│    N bytes  name       UTF-8 string                  │
+├─────────────────────────────────────────────────────┤
+│  TREE NAMES                                          │
+│  For each of n_trees:                                │
+│    4 bytes  length     u32 LE — byte length of name │
+│    N bytes  name       UTF-8 string                  │
+├─────────────────────────────────────────────────────┤
+│  PRESENCE MATRIX                                     │
+│  n_trees × n_bip bytes, row-major uint8             │
+│  presence[i][j] = 1 if bipartition j is in tree i  │
+│                   0 otherwise                        │
+└─────────────────────────────────────────────────────┘
+```
+
+Bipartition column order is **deterministic**: columns are sorted in ascending `Bitset` order (lexicographic over `u64` words, i.e. by leaf-index bit pattern), so the same tree set always produces the same column indices regardless of parse order.
+
+### What the presence matrix gives you
+
+The presence matrix is sufficient for all major convergence diagnostics:
+
+| Diagnostic              | What you need                    |
+| ----------------------- | -------------------------------- |
+| **Pseudo ESS**          | `presence.mean(axis=0)` per chain |
+| **ASDSF**               | Per-chain split frequencies       |
+| **Fréchet ESS**         | RF distances via XOR of rows      |
+| **WRF / KF distances**  | Branch lengths *(future section)* |
+
+Note: `sum(presence[i] XOR presence[j]) == RF(tree_i, tree_j)` exactly.
+
+### Presence matrix from Python
+
+Snap files are written and read by the CLI only. From Python, use
+`pairwise_rf_with_snapshots_from_newick_iter` to obtain the same presence
+matrix in memory without writing a file — see the [Python API section](#-python-api) above.
+
+```python
+import rapidtrees as rtd
+import numpy as np
+
+tree_names, rf_bytes, leaf_names, n_bip, pres_bytes = (
+    rtd.pairwise_rf_with_snapshots_from_newick_iter(
+        names, iter(newicks), translate_maps, map_indices
+    )
 )
+n = len(tree_names)
+presence = np.frombuffer(pres_bytes, dtype=np.uint8).reshape(n, n_bip).copy()
 
-# Kuhner-Felsenstein distances
-tree_names, kf_matrix = rtd.pairwise_kf(
-    paths=["file1.trees"],
-    burnin_trees=10
-)
+# Global split frequencies (for Pseudo ESS / ASDSF)
+global_freq = presence.mean(axis=0)
 
-print(f"Computed distances for {len(tree_names)} trees")
-print(f"RF distance between tree 0 and 1: {rf_matrix[0][1]}")
+# RF distance between any two trees — no recomputation needed
+rf_01 = int((presence[0].astype(int) ^ presence[1].astype(int)).sum())
 ```
 
 ---
+
+
 
 ## ⏱️ Benchmarks
 
@@ -188,32 +306,33 @@ Benchmarks were run on a MacBook Pro M1. Trees are parsed **once** and bitset sn
 <details>
 <summary><strong>Show full benchmark table</strong></summary>
 
-| Taxa (N) | Trees (T) | Combinations | Est. Memory | Actual Memory   | Wall Time        | CPU Time         |
-| -------- | --------- | ------------ | ----------- | --------------- | ---------------- | ---------------- |
-| 10       | 100       | 10.0K        | 51.56 KB    | 64.00 KB        | 391.71 µs        | 1.77 ms          |
-| 10       | 1000      | 1.0M         | 515.62 KB   | 448.00 KB       | 1.16 ms          | 9.52 ms          |
-| 10       | 10000     | 100.0M       | 5.04 MB     | 5.02 MB         | 81.86 ms         | 757.66 ms        |
-| 10       | 100000    | 10.0B        | 50.35 MB    | 52.42 MB        | 8.17 s (est)     | 1.27 min (est)   |
-| 100      | 100       | 10.0K        | 481.25 KB   | 464.00 KB       | 230.54 µs        | 1.45 ms          |
-| 100      | 1000      | 1.0M         | 4.70 MB     | 1.17 MB         | 42.00 ms         | 147.22 ms        |
-| 100      | 10000     | 100.0M       | 47.00 MB    | 38.42 MB        | 1.78 s           | 14.75 s          |
-| 100      | 100000    | 10.0B        | 469.97 MB   | 451.47 MB       | 2.77 min (est)   | 25.29 min (est)  |
-| 500      | 100       | 10.0K        | 4.59 MB     | 80.00 KB        | 1.61 ms          | 14.18 ms         |
-| 500      | 1000      | 1.0M         | 45.90 MB    | 25.95 MB        | 165.58 ms        | 1.46 s           |
-| 500      | 10000     | 100.0M       | 458.98 MB   | 399.44 MB       | 19.75 s          | 2.87 min         |
-| 500      | 100000    | 10.0B        | 4.48 GB     | 4.51 GB         | 31.75 min (est)  | 294.98 min (est) |
-| 1000     | 100       | 10.0K        | 15.27 MB    | 5.30 MB         | 4.69 ms          | 44.25 ms         |
-| 1000     | 1000      | 1.0M         | 152.71 MB   | 126.77 MB       | 660.03 ms        | 5.30 s           |
-| 1000     | 10000     | 100.0M       | 1.49 GB     | 1.44 GB         | 1.13 min         | 9.72 min         |
-| 1000     | 100000    | 10.0B        | 14.91 GB    | 9.41 GB         | 111.42 min (est) | 983.70 min (est) |
-| 2000     | 100       | 10.0K        | 54.94 MB    | 34.56 MB        | 23.11 ms         | 182.28 ms        |
-| 2000     | 1000      | 1.0M         | 549.44 MB   | 480.02 MB       | 2.89 s           | 19.48 s          |
-| 2000     | 10000     | 100.0M       | 5.37 GB     | 5.10 GB         | 3.92 min         | 34.76 min        |
-| 2000     | 100000    | 10.0B        | 53.66 GB    | Skipped (>30GB) | -                | -                |
-| 5000     | 100       | 10.0K        | 316.63 MB   | 299.31 MB       | 270.13 ms        | 2.09 s           |
-| 5000     | 1000      | 1.0M         | 3.09 GB     | 3.06 GB         | 27.61 s          | 4.05 min         |
-| 5000     | 10000     | 100.0M       | 30.92 GB    | Skipped (>30GB) | -                | -                |
-| 5000     | 100000    | 10.0B        | 309.21 GB   | Skipped (>30GB) | -                | -                |
+> Output of `cargo bench --bench memory_time_benchmark`
+
+| Taxa (N) | Trees (T) | Combinations | Est. Memory | Actual Memory | Wall Time | CPU Time |
+|----------|-----------|--------------|-------------|---------------|-----------|----------|
+| 10       | 100       | 5.0K        | 13.96 KB    | 17.87 KB      | 172.29 µs | 733.00 µs |
+| 10       | 1000      | 500.0K         | 139.65 KB   | 168.95 KB     | 5.94 ms   | 12.99 ms |
+| 10       | 10000     | 50.0M       | 1.36 MB     | 1.64 MB       | 717.43 ms | 1.36 s   |
+| 10       | 100000    | 5.0B        | 13.64 MB    | 16.40 MB      | 3.53 min  | 4.04 min |
+| 100      | 100       | 5.0K        | 133.59 KB   | 136.09 KB     | 244.42 µs | 1.75 ms  |
+| 100      | 1000      | 500.0K         | 1.30 MB     | 1.21 MB       | 17.49 ms  | 50.99 ms |
+| 100      | 10000     | 50.0M       | 13.05 MB    | 11.95 MB      | 1.08 s    | 4.81 s   |
+| 100      | 100000    | 5.0B        | 130.46 MB   | 119.41 MB     | 4.29 min  | 9.86 min |
+| 500      | 100       | 5.0K        | 706.84 KB   | 713.93 KB     | 2.02 ms   | 3.08 ms  |
+| 500      | 1000      | 500.0K         | 6.90 MB     | 5.89 MB       | 27.77 ms  | 216.87 ms |
+| 500      | 10000     | 50.0M       | 69.03 MB    | 57.84 MB      | 2.82 s    | 21.30 s  |
+| 500      | 100000    | 5.0B        | 690.27 MB   | 577.28 MB     | 7.44 min  | 37.13 min |
+| 1000     | 100       | 5.0K        | 1.50 MB     | 1.51 MB       | 873.75 µs | 5.63 ms  |
+| 1000     | 1000      | 500.0K         | 15.03 MB    | 11.86 MB      | 51.22 ms  | 420.94 ms |
+| 1000     | 10000     | 50.0M       | 150.32 MB   | 115.30 MB     | 5.12 s    | 42.92 s  |
+| 1000     | 100000    | 5.0B        | 1.47 GB     | 1.12 GB       | 11.26 min | 74.74 min |
+| 2000     | 100       | 5.0K        | 3.50 MB     | 3.51 MB       | 1.14 ms   | 9.92 ms  |
+| 2000     | 1000      | 500.0K         | 35.01 MB    | 24.15 MB      | 93.73 ms  | 838.01 ms |
+| 2000     | 10000     | 50.0M       | 350.06 MB   | 230.59 MB     | 9.42 s    | 1.38 min |
+| 2000     | 100000    | 5.0B        | 3.42 GB     | 2.24 GB       | 18.57 min | 141.11 min |
+| 5000     | 100       | 5.0K        | 14.30 MB    | 12.43 MB      | 61.36 ms  | 83.85 ms |
+| 5000     | 1000      | 500.0K         | 143.02 MB   | 63.97 MB      | 224.40 ms | 2.09 s   |
+| 5000     | 10000     | 50.0M       | 1.40 GB     | 579.40 MB     | 22.45 s   | 3.44 min |
 
 </details>
 
