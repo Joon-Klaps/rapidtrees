@@ -43,13 +43,13 @@
 
 ### 🚀 Performance
 
-Benchmarked on a ZIKA dataset (283 taxa · 4 000 trees · ~8 M comparisons):
+Benchmarked on a ZIKA dataset (283 taxa · 4 000 trees · ~8 M comparisons) (non-gzipped output):
 
 | Metric             | Total time | Throughput                 |
 | ------------------ | ---------- | -------------------------- |
-| Robinson-Foulds    | ~3.5 s     | **~2.3 M comparisons/sec** |
-| Weighted RF        | ~3.5 s     | **~2.3 M comparisons/sec** |
-| Kuhner-Felsenstein | ~3.5 s     | **~2.3 M comparisons/sec** |
+| Robinson-Foulds    | ~2.7 s     | **~3.0 M comparisons/sec** |
+| Weighted RF        | ~3.4 s     | **~2.3 M comparisons/sec** |
+| Kuhner-Felsenstein | ~3.3 s     | **~2.3 M comparisons/sec** |
 
 ---
 
@@ -73,11 +73,27 @@ cargo install rapidtrees
 
 ### 🛠️ From source
 
+#### Prerequisites
+- [Rust toolchain](https://rustup.rs/) — for building the Rust core
+- [pixi](https://pixi.sh/) — for managing Python and R dependencies
+
+#### Setup
+
 ```bash
 git clone https://github.com/Joon-Klaps/rapidtrees.git
 cd rapidtrees
-cargo build --release   # CLI binary → target/release/rapidtrees
-pip install -e .        # Python bindings (requires Rust toolchain + maturin)
+# Set up environment — installs Python, R (with phangorn), and builds the package
+pixi install
+```
+
+#### Development tasks
+
+```bash
+# Run Python API tests (includes R/phangorn cross-validation)
+pixi run test-python
+
+# Run Rust unit tests
+pixi run test-rust
 ```
 
 ---
@@ -168,34 +184,33 @@ rapidtrees \
 
 ## 🐍 Python API
 
-`rapidtrees` ships Python bindings for seamless integration into Python workflows.
+`rapidtrees` exposes four functions from its Rust core. All accept a Python **iterator** of newick strings, keeping memory constant regardless of tree count.
+
+| Function | Returns |
+| --- | --- |
+| `pairwise_rf_from_newick_iter` | `(names, bytes)` — RF matrix as flat `uint32` bytes, row-major |
+| `pairwise_rf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes)` — RF + bipartition presence matrix |
+| `pairwise_wrf_from_newick_iter` | `(names, list[float])` — Weighted RF, flat row-major |
+| `pairwise_kf_from_newick_iter` | `(names, list[float])` — Kuhner-Felsenstein, flat row-major |
 
 ```python
 import rapidtrees as rtd
+import numpy as np
 
-# Robinson-Foulds distances
-tree_names, rf_matrix = rtd.pairwise_rf(
-    paths=["file1.trees", "file2.trees"],
-    burnin_trees=10,    # skip first 10 trees per file
-    burnin_states=0,    # skip trees with STATE < 0
-    use_real_taxa=True  # use TRANSLATE block when merging multiple files
+trees = [
+    "(A:0.1,(B:0.1,C:0.1):0.1);",
+    "(A:0.1,(C:0.1,B:0.1):0.1);",
+    "((A:0.1,B:0.1):0.1,C:0.1);",
+]
+names = ["t1", "t2", "t3"]
+
+tree_names, rf_bytes = rtd.pairwise_rf_from_newick_iter(
+    names, iter(trees), [{}], [0, 0, 0]
 )
-
-# Weighted RF (considers branch lengths)
-tree_names, wrf_matrix = rtd.pairwise_weighted_rf(
-    paths=["file1.trees"],
-    burnin_trees=10
-)
-
-# Kuhner-Felsenstein distances
-tree_names, kf_matrix = rtd.pairwise_kf(
-    paths=["file1.trees"],
-    burnin_trees=10
-)
-
-print(f"Computed distances for {len(tree_names)} trees")
-print(f"RF distance between tree 0 and 1: {rf_matrix[0][1]}")
+rf = np.frombuffer(rf_bytes, dtype=np.uint32).reshape(len(tree_names), -1)
 ```
+
+For BEAST `.trees` files, translate maps, the snapshot API, and multi-file usage see **[docs/python-api.md](docs/python-api.md)**.
 
 ---
 
@@ -255,13 +270,21 @@ The presence matrix is sufficient for all major convergence diagnostics:
 
 Note: `sum(presence[i] XOR presence[j]) == RF(tree_i, tree_j)` exactly.
 
-### Loading in Python
+### Presence matrix from Python
+
+Snap files are written and read by the CLI only. From Python, use
+`pairwise_rf_with_snapshots_from_newick_iter` to obtain the same presence
+matrix in memory without writing a file — see the [Python API section](#-python-api) above.
 
 ```python
-import rapidtrees
+import rapidtrees as rtd
 import numpy as np
 
-tree_names, taxa_names, n_bip, pres_bytes = rapidtrees.load_snap("run1.snap")
+tree_names, rf_bytes, leaf_names, n_bip, pres_bytes = (
+    rtd.pairwise_rf_with_snapshots_from_newick_iter(
+        names, iter(newicks), translate_maps, map_indices
+    )
+)
 n = len(tree_names)
 presence = np.frombuffer(pres_bytes, dtype=np.uint8).reshape(n, n_bip).copy()
 
@@ -269,7 +292,7 @@ presence = np.frombuffer(pres_bytes, dtype=np.uint8).reshape(n, n_bip).copy()
 global_freq = presence.mean(axis=0)
 
 # RF distance between any two trees — no recomputation needed
-rf_01 = int((presence[0] ^ presence[1]).sum())
+rf_01 = int((presence[0].astype(int) ^ presence[1].astype(int)).sum())
 ```
 
 ---
@@ -309,8 +332,7 @@ Benchmarks were run on a MacBook Pro M1. Trees are parsed **once** and bitset sn
 | 2000     | 100000    | 10.0B        | 3.42 GB     | 2.24 GB       | 18.57 min | 141.11 min |
 | 5000     | 100       | 10.0K        | 14.30 MB    | 12.43 MB      | 61.36 ms  | 83.85 ms |
 | 5000     | 1000      | 1.0M         | 143.02 MB   | 63.97 MB      | 224.40 ms | 2.09 s   |
-| 5000     | 10000     | 100.0M       | 1.40 GB     | 579.40 MB     | 22.45 s   | 3.44 min |
-| 5000     | 100000    | 10.0B        | 309.21 GB   | Skipped (>30GB) | -                | -                |
+| 5000     | 10000     | 100.0M       | 1.40 GB     | 579.40 MB     | 22.45 s   | 3.44 min |             |
 
 </details>
 

@@ -8,3 +8,6 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 treetracer/
+# pixi environments
+.pixi/*
+!.pixi/config.toml
