@@ -36,8 +36,8 @@ struct Args {
     burnin_states: usize,
 
     /// Output path for TSV distance matrix
-    #[arg(short = 'o', long = "output")]
-    output: PathBuf,
+    #[arg(short = 'o', long = "output", required_unless_present = "export_snap")]
+    output: Option<PathBuf>,
 
     #[arg(long = "export-snap")]
     export_snap: Option<PathBuf>,
