@@ -53,16 +53,27 @@ jobs:
               with:
                   python-version: "3.12"
 
+            - name: Setup R
+              uses: r-lib/actions/setup-r@v2
+
+            - name: Install R dependency (phangorn)
+              uses: r-lib/actions/setup-r-dependencies@v2
+              with:
+                  packages: any::phangorn
+
             - name: Setup Rust
               uses: dtolnay/rust-toolchain@stable
 
             - name: Install dependencies
               run: |
                   pip install --upgrade pip
-                  pip install maturin pytest pytest-cov
+                  pip install maturin
 
             - name: Build and install package
               run: pip install -e .[dev] --verbose
+
+            - name: Verify R phangorn installation
+              run: Rscript -e 'library(phangorn); cat("phangorn ", as.character(packageVersion("phangorn")), "\n", sep="")'
 
             - name: Run Python tests with coverage
               run: pytest tests/test_python_api.py -v --cov=rapidtrees --cov-report=xml:python-coverage.xml

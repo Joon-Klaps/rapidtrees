@@ -1,37 +1,25 @@
-#[cfg(feature = "cli")]
 use crate::bitset::Bitset;
-use crate::snapshot::TreeSnapshot;
+use crate::snapshot::{InternSnap, Snapshots};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use phylotree::tree::Tree;
-use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use rustc_hash::FxHashMap;
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-/// Shared return type for functions that load trees: a taxon map and a list of
-/// (tree name, snapshot) pairs.
-pub type LoadedTrees = (HashMap<String, String>, Vec<(String, TreeSnapshot)>);
-
-/// Strip BEAST annotations from Newick strings.
-///
-/// BEAST format includes annotations like :[&rate=0.123]2.45 where 2.45 is the actual branch length.
-/// This function removes the [&...] annotations while preserving the branch lengths.
-/// We shouldn't be needing, this TODO: update phylotree to handle BEAST annotations directly.
-pub fn strip_beast_annotations(newick: &str) -> String {
+/// Strip BEAST `[&...]` annotations from a Newick string.
+pub(crate) fn strip_beast_annotations(newick: &str) -> String {
     let mut result = String::with_capacity(newick.len());
     let mut in_annotation = false;
     let mut chars = newick.chars().peekable();
 
     while let Some(ch) = chars.next() {
         if ch == '[' && chars.peek() == Some(&'&') {
-            // Start of BEAST annotation
             in_annotation = true;
         } else if ch == ']' && in_annotation {
-            // End of BEAST annotation
             in_annotation = false;
         } else if !in_annotation {
-            // Only copy characters outside annotations
             result.push(ch);
         }
     }
@@ -39,91 +27,31 @@ pub fn strip_beast_annotations(newick: &str) -> String {
     result
 }
 
-/// Parse newick strings, rename leaves, validate leaf-set consistency, and
-/// create [`TreeSnapshot`]s. Returns `(snapshots, sorted_leaf_names)`.
+/// Rename leaf nodes in a tree according to a translate map.
 ///
-/// All entries must share the same leaf set; the first tree establishes the
-/// reference and subsequent trees are validated against it.
-///
-/// Tree 0 is parsed sequentially to establish the reference leaf set; all
-/// remaining trees are parsed in parallel via rayon. Each worker only reads
-/// the shared `reference_leaves` (via `&HashSet`), so no synchronization is
-/// needed beyond rayon's own join. Output order matches input order — `par_iter`
-/// + `collect::<Result<Vec<_>>>` preserves indexing, which downstream RF
-/// computation relies on.
-pub fn parse_and_snapshot_newicks<'a>(
-    entries: impl Iterator<Item = (&'a str, &'a HashMap<String, String>)>,
-    rooted: bool,
-) -> Result<(Vec<TreeSnapshot>, Vec<String>), String> {
-    let entries: Vec<(&'a str, &'a HashMap<String, String>)> = entries.collect();
-    if entries.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
+/// Used to apply BEAST translate blocks (numeric ID → taxon name). A no-op if
+/// `translate` is empty.
+pub(crate) fn rename_leaf_nodes(phylo_tree: &mut Tree, translate: &HashMap<String, String>) {
+    if translate.is_empty() {
+        return;
     }
-
-    // Phase 1 — sequentially process tree 0 to establish the reference leaf
-    // set + sorted_leaf_names. Required because the parallel section needs
-    // a fixed reference to validate against.
-    let (first_newick, first_translate) = entries[0];
-    let first_clean = strip_beast_annotations(first_newick);
-    let mut first_tree = Tree::from_newick(&first_clean)
-        .map_err(|e| format!("Failed to parse newick at index 0: {e}"))?;
-    rename_leaf_nodes(&mut first_tree, first_translate);
-
-    let reference_leaves: HashSet<String> = first_tree
-        .get_leaves()
-        .iter()
-        .filter_map(|&id| first_tree.get(&id).ok()?.name.clone())
-        .collect();
-    let mut sorted_leaf_names: Vec<String> = reference_leaves.iter().cloned().collect();
-    sorted_leaf_names.sort_unstable();
-
-    let first_snapshot = TreeSnapshot::from_tree(&first_tree, rooted)
-        .map_err(|e| format!("Failed to create tree snapshot at index 0: {e}"))?;
-    drop(first_tree); // free before launching the parallel workers
-
-    // Phase 2 — parse + validate + snapshot the remaining trees in parallel.
-    // `par_iter` over the slice yields `&(&str, &HashMap)`; the `&(n, t)` pattern
-    // destructures the reference because the inner tuple is Copy.
-    let rest: Vec<TreeSnapshot> = entries[1..]
-        .par_iter()
-        .enumerate()
-        .map(|(j, &(newick, translate))| {
-            let i = j + 1; // original (caller-facing) index for error messages
-            let clean = strip_beast_annotations(newick);
-            let mut tree = Tree::from_newick(&clean)
-                .map_err(|e| format!("Failed to parse newick at index {i}: {e}"))?;
-            rename_leaf_nodes(&mut tree, translate);
-
-            let leaves: HashSet<String> = tree
-                .get_leaves()
-                .iter()
-                .filter_map(|&id| tree.get(&id).ok()?.name.clone())
-                .collect();
-            if leaves != reference_leaves {
-                return Err(format!(
-                    "Tree {i} has different leaf set than tree 0. All trees must have the same taxa."
-                ));
-            }
-
-            TreeSnapshot::from_tree(&tree, rooted)
-                .map_err(|e| format!("Failed to create tree snapshot at index {i}: {e}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let mut snapshots = Vec::with_capacity(entries.len());
-    snapshots.push(first_snapshot);
-    snapshots.extend(rest);
-
-    Ok((snapshots, sorted_leaf_names))
+    for leaf_id in phylo_tree.get_leaves() {
+        if let Ok(node) = phylo_tree.get_mut(&leaf_id) {
+            node.name = node.name.as_ref().and_then(|n| translate.get(n).cloned());
+        }
+    }
 }
 
-pub fn load_beast_trees<P: AsRef<Path>>(
+/// Load raw tree data from a BEAST `.trees` file without parsing.
+///
+/// Returns `(translate_map, [(tree_name, stripped_newick)])`. Burnin filtering
+/// and annotation stripping are applied but no Newick parsing is done.
+pub(crate) fn load_beast_raw<P: AsRef<Path>>(
     path: P,
     burnin_trees: usize,
     burnin_states: usize,
     use_real_taxa: bool,
-    rooted: bool,
-) -> LoadedTrees {
+) -> (HashMap<String, String>, Vec<(String, String)>) {
     let content = match fs::read_to_string(path.as_ref()) {
         Ok(s) => s,
         Err(e) => {
@@ -140,10 +68,13 @@ pub fn load_beast_trees<P: AsRef<Path>>(
         .unwrap_or("unknown");
 
     let taxons = parse_taxon_block(&content);
-    let empty_map = HashMap::new();
-    let translate = if use_real_taxa { &taxons } else { &empty_map };
+    let translate_map = if use_real_taxa {
+        taxons
+    } else {
+        HashMap::new()
+    };
 
-    let (names, newicks): (Vec<String>, Vec<String>) = collect_tree_blocks(&content)
+    let tree_pairs: Vec<(String, String)> = collect_tree_blocks(&content)
         .into_iter()
         .enumerate()
         .map(|(idx, tree)| {
@@ -156,107 +87,42 @@ pub fn load_beast_trees<P: AsRef<Path>>(
                 || (burnin_states > 0 && *state > burnin_states)
         })
         .map(|(_, tree, _, name)| (name, strip_beast_annotations(&tree.body)))
-        .unzip();
+        .collect();
 
-    let entries = newicks.iter().map(|n| (n.as_str(), translate));
-    match parse_and_snapshot_newicks(entries, rooted) {
-        Ok((snapshots, _)) => (taxons, names.into_iter().zip(snapshots).collect()),
+    (translate_map, tree_pairs)
+}
+
+/// Load and parse all trees from a BEAST `.trees` file.
+///
+/// Returns `(tree_names, Snapshots)`. On any error, prints to stderr and
+/// returns an empty `Snapshots`.
+pub fn load_beast_trees<P: AsRef<Path>>(
+    path: P,
+    burnin_trees: usize,
+    burnin_states: usize,
+    use_real_taxa: bool,
+    rooted: bool,
+) -> (Vec<String>, Snapshots) {
+    let (translate_map, tree_pairs) =
+        load_beast_raw(&path, burnin_trees, burnin_states, use_real_taxa);
+    let (names, newicks): (Vec<String>, Vec<String>) = tree_pairs.into_iter().unzip();
+    let entries = newicks.iter().map(|n| (n.as_str(), &translate_map));
+    match Snapshots::from_newick_iter(entries, rooted) {
+        Ok(snaps) => (names, snaps),
         Err(e) => {
             eprintln!("Failed to parse trees in {:?}: {e}", path.as_ref());
-            (taxons, Vec::new())
-        }
-    }
-}
-
-fn extract_name_state(header: &str) -> (String, usize) {
-    // tree classic2_STATE_968940000 [...]
-    // tree STATE_8500000 [...]
-    // tree classic1_STATE_766540000 [...]
-
-    // Find "STATE_" in the header (case-insensitive)
-    let upper = header.to_ascii_uppercase();
-    if let Some(state_pos) = upper.find("STATE_") {
-        // Split on first space to get the tree name part (after "tree ")
-        if let Some((_, rest)) = header.split_once(' ') {
-            // Extract just the tree name (everything before the opening bracket or end of string)
-            let tree_name = rest.split_whitespace().next().unwrap_or("").to_string();
-
-            // Extract the state number (digits after "STATE_")
-            let digits = header[state_pos + 6..]
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect::<String>();
-
-            if let Ok(num) = digits.parse::<usize>() {
-                return (tree_name, num);
-            }
-        }
-    }
-
-    ("".to_string(), 0)
-}
-
-struct TreeBlock<'a> {
-    header: &'a str,
-    body: String,
-}
-
-fn collect_tree_blocks(content: &str) -> Vec<TreeBlock<'_>> {
-    content
-        .lines()
-        .skip_while(|line| !line.to_ascii_uppercase().starts_with("TREE "))
-        .take_while(|line| !line.trim().to_ascii_uppercase().starts_with("END;"))
-        .filter_map(|line| {
-            let mut parts = line.splitn(2, " = ");
-            let header = parts.next()?.trim();
-            let body = parts.next()?.trim().to_string();
-            Some(TreeBlock { header, body })
-        })
-        .collect()
-}
-
-fn parse_taxon_block(content: &str) -> HashMap<String, String> {
-    content
-        .lines()
-        .skip_while(|line| !line.trim().to_ascii_uppercase().starts_with("TRANSLATE"))
-        .skip(1)
-        .take_while(|line| !line.trim().to_ascii_uppercase().starts_with(";"))
-        // STRUCTURE:
-        // 1 '1959.M.CD.59.ZR59',
-        // 2 '1960.DRC60A',
-        // 3 GU573545|Soromba_R245|Mouse|MLI|2009,
-        .filter_map(|line| {
-            let line = line.trim().trim_end_matches(',');
-            let mut parts = line.split_whitespace();
-            let id = parts.next()?.to_string();
-            let label = parts.next()?.trim_matches('\'').to_string();
-            Some((id, label))
-        })
-        .collect::<HashMap<_, _>>()
-}
-
-pub fn rename_leaf_nodes(
-    phylo_tree: &mut Tree,
-    translate: &std::collections::HashMap<String, String>,
-) {
-    if translate.is_empty() {
-        return;
-    }
-    for leaf_id in phylo_tree.get_leaves() {
-        if let Ok(node) = phylo_tree.get_mut(&leaf_id) {
-            node.name = node.name.as_ref().and_then(|n| translate.get(n).cloned());
+            (Vec::new(), Snapshots::from_newicks(&[], rooted).unwrap())
         }
     }
 }
 
 /// Write a labeled square matrix as TSV to a file or stdout.
-/// If `path` ends with `.gz`, the output is gzip-compressed.
-/// If `path` equals `-`, the matrix is written to stdout (uncompressed).
 #[cfg(feature = "cli")]
 pub fn write_matrix_tsv<P: AsRef<Path>, T: std::fmt::Display>(
     path: P,
     names: &[String],
-    mat: &[Vec<T>],
+    mat: &[T],
+    n_trees: usize,
 ) -> io::Result<()> {
     use std::fs::File;
     use std::io::BufWriter;
@@ -279,7 +145,6 @@ pub fn write_matrix_tsv<P: AsRef<Path>, T: std::fmt::Display>(
         Box::new(BufWriter::new(File::create(p)?))
     };
 
-    // Header row
     write!(&mut out, "\t")?;
     for (k, name) in names.iter().enumerate() {
         if k > 0 {
@@ -289,8 +154,7 @@ pub fn write_matrix_tsv<P: AsRef<Path>, T: std::fmt::Display>(
     }
     writeln!(&mut out)?;
 
-    // Rows
-    for (i, row) in mat.iter().enumerate() {
+    for (i, row) in mat.chunks(n_trees).enumerate() {
         write!(&mut out, "{}", names[i])?;
         for val in row {
             write!(&mut out, "\t{}", val)?;
@@ -302,88 +166,64 @@ pub fn write_matrix_tsv<P: AsRef<Path>, T: std::fmt::Display>(
     Ok(())
 }
 
-// ── Public snap API ───────────────────────────────────────────────────────
+// ── Snap file I/O ─────────────────────────────────────────────────────────────
+//
+// The `.snap` format stores only bipartition presence (no branch lengths).
+// Branch lengths are zeroed on load — snap files are RF-only.
 
 /// Write tree snapshots to a gzip-compressed binary `.snap` file.
 ///
 /// # File layout (inside gzip stream)
 /// ```text
 /// HEADER     4 B  magic "SNAP"
-///            1 B  version (1)
+///            1 B  version (2)
 ///            8 B  n_trees  u64 LE
 ///            8 B  n_taxa   u64 LE
 ///            8 B  n_bip    u64 LE
-/// TAXA NAMES for each taxon:  4 B len u32 LE + N B UTF-8
-/// TREE NAMES for each tree:   4 B len u32 LE + N B UTF-8
+///            8 B  words    u64 LE
+/// NAMES      for each taxon then each tree: 4 B len u32 LE + N B UTF-8
+/// BIPARTS    n_bip × words × 8 bytes (sorted ascending by Bitset)
 /// PRESENCE   n_trees × n_bip bytes, row-major uint8
-///            presence[i][j] = 1 iff bipartition j is in tree i
 /// ```
 ///
-/// Bipartition column order is deterministic: globally sorted in ascending
-/// bitset order so the same tree set always produces the same columns.
-///
-/// Note: `sum(presence[i] XOR presence[j]) == RF(tree_i, tree_j)` exactly.
+/// **Note:** branch lengths are not stored. A snap file loaded back via
+/// [`load_snapshots`] will have zero branch lengths (RF-only).
 #[cfg(feature = "cli")]
 pub fn write_snap<P: AsRef<Path>>(
     path: P,
     tree_names: &[String],
-    taxa_names: &[String],
-    snapshots: &[TreeSnapshot],
+    snaps: &Snapshots,
 ) -> io::Result<()> {
-    let mut all_bips: Vec<_> = snapshots
-        .iter()
-        .flat_map(|s| s.parts.iter().cloned())
-        .collect();
-    all_bips.sort_unstable();
-    all_bips.dedup();
+    let mut bip_order: Vec<usize> = (0..snaps.bipartitions.len()).collect();
+    bip_order.sort_unstable_by(|&a, &b| snaps.bipartitions[a].cmp(&snaps.bipartitions[b]));
 
-    let n_trees = snapshots.len();
-    let n_taxa = taxa_names.len();
-    let n_bip = all_bips.len();
-    let words = snapshots.first().map_or(1, |s| s.words);
+    let n_trees = snaps.snapshots.len();
+    let n_taxa = snaps.leaf_names.len();
+    let n_bip = snaps.bipartitions.len();
+    let words = snaps.words_per_bitset.max(1);
 
-    let mut presence = vec![0u8; n_trees * n_bip];
-    for (ti, snap) in snapshots.iter().enumerate() {
-        let row = &mut presence[ti * n_bip..(ti + 1) * n_bip];
-        let (mut gi, mut li) = (0, 0);
-        while gi < n_bip && li < snap.parts.len() {
-            match all_bips[gi].cmp(&snap.parts[li]) {
-                std::cmp::Ordering::Equal => {
-                    row[gi] = 1;
-                    gi += 1;
-                    li += 1;
-                }
-                std::cmp::Ordering::Less => gi += 1,
-                std::cmp::Ordering::Greater => li += 1,
-            }
-        }
-    }
+    let presence = snaps.build_presence_matrix();
 
     let mut w = BufWriter::new(GzEncoder::new(File::create(path)?, Compression::default()));
-
-    // Header
     w.write_all(b"SNAP")?;
-    w.write_all(&[2u8])?; // version 2
+    w.write_all(&[2u8])?;
     w.write_all(&(n_trees as u64).to_le_bytes())?;
     w.write_all(&(n_taxa as u64).to_le_bytes())?;
     w.write_all(&(n_bip as u64).to_le_bytes())?;
-    w.write_all(&(words as u64).to_le_bytes())?; // new in v2
+    w.write_all(&(words as u64).to_le_bytes())?;
 
-    // Names
-    for name in taxa_names.iter().chain(tree_names.iter()) {
+    for name in snaps.leaf_names.iter().chain(tree_names.iter()) {
         let b = name.as_bytes();
         w.write_all(&(b.len() as u32).to_le_bytes())?;
         w.write_all(b)?;
     }
 
-    // Bipartition bitsets — actual leaf content, n_bip × words × 8 bytes
-    for bip in &all_bips {
-        for word in &bip.0 {
+    for &orig_id in &bip_order {
+        for word in &snaps.bipartitions[orig_id].0 {
             w.write_all(&word.to_le_bytes())?;
         }
     }
 
-    // Presence matrix
     w.write_all(&presence)?;
     w.flush()?;
     Ok(())
@@ -391,12 +231,12 @@ pub fn write_snap<P: AsRef<Path>>(
 
 /// Read a `.snap` file produced by [`write_snap`].
 ///
-/// Returns `(tree_names, taxa_names, snapshots)`.
+/// Returns `(tree_names, Snapshots)`.
 ///
-/// Snapshots are reconstructed from the on-disk presence matrix so callers can
-/// feed them directly into distance functions like [`crate::distances::pairwise_rf_matrix`].
+/// **Note:** branch lengths are zeroed on load — snap files store only split
+/// presence. Use the returned `Snapshots` for RF distances only.
 #[cfg(feature = "cli")]
-pub fn load_snapshots<P: AsRef<Path>>(path: P) -> io::Result<LoadedTrees> {
+pub fn load_snapshots<P: AsRef<Path>>(path: P) -> io::Result<(Vec<String>, Snapshots)> {
     let file = File::open(path.as_ref())?;
     let mut r = BufReader::new(GzDecoder::new(file));
 
@@ -426,8 +266,6 @@ pub fn load_snapshots<P: AsRef<Path>>(path: P) -> io::Result<LoadedTrees> {
     let taxa_names = snap_read_strings(&mut r, n_taxa)?;
     let tree_names = snap_read_strings(&mut r, n_trees)?;
 
-    // Number of bytes to read = n_trees * n_bip
-    // Read the actual bipartition bitsets
     let all_bips: Vec<Bitset> = (0..n_bip)
         .map(|_| {
             (0..words)
@@ -437,45 +275,40 @@ pub fn load_snapshots<P: AsRef<Path>>(path: P) -> io::Result<LoadedTrees> {
         })
         .collect::<io::Result<_>>()?;
 
-    // Read presence matrix and reconstruct snapshots with real bitsets
     let mut presence = vec![0u8; n_trees * n_bip];
     r.read_exact(&mut presence)?;
 
-    let snapshots: Vec<TreeSnapshot> = presence
+    let bipartition_index: FxHashMap<Bitset, u32> = all_bips
+        .iter()
+        .enumerate()
+        .map(|(i, bip)| (bip.clone(), i as u32))
+        .collect();
+
+    let interned_snaps: Vec<InternSnap> = presence
         .chunks_exact(n_bip)
         .take(n_trees)
         .map(|row| {
-            let parts: Vec<Bitset> = (0..n_bip)
+            let split_ids: Vec<u32> = (0..n_bip)
                 .filter(|&i| row[i] != 0)
-                .map(|i| all_bips[i].clone())
+                .map(|i| i as u32)
                 .collect();
-            TreeSnapshot {
-                lengths: vec![0.0; parts.len()],
-                parts,
-                root_children: Vec::new(),
-                words,
-                num_leaves: n_taxa,
-                rooted: false,
-            }
+            let lengths = vec![0.0f64; split_ids.len()];
+            InternSnap { split_ids, lengths }
         })
         .collect();
 
-    let taxa_map: HashMap<String, String> = taxa_names
-        .into_iter()
-        .enumerate()
-        .map(|(i, name)| (i.to_string(), name))
-        .collect();
+    let snaps = Snapshots {
+        snapshots: interned_snaps,
+        bipartitions: all_bips,
+        bipartition_index,
+        words_per_bitset: words,
+        leaf_names: taxa_names,
+    };
 
-    let trees: Vec<(String, TreeSnapshot)> = tree_names.into_iter().zip(snapshots).collect();
-
-    Ok((taxa_map, trees))
+    Ok((tree_names, snaps))
 }
 
-// ── Snap helpers ──────────────────────────────────────────────────────────────
-
-fn invalid_data(msg: impl ToString) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
-}
+// ── Private helpers ────────────────────────────────────────────────────────────
 
 fn snap_read_u64<R: io::Read>(r: &mut R) -> io::Result<u64> {
     let mut buf = [0u8; 8];
@@ -490,59 +323,96 @@ fn snap_read_strings<R: io::Read>(r: &mut R, n: usize) -> io::Result<Vec<String>
             r.read_exact(&mut buf)?;
             let mut bytes = vec![0u8; u32::from_le_bytes(buf) as usize];
             r.read_exact(&mut bytes)?;
-            String::from_utf8(bytes).map_err(invalid_data) // ← passes directly now
+            String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
         })
         .collect()
+}
+
+fn extract_name_state(header: &str) -> (String, usize) {
+    let upper = header.to_ascii_uppercase();
+    if let Some(state_pos) = upper.find("STATE_")
+        && let Some((_, rest)) = header.split_once(' ')
+    {
+        let tree_name = rest.split_whitespace().next().unwrap_or("").to_string();
+        let digits = header[state_pos + 6..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>();
+        if let Ok(num) = digits.parse::<usize>() {
+            return (tree_name, num);
+        }
+    }
+    (String::new(), 0)
+}
+
+struct TreeBlock<'a> {
+    header: &'a str,
+    body: String,
+}
+
+fn collect_tree_blocks(content: &str) -> Vec<TreeBlock<'_>> {
+    content
+        .lines()
+        .skip_while(|line| !line.to_ascii_uppercase().starts_with("TREE "))
+        .take_while(|line| !line.trim().to_ascii_uppercase().starts_with("END;"))
+        .filter_map(|line| {
+            let mut parts = line.splitn(2, " = ");
+            let header = parts.next()?.trim();
+            let body = parts.next()?.trim().to_string();
+            Some(TreeBlock { header, body })
+        })
+        .collect()
+}
+
+fn parse_taxon_block(content: &str) -> HashMap<String, String> {
+    content
+        .lines()
+        .skip_while(|line| !line.trim().to_ascii_uppercase().starts_with("TRANSLATE"))
+        .skip(1)
+        .take_while(|line| !line.trim().to_ascii_uppercase().starts_with(";"))
+        .filter_map(|line| {
+            let line = line.trim().trim_end_matches(',');
+            let mut parts = line.split_whitespace();
+            let id = parts.next()?.to_string();
+            let label = parts.next()?.trim_matches('\'').to_string();
+            Some((id, label))
+        })
+        .collect::<HashMap<_, _>>()
 }
 
 #[cfg(all(test, feature = "cli"))]
 mod tests {
     use super::*;
-    use crate::distances::pairwise_rf_matrix;
-    use crate::snapshot::TreeSnapshot;
-    use phylotree::tree::Tree as PhyloTree;
+    use crate::snapshot::Snapshots;
 
-    fn make_snapshots() -> (Vec<String>, Vec<String>, Vec<TreeSnapshot>) {
+    fn make_snapshots() -> (Vec<String>, Snapshots) {
         let trees = [
             "((A:1,B:1):1,(C:1,D:1):1);",
             "((A:1,C:1):1,(B:1,D:1):1);",
             "((A:1,D:1):1,(B:1,C:1):1);",
         ];
-        let snapshots: Vec<TreeSnapshot> = trees
-            .iter()
-            .map(|nwk| {
-                TreeSnapshot::from_tree(&PhyloTree::from_newick(nwk).unwrap(), false).unwrap()
-            })
-            .collect();
+        let snaps = Snapshots::from_newicks(&trees, false).unwrap();
         let tree_names = vec!["t1".to_string(), "t2".to_string(), "t3".to_string()];
-        let mut taxa_names = vec![
-            "A".to_string(),
-            "B".to_string(),
-            "C".to_string(),
-            "D".to_string(),
-        ];
-        taxa_names.sort_unstable();
-        (tree_names, taxa_names, snapshots)
+        (tree_names, snaps)
     }
 
     #[test]
     fn test_snap_roundtrip_preserves_rf_distances() {
-        let (tree_names, taxa_names, snapshots) = make_snapshots();
-        let rf_before = pairwise_rf_matrix(&snapshots);
+        let (tree_names, snaps) = make_snapshots();
+        let rf_before = snaps.pairwise_rf();
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        write_snap(tmp.path(), &tree_names, &taxa_names, &snapshots).unwrap();
+        write_snap(tmp.path(), &tree_names, &snaps).unwrap();
 
-        let (_taxon_map, loaded_trees) = load_snapshots(tmp.path()).unwrap();
-        let (loaded_names, loaded_snaps): (Vec<_>, Vec<_>) = loaded_trees.into_iter().unzip();
+        let (loaded_names, loaded_snaps) = load_snapshots(tmp.path()).unwrap();
 
         assert_eq!(
             loaded_names, tree_names,
             "tree names must survive roundtrip"
         );
-        assert_eq!(loaded_snaps.len(), snapshots.len());
+        assert_eq!(loaded_snaps.snapshots.len(), snaps.snapshots.len());
 
-        let rf_after = pairwise_rf_matrix(&loaded_snaps);
+        let rf_after = loaded_snaps.pairwise_rf();
         assert_eq!(
             rf_before, rf_after,
             "RF distances must be identical after snap roundtrip"

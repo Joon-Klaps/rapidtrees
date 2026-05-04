@@ -1,27 +1,21 @@
 //! Crate root: lightweight module orchestration and public re-exports.
 //!
 //! Modules:
-//! - `distances`: generic distance trait + RF / cluster affinity implementations.
+//! - `distances`: single-pair and pairwise distance functions.
 //! - `io`: reading and parsing BEAST/NEXUS tree files.
 //! - `bitset`: compact bitset representation for tree partitions.
-//! - `snapshot`: tree snapshot for efficient distance calculations.
-//! - `interned`: globally-deduped split-ID representation of snapshots.
+//! - `snapshot`: tree snapshot and interned snapshot types (crate-internal).
 //! - `api`: Python bindings via `pyo3` (gated behind "python" feature).
-//!
-//! Public API kept stable by re-exporting key items from the new modules.
 
 pub mod bitset;
 pub mod distances;
-pub mod interned;
 pub mod io;
-pub mod snapshot;
+pub(crate) mod snapshot;
 
 #[cfg(feature = "python")]
 pub mod api;
 
-// Re-export frequently used types & functions
 pub use bitset::Bitset;
 #[cfg(feature = "cli")]
 pub use io::write_matrix_tsv;
-pub use io::{load_beast_trees, rename_leaf_nodes, strip_beast_annotations};
-pub use snapshot::TreeSnapshot;
+pub use snapshot::{Snapshot, Snapshots};

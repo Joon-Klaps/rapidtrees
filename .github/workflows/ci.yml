@@ -79,6 +79,14 @@ jobs:
               with:
                   python-version: ${{ matrix.python-version }}
 
+            - name: Setup R
+              uses: r-lib/actions/setup-r@v2
+
+            - name: Install R dependency (phangorn)
+              uses: r-lib/actions/setup-r-dependencies@v2
+              with:
+                  packages: any::phangorn
+
             - name: Setup Rust
               uses: dtolnay/rust-toolchain@stable
 
@@ -91,12 +99,15 @@ jobs:
             - name: Install dependencies
               run: |
                   pip install --upgrade pip
-                  pip install maturin pytest
+                  pip install maturin
 
             - name: Build and install package
               run: pip install -e .[dev] --verbose
               env:
                   RUST_BACKTRACE: 1
+
+            - name: Verify R phangorn installation
+              run: Rscript -e 'library(phangorn); cat("phangorn ", as.character(packageVersion("phangorn")), "\n", sep="")'
 
             - name: Test Python import
               run: python -c "import rapidtrees; print('Import successful!')"
