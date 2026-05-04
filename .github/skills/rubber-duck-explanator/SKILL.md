@@ -49,7 +49,7 @@ Before explaining changes, run a pass over every new or renamed item (functions,
 
 1. **Intuitiveness** — Is the name self-explanatory to someone unfamiliar with the codebase?
    - Flag names containing implementation-leaking adjectives (e.g., "Interned", "Raw", "Parsed") unless the distinction is truly user-visible.
-   - Flag names with stuttering (e.g., `InternedSnapshots::from_snapshots`).
+   - Flag names with stuttering (e.g., `Snapshots::from_snapshots`).
    - Flag names that describe *how* rather than *what* (e.g., `parse_and_snapshot_newicks` vs `Snapshots::from_newick_iter`).
 2. **Placement** — Is this function/method in the right file or module?
    - `io.rs` should contain only filesystem I/O (reading from and writing to long-term storage). Flag any function in `io.rs` that only processes in-memory data.

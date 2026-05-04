@@ -23,7 +23,6 @@ Analyse every file under `src/` and `tests/` (skip `target/`, `.venv/`, `treetra
 src/api.rs        — PyO3 bindings
 src/bitset.rs     — Bitset implementation
 src/distances.rs  — RF / WRF / KF distance algorithms
-src/interned.rs   — Interned snapshot representation
 src/io.rs         — Newick / BEAST parsing helpers
 src/snapshot.rs   — TreeSnapshot construction
 src/lib.rs        — Re-exports

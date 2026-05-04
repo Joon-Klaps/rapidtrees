@@ -85,7 +85,6 @@ Files to review and refactor:
 ```
 src/bitset.rs
 src/distances.rs
-src/interned.rs
 src/io.rs
 src/snapshot.rs
 src/api.rs
