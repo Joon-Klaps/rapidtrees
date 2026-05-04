@@ -66,12 +66,28 @@ enum MetricArg {
     Kf,
 }
 
+impl PartialEq for MetricArg {
+    fn eq(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (MetricArg::Rf, MetricArg::Rf)
+                | (MetricArg::Weighted, MetricArg::Weighted)
+                | (MetricArg::Kf, MetricArg::Kf)
+        )
+    }
+}
+
 fn main() {
     let args = Args::parse();
 
     if args.snap_input.is_some() && args.export_snap.is_some() {
         eprintln!("--export-snap cannot be used together with --snap-input");
         std::process::exit(7);
+    }
+
+    if args.snap_input.is_some() && (args.metric != MetricArg::Rf) {
+        eprintln!("--snap-input only supports RF distances.");
+        std::process::exit(8);
     }
 
     let quiet = args.quiet;
@@ -148,15 +164,19 @@ fn main() {
     );
 
     let t = Instant::now();
-    if let Err(e) = write_matrix_tsv(&args.output, &names, &mat, interned.len()) {
-        eprintln!("Failed to write output {:?}: {e}", args.output);
+    let output_path = args
+        .output
+        .as_deref()
+        .expect("output is required when not exporting snap");
+    if let Err(e) = write_matrix_tsv(output_path, &names, &mat, interned.len()) {
+        eprintln!("Failed to write output {}: {e}", output_path.display());
         std::process::exit(4);
     }
     log_if(
         quiet,
         format!(
             "Wrote matrix to {} in {:.3}s",
-            args.output.display(),
+            output_path.display(),
             t.elapsed().as_secs_f64()
         ),
     );

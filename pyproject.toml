@@ -51,6 +51,20 @@ prek = "*"
 [tool.pixi.pypi-dependencies]
 rapidtrees = { path = ".", editable = true }
 
+[tool.pixi.feature.py310.dependencies]
+python = "3.10.*"
+
+[tool.pixi.feature.py311.dependencies]
+python = "3.11.*"
+
+[tool.pixi.feature.py312.dependencies]
+python = "3.12.*"
+
+[tool.pixi.environments]
+py310 = { features = ["py310"], solve-group = "default" }
+py311 = { features = ["py311"], solve-group = "default" }
+py312 = { features = ["py312"], solve-group = "default" }
+
 [tool.pixi.tasks]
 test-rust = { cmd = "cargo test --lib", description = "Run Rust unit tests" }
 test-python = { cmd = "pytest tests/test_python_api.py -v", description = "Run Python API tests" }

@@ -14,7 +14,7 @@
 6. [Step 4 — TreeSnapshot: the internal intermediate form](#step-4--treesnapshot-the-internal-intermediate-form)
 7. [Step 5 — Computing RF distance via two-pointer merge](#step-5--computing-rf-distance-via-two-pointer-merge)
 8. [Step 6 — The scaling problem at large taxa counts](#step-6--the-scaling-problem-at-large-taxa-counts)
-9. [Step 7 — InternedSnapshot: replacing bitsets with integer IDs](#step-7--internedsnapshot-replacing-bitsets-with-integer-ids)
+9. [Step 7 — InternSnap: replacing bitsets with integer IDs](#step-7--internsnap-replacing-bitsets-with-integer-ids)
 10. [Step 8 — RF with interned IDs](#step-8--rf-with-interned-ids)
 11. [The full pipeline at a glance](#the-full-pipeline-at-a-glance)
 12. [Cheat sheet: all representations](#cheat-sheet-all-representations)
@@ -200,7 +200,7 @@ Canonical bipartitions for Tree 2: **`{24, 28, 96, 124}`**
 
 ## Step 4 — TreeSnapshot: the internal intermediate form
 
-A `TreeSnapshot` is an **internal** intermediate form used during tree loading. It is not part of the public API — user code always works with `InternedSnapshots`. A snapshot stores the canonicalized bipartitions for one tree as parallel sorted arrays:
+A `TreeSnapshot` is an **internal** intermediate form used during tree loading. It is not part of the public API — user code always works with `Snapshots`. A snapshot stores the canonicalized bipartitions for one tree as parallel sorted arrays:
 
 ```
 TreeSnapshot (Tree 1)                     ← internal only, not returned to callers
@@ -219,7 +219,7 @@ TreeSnapshot (Tree 2)
 Key points:
 - `parts` is **sorted** — this enables the fast O(m+n) merge comparison below.
 - `lengths[i]` is the branch length of `parts[i]` — **parallel arrays**, not a HashMap. 10–20× faster to access than hash lookups.
-- `TreeSnapshot`s are immediately fed into `InternedSnapshots::from_snapshots()` and then discarded.
+- `TreeSnapshot`s are immediately fed into `Snapshots::intern()` and then discarded.
 
 ---
 
@@ -271,9 +271,9 @@ The solution is **interning**.
 
 ---
 
-## Step 7 — InternedSnapshot: replacing bitsets with integer IDs
+## Step 7 — InternSnap: replacing bitsets with integer IDs
 
-After all `TreeSnapshot`s are built in a first pass, a second pass walks every bipartition in every tree and assigns each **unique** bipartition a sequential `u32` integer ID. This is called **interning** — like a dictionary lookup where every word gets a page number. The `TreeSnapshot`s are then discarded; all subsequent distance calculations work exclusively on `InternedSnapshots`.
+After all `TreeSnapshot`s are built in a first pass, a second pass walks every bipartition in every tree and assigns each **unique** bipartition a sequential `u32` integer ID. This is called **interning** — like a dictionary lookup where every word gets a page number. The `TreeSnapshot`s are then discarded; all subsequent distance calculations work exclusively on `InternSnap`s held inside a `Snapshots` container.
 
 **Building the global dictionary:**
 
@@ -305,19 +305,19 @@ ID 5  →  Bitset(28)   =  {C, D, E}
 Each tree is now represented as a **sorted `Vec<u32>`** — just small integers:
 
 ```
-InternedSnapshot (Tree 1)
+InternSnap (Tree 1)
 ├── split_ids: [ 0,    1,    2,    3  ]   ← sorted by ID
 └── lengths:   [ 0.20, 0.30, 0.40, 0.10 ] ← still parallel to split_ids
 
-InternedSnapshot (Tree 2)
+InternSnap (Tree 2)
 ├── split_ids: [ 1,    3,    4,    5  ]   ← IDs 1 and 3 shared with Tree 1!
 └── lengths:   [ 0.30, 0.10, 0.15, 0.25 ]
 ```
 
-The `InternedSnapshots` container holds:
+The `Snapshots` container holds:
 ```
-InternedSnapshots
-├── snapshots:          Vec<InternedSnapshot>  ← one per tree
+Snapshots
+├── snapshots:          Vec<InternSnap>        ← one per tree
 ├── bipartitions:       Vec<Bitset>            ← the global ID→Bitset table
 ├── bipartition_index:  HashMap<Bitset, u32>   ← reverse: Bitset→ID (for lookups)
 └── leaf_names:         Vec<String>            ← ["A","B","C","D","E","F","G"]
@@ -328,7 +328,7 @@ InternedSnapshots
 | Representation | Per bipartition | 5 000 trees × 600 splits | Fits in L3 cache? |
 |---|---|---|---|
 | `TreeSnapshot` (Bitset) | 256 bytes | ~750 MB | ❌ No |
-| `InternedSnapshot` (u32) | 4 bytes | ~12 MB | ✅ Yes |
+| `InternSnap` (u32) | 4 bytes | ~12 MB | ✅ Yes |
 
 The Bitsets still exist in the global table — but there's only **one copy of each unique bipartition** instead of one per tree. The per-tree data is now tiny integers.
 
@@ -375,12 +375,12 @@ BEAST/Newick file
  Vec<TreeSnapshot>  (internal; discarded after this step)
 
        │
-       │  InternedSnapshots::from_snapshots()
+       │  Snapshots::intern()
        │    1. Walk all parts across all trees
        │    2. Assign each unique bipartition a u32 ID
        │    3. Re-sort per-tree split_ids by ID
        ▼
- InternedSnapshots  ← the only public representation
+ Snapshots  ← the only public representation
        │
        ├─  rf_distance / wrf_distance / kf_distance       (one pair)
        └─  pairwise_rf_matrix / pairwise_wrf_matrix / pairwise_kf_matrix  (all pairs)
@@ -394,7 +394,7 @@ BEAST/Newick file
 |---|---|---|---|---|
 | `Bitset` | `src/bitset.rs` | Raw packed bits, 1 bit per taxon | `ceil(n_taxa/64) × 8` bytes | Building blocks for everything |
 | `TreeSnapshot` | `src/snapshot.rs` | `Vec<Bitset>` (sorted) + parallel `Vec<f64>` lengths | 256 bytes @ 2000 taxa | **Internal only** — built during loading, discarded after interning |
-| `InternedSnapshot` | `src/interned.rs` | `Vec<u32>` IDs (sorted) + parallel `Vec<f64>` lengths | 4 bytes | **The public API** — all distance calculations |
-| `InternedSnapshots` | `src/interned.rs` | The global ID↔Bitset dictionary + all `InternedSnapshot`s | One Bitset per *unique* split, shared | **The public API** — returned by all loading functions |
+| `InternSnap` | `src/snapshot.rs` | `Vec<u32>` IDs (sorted) + parallel `Vec<f64>` lengths | 4 bytes | **Internal** — held inside `Snapshots`, all distance calculations |
+| `Snapshots` | `src/snapshot.rs` | The global ID↔Bitset dictionary + all `InternSnap`s | One Bitset per *unique* split, shared | **The public API** — returned by all loading functions |
 
-> **tl;dr:** `TreeSnapshot` is a private stepping stone used during parsing. `InternedSnapshots` is what everything else touches — RF, WRF, KF, pairwise matrices, snap file I/O, and Python bindings all take or return `InternedSnapshots`.
+> **tl;dr:** `TreeSnapshot` is a private stepping stone used during parsing. `Snapshots` is what everything else touches — RF, WRF, KF, pairwise matrices, snap file I/O, and Python bindings all take or return `Snapshots`.

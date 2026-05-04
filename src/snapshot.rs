@@ -432,8 +432,15 @@ impl Snapshots {
             .map_err(|e| format!("Failed to parse newick at index 0: {e}"))?;
         crate::io::rename_leaf_nodes(&mut first_tree, first_translate);
 
-        let mut sorted_leaf_names: Vec<String> = first_tree
-            .get_leaves()
+        //sanity check: ensure all leaf names are unique within the first tree
+        let first_leaves = first_tree.get_leaves();
+        if first_leaves.len() != first_leaves.iter().collect::<HashSet<_>>().len() {
+            return Err(
+                "Trees have duplicate leaf names. All leaf names must be unique.".to_string(),
+            );
+        }
+
+        let mut sorted_leaf_names: Vec<String> = first_leaves
             .iter()
             .filter_map(|&id| first_tree.get(&id).ok()?.name.clone())
             .collect();
@@ -523,6 +530,10 @@ impl Snapshots {
         let n_trees = self.snapshots.len();
         let n_bip = self.bipartitions.len();
         let mut presence = vec![0u8; n_trees * n_bip];
+
+        if n_bip == 0 {
+            return presence; // No splits, return empty matrix
+        }
 
         // Safely divide the mutable slice into row-sized chunks across threads
         presence

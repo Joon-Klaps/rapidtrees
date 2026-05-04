@@ -39,8 +39,8 @@ pixi run test-rust
 # Run Python API tests (includes R comparisons with phangorn)
 pixi run test-python
 
-# Run all tests (Rust + Python + R)
-pixi run test-all
+# Run Python tests with coverage report
+pixi run test-python-cov
 ```
 
 ### Code Quality
@@ -50,7 +50,7 @@ pixi run test-all
 pixi run fmt
 
 # Lint with clippy (strict warnings-as-errors)
-pixi run lint
+pixi run clippy
 
 # Pre-commit checks
 pixi run pre-commit
@@ -60,13 +60,13 @@ pixi run pre-commit
 
 ```bash
 # Debug build
-pixi run cargo build
+cargo build
 
 # Release binary (optimized)
-pixi run build-release
+cargo build --release
 
-# Python wheels (all platforms)
-pixi run maturin build --release
+# Python wheels (editable install for dev)
+pip install -e .
 ```
 
 ## 📁 Project Structure
@@ -89,7 +89,6 @@ rapidtrees/
 │   └── rapidtrees-for-dummies.md # Architecture guide
 ├── Cargo.toml                # Rust dependencies
 ├── pyproject.toml            # Python package metadata
-├── pixi.toml                 # Pixi environment definition
 └── .github/workflows/
     └── ci.yml                # CI/CD pipeline (GitHub Actions)
 ```
@@ -109,7 +108,7 @@ rapidtrees/
    pub fn your_metric(a: &Snapshot, b: &Snapshot) -> f64 {
        // Implementation
    }
-   
+
    #[cfg(test)]
    mod tests {
        #[test]
@@ -208,9 +207,9 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on every push/PR:
 
 Before submitting a PR:
 
-1. **Run tests locally**: `pixi run test-all`
+1. **Run tests locally**: `pixi run test-rust && pixi run test-python`
 2. **Format code**: `pixi run fmt`
-3. **Lint**: `pixi run lint`
+3. **Lint**: `pixi run clippy`
 4. **Update docs** if adding/changing public APIs
 5. **Add tests** for new functionality
 6. **Reference related issues** in your PR description
@@ -237,18 +236,18 @@ Happy contributing! 🌲⚡
 
 ## 📋 Single Source of Truth for Versions
 
-All project metadata is now in **`pixi.toml`**:
+All project metadata is in **`pyproject.toml`**:
 - Python package metadata (name, version, description, classifiers, URLs)
 - Python, R, and Rust dependencies
 - Build system configuration (maturin)
-- Development tasks
+- Development tasks (under `[tool.pixi.tasks]`)
 
-**For releases:** Update `version` in `pixi.toml` and `Cargo.toml` (Cargo.toml needed for crates.io):
+**For releases:** Update `version` in `pyproject.toml` and `Cargo.toml`:
 
 ```bash
 # Update version in both files
-pixi.toml:   version = "0.5.0"
-Cargo.toml:  version = "0.5.0"
+pyproject.toml:  version = "0.5.0"
+Cargo.toml:      version = "0.5.0"
 
 # Tag and push
 git tag v0.5.0

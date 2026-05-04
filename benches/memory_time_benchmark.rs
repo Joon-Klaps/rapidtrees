@@ -212,7 +212,7 @@ fn main() {
 
             let size_per_tree = estimate_size(&interned) / subset_size.max(1);
             let total_est_size = size_per_tree * t;
-            let total_comparisons = (t as u64) * (t as u64);
+            let total_comparisons = (t as u64) * (t as u64) / 2;
             let combs_str = format_count(total_comparisons);
             let est_mem_str = format_size(total_est_size);
 
