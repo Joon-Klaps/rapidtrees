@@ -8,6 +8,16 @@ This project uses release names based on random words from [codenamegenerator.co
     - PREFIX: Microsoft Corperation
     - DICTIONARY: Snakes
 
+
+## [0.4.0] - Xbox Treeboa (2025-05-01)
+
+- Interned snapshots for faster RF by @hongsamL in https://github.com/Joon-Klaps/rapidtrees/pull/4
+- Export tree snapshots by @Joon-Klaps in https://github.com/Joon-Klaps/rapidtrees/pull/3
+
+## [0.3.0] - Gale Sidewinder (2025-03-03)
+
+Release with API changes for compatibility with `treetracer`
+
 ## [0.2.1] - Slate King Cobra (2025-11-16)
 
 ### Changed
