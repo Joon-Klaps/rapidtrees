@@ -1,7 +1,5 @@
 use clap::{Parser, ValueEnum};
-use rapidtrees::distances::{pairwise_kf_matrix, pairwise_rf_matrix, pairwise_wrf_matrix};
 use rapidtrees::io::{load_beast_trees, load_snapshots, write_matrix_tsv, write_snap};
-use rapidtrees::snapshot::TreeSnapshot;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -21,7 +19,7 @@ struct Args {
     )]
     input: Option<PathBuf>,
 
-    /// Path to compressed .snap file (RF only)
+    /// Path to compressed .snap file
     #[arg(
         long = "snap-input",
         required_unless_present = "input",
@@ -68,26 +66,19 @@ enum MetricArg {
     Kf,
 }
 
-enum DistanceInput {
-    Snapshots(Vec<TreeSnapshot>),
-}
-
 fn main() {
     let args = Args::parse();
 
-    if args.snap_input.is_some() && !matches!(args.metric, MetricArg::Rf) {
-        eprintln!("--snap-input currently supports only --metric rf");
-        std::process::exit(6);
-    }
     if args.snap_input.is_some() && args.export_snap.is_some() {
         eprintln!("--export-snap cannot be used together with --snap-input");
         std::process::exit(7);
     }
 
     let quiet = args.quiet;
-
+    let t_total = Instant::now();
     let t = Instant::now();
-    let (taxon_map, trees) = match &args.snap_input {
+
+    let (names, interned) = match &args.snap_input {
         Some(path) => load_snapshots(path).unwrap_or_else(|e| {
             eprintln!("Failed to load trees: {e}");
             std::process::exit(1);
@@ -101,35 +92,30 @@ fn main() {
         ),
     };
 
-    let (names, snapshots): (Vec<String>, Vec<TreeSnapshot>) = trees.into_iter().unzip();
-
     log_if(
         quiet,
         format!(
-            "Loaded {} trees from {} in {:.3}s",
+            "Loaded {} trees in {:.3}s",
             names.len(),
-            if let Some(path) = &args.snap_input {
-                format!("snap {path:?}")
-            } else {
-                "BEAST file".to_string()
-            },
             t.elapsed().as_secs_f64()
         ),
     );
 
-    // If --export-snap is specified, write the snapshots to a .snap file and exit
+    if names.len() < 2 {
+        eprintln!("Need at least 2 trees to compute pairwise distances");
+        std::process::exit(2);
+    }
+
     if let Some(snap_path) = args.export_snap {
         let t = Instant::now();
-        let mut taxa_names: Vec<String> = taxon_map.values().cloned().collect();
-        taxa_names.sort_unstable();
-        if let Err(e) = write_snap(&snap_path, &names, &taxa_names, &snapshots) {
+        if let Err(e) = write_snap(&snap_path, &names, &interned) {
             eprintln!("Failed to write snap {snap_path:?}: {e}");
             std::process::exit(5);
         }
         log_if(
             quiet,
             format!(
-                "Exported snapshots to snap {snap_path:?} in {:.3}s",
+                "Exported snapshots to {snap_path:?} in {:.3}s",
                 t.elapsed().as_secs_f64()
             ),
         );
@@ -144,7 +130,15 @@ fn main() {
     );
 
     let t = Instant::now();
-    let mat = compute_matrix(args.metric, &DistanceInput::Snapshots(snapshots));
+    let mat: Vec<f64> = match args.metric {
+        MetricArg::Rf => interned
+            .pairwise_rf()
+            .into_iter()
+            .map(|dist| dist as f64)
+            .collect(),
+        MetricArg::Weighted => interned.pairwise_wrf(),
+        MetricArg::Kf => interned.pairwise_kf(),
+    };
     log_if(
         quiet,
         format!(
@@ -154,7 +148,7 @@ fn main() {
     );
 
     let t = Instant::now();
-    if let Err(e) = write_matrix_tsv(&args.output, &names, &mat) {
+    if let Err(e) = write_matrix_tsv(&args.output, &names, &mat, interned.len()) {
         eprintln!("Failed to write output {:?}: {e}", args.output);
         std::process::exit(4);
     }
@@ -166,18 +160,11 @@ fn main() {
             t.elapsed().as_secs_f64()
         ),
     );
-}
 
-fn compute_matrix(metric: MetricArg, input: &DistanceInput) -> Vec<Vec<f64>> {
-    match (metric, input) {
-        (MetricArg::Rf, DistanceInput::Snapshots(snaps)) => pairwise_rf_matrix(snaps)
-            .into_iter()
-            .map(|row| row.into_iter().map(|v| v as f64).collect())
-            .collect(),
-
-        (MetricArg::Weighted, DistanceInput::Snapshots(snaps)) => pairwise_wrf_matrix(snaps),
-        (MetricArg::Kf, DistanceInput::Snapshots(snaps)) => pairwise_kf_matrix(snaps),
-    }
+    log_if(
+        quiet,
+        format!("Total runtime: {:.3}s", t_total.elapsed().as_secs_f64()),
+    );
 }
 
 fn metric_label(metric: MetricArg) -> &'static str {
