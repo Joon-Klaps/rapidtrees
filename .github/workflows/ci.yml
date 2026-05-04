@@ -56,7 +56,7 @@ jobs:
         name: Python API Tests (${{ matrix.os }}, ${{ matrix.environment }})
         runs-on: ${{ matrix.os }}
         strategy:
-            fail-fast: false
+            fail-fast: true
             matrix:
                 os: [ubuntu-latest, macos-latest]
                 environment: [py310, py311, py312]
