@@ -107,30 +107,6 @@ impl Bitset {
     pub fn count_ones(&self) -> usize {
         self.0.iter().map(|w| w.count_ones() as usize).sum()
     }
-
-    /// Collect the indices of all set bits below `n_leaves`.
-    ///
-    /// Uses a trailing-zeros bit trick so cost is O(set_bits) rather than
-    /// O(n_leaves), which matters a lot for large but sparse bipartitions
-    /// (e.g. cherry splits {A,B} in a 10 000-taxon tree).
-    #[inline]
-    pub fn to_leaf_indices(&self, n_leaves: usize) -> Vec<u32> {
-        let mut out = Vec::with_capacity(self.count_ones());
-        for (word_idx, &word) in self.0.iter().enumerate() {
-            let base = (word_idx * 64) as u32;
-            let mut w = word;
-            while w != 0 {
-                let bit = w.trailing_zeros();
-                let idx = base + bit;
-                if idx as usize >= n_leaves {
-                    break;
-                }
-                out.push(idx);
-                w &= w - 1; // clear lowest set bit
-            }
-        }
-        out
-    }
 }
 
 #[cfg(test)]
@@ -214,5 +190,16 @@ mod tests {
         assert_eq!(bs.count_ones(), 4);
         assert_eq!(bs.0[0], 1u64 | (1u64 << 63));
         assert_eq!(bs.0[1], 1u64 | (1u64 << 63));
+    }
+
+    #[test]
+    fn test_get() {
+        let mut bs = Bitset::zeros(1);
+        bs.set(0);
+        bs.set(2);
+        assert!(bs.get(0));
+        assert!(!bs.get(1));
+        assert!(bs.get(2));
+        assert!(!bs.get(3));
     }
 }
