@@ -214,7 +214,7 @@ pub fn write_snap<P: AsRef<Path>>(
     let n_bip = snaps.bipartitions.len();
     let words = snaps.words_per_bitset.max(1);
 
-    let presence = snaps.build_presence_matrix();
+    let (presence, _) = snaps.build_presence_matrix();
 
     let mut w = BufWriter::new(GzEncoder::new(File::create(path)?, Compression::default()));
     w.write_all(b"SNAP")?;

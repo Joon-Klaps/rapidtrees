@@ -242,17 +242,4 @@ All project metadata is in **`pyproject.toml`**:
 - Build system configuration (maturin)
 - Development tasks (under `[tool.pixi.tasks]`)
 
-**For releases:** Update `version` in `pyproject.toml` and `Cargo.toml`:
-
-```bash
-# Update version in both files
-pyproject.toml:  version = "0.5.0"
-Cargo.toml:      version = "0.5.0"
-
-# Tag and push
-git tag v0.5.0
-git push origin v0.5.0
-# GitHub Actions validates consistency and publishes automatically
-```
-
-This eliminates version drift and inconsistencies.
+**For releases:** Update `version` in `pyproject.toml` and `Cargo.toml`, then update `CHANGELOG.md` with the new version and release notes. This ensures consistency across all project files and simplifies the release process.

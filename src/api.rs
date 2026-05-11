@@ -11,7 +11,14 @@ use std::collections::HashMap;
 
 use crate::snapshot::Snapshots;
 
-type PyRfSnapshotResult = (Vec<String>, Py<PyAny>, Vec<String>, usize, Py<PyAny>);
+type PyRfSnapshotResult = (
+    Vec<String>,
+    Py<PyAny>,
+    Vec<String>,
+    usize,
+    Py<PyAny>,
+    Py<PyAny>,
+);
 
 /// Collect tree snapshots from a lazy Python iterator of newick strings.
 fn collect_snapshots_from_iter(
@@ -125,6 +132,33 @@ fn pairwise_rf_from_newick_iter(
 /// presence = np.frombuffer(pres_bytes, dtype=np.uint8).reshape(n_trees, n_bip).copy()
 /// ```
 ///
+/// # Bipartition clade bytes
+///
+/// `bipartition_clade_bytes` is a flat `bytes` buffer encoding the canonical leaf
+/// membership of every bipartition. Shape: `(n_bipartitions, ceil(n_leaves / 8))`,
+/// row-major. Bit `i` of row `j` — **little-endian bit order within each byte** — is `1`
+/// if `leaf_names[i]` is on the canonical side of bipartition `j`. Column order matches
+/// the presence matrix (ascending `Bitset` order, stable across calls).
+///
+/// For unrooted trees the canonical side is the half that does **not** contain the first
+/// leaf alphabetically, so bit 0 of every row is always `0`.
+///
+/// Decode with NumPy:
+/// ```python
+/// import math
+/// bytes_per_bip = math.ceil(len(leaf_names) / 8)
+/// bip_arr  = np.frombuffer(bipartition_clade_bytes, dtype=np.uint8)
+///                .reshape(n_bip, bytes_per_bip)
+/// bip_bool = np.unpackbits(bip_arr, axis=1, bitorder='little')[:, :len(leaf_names)]
+/// # bip_bool[j, i] == 1  →  leaf_names[i] is in bipartition j
+///
+/// # Human-readable column labels
+/// col_labels = [
+///     "|".join(n for i, n in enumerate(leaf_names) if bip_bool[j, i])
+///     for j in range(n_bip)
+/// ]
+/// ```
+///
 /// Args:
 ///     names: Tree identifiers (one per newick).
 ///     newick_iter: Python iterator yielding newick strings.
@@ -133,7 +167,8 @@ fn pairwise_rf_from_newick_iter(
 ///     rooted: If True compare clades; if False compare bipartitions (default: False).
 ///
 /// Returns:
-///     5-tuple (tree_names, rf_matrix_bytes, leaf_names, n_bipartitions, presence_bytes).
+///     6-tuple (tree_names, rf_matrix_bytes, leaf_names, n_bipartitions, presence_bytes,
+///     bipartition_clade_bytes).
 ///
 /// Raises:
 ///     ValueError: If fewer than 2 trees, leaf sets differ, or argument lengths mismatch.
@@ -158,17 +193,20 @@ fn pairwise_rf_with_snapshots_from_newick_iter(
         .collect();
 
     let n_bipartitions = snaps.bipartitions.len();
-    let presence_vec = snaps.build_presence_matrix();
+    let (presence_vec, col_to_bip_id) = snaps.build_presence_matrix();
     let leaf_names = snaps.leaf_names.clone();
+    let bip_clade_bytes = snaps.build_bipartition_bytes(&col_to_bip_id);
 
     let py_rf = PyBytes::new(py, &rf_bytes);
     let py_pres = PyBytes::new(py, &presence_vec);
+    let py_bip = PyBytes::new(py, &bip_clade_bytes);
     Ok((
         names,
         py_rf.into(),
         leaf_names,
         n_bipartitions,
         py_pres.into(),
+        py_bip.into(),
     ))
 }
 

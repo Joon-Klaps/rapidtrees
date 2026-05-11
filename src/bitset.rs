@@ -82,6 +82,14 @@ impl Bitset {
         }
     }
 
+    /// Returns true if the bit at the given index is set.
+    #[inline]
+    pub fn get(&self, idx: usize) -> bool {
+        let word = idx >> 6;
+        let bit = idx & 63;
+        (self.0[word] >> bit) & 1 == 1
+    }
+
     /// Counts the number of set bits (population count).
     ///
     /// Returns how many leaves are in this partition.
@@ -182,5 +190,16 @@ mod tests {
         assert_eq!(bs.count_ones(), 4);
         assert_eq!(bs.0[0], 1u64 | (1u64 << 63));
         assert_eq!(bs.0[1], 1u64 | (1u64 << 63));
+    }
+
+    #[test]
+    fn test_get() {
+        let mut bs = Bitset::zeros(1);
+        bs.set(0);
+        bs.set(2);
+        assert!(bs.get(0));
+        assert!(!bs.get(1));
+        assert!(bs.get(2));
+        assert!(!bs.get(3));
     }
 }
