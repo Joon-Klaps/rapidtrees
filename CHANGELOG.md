@@ -12,6 +12,7 @@ This project uses release names based on random words from [codenamegenerator.co
 ## [0.5.1] - (YYYY-MM-DD)
 
 - wRF and KF distances now match phangorn ([#9](https://github.com/Joon-Klaps/rapidtrees/pull/9)).
+- include tests for load_beast_raw in io.rs ([#10](https://github.com/Joon-Klaps/rapidtrees/pull/10)).
 
 ## [0.5.0] - Obsidian Sidewinder (2026-05-11)
 
