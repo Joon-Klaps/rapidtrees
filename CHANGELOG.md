@@ -13,7 +13,7 @@ This project uses release names based on random words from [codenamegenerator.co
 
 - wRF and KF distances now match phangorn ([#9](https://github.com/Joon-Klaps/rapidtrees/pull/9)).
 
-## [0.5.0] - (2026-05-11)
+## [0.5.0] - Obsidian Sidewinder (2026-05-11)
 
 - Add `bipartition_clade_bytes: bytes` in the return value of `pairwise_rf_with_snapshots_from_newick_iter` ([#8](https://github.com/Joon-Klaps/rapidtrees/pull/8)). The new field is a packed bitmask buffer of shape `(n_bip, ceil(n_leaves/8))` — decode with `np.unpackbits(..., bitorder='little')`. This representation is more compact (up to 16× smaller for large trees) and has zero Python object overhead.
 
