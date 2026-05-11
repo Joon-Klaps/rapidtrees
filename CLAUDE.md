@@ -85,17 +85,13 @@ Invoke with `/skill-name` in chat.
 
 ```bash
 # Build & install (development)
-pixi run pip install -e .
+pixi run develop
 
 # Rust tests
-pixi run test-rust           # cargo test --lib
+pixi run pre-commit          # cargo test --lib & cargo clippy & cargo fmt
 
 # Python API tests
 pixi run test-python         # pytest tests/test_python_api.py -v
-
-# Format / lint
-pixi run fmt                 # cargo fmt
-pixi run clippy              # cargo clippy -- -D warnings
 
 # Benchmarks
 pixi run cargo bench

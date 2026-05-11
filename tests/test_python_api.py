@@ -1022,7 +1022,11 @@ class TestPairwiseRFWithSnapshots:
         assert len(bip_clade_bytes) == n_bip * bytes_per_bip
 
     def test_bip_clade_bytes_valid_range(self):
-        """No padding bits beyond n_leaves are set, and every row has ≥ 2 leaves."""
+        """No padding bits beyond n_leaves are set, and every row has ≥ 1 leaf.
+
+        Pendant (leaf) edges are included in the bipartition table as single-leaf
+        rows; internal bipartitions always have ≥ 2 leaves.
+        """
         _, _, leaf_names, n_bip, _, bip_clade_bytes = self._call()
         n_leaves = len(leaf_names)
         bytes_per_bip = (n_leaves + 7) // 8
@@ -1030,17 +1034,24 @@ class TestPairwiseRFWithSnapshots:
         bip_bool = np.unpackbits(bip_arr, axis=1, bitorder='little')
         # padding bits (columns >= n_leaves) must all be zero
         assert np.all(bip_bool[:, n_leaves:] == 0), "padding bits must be zero"
-        # each bipartition has at least 2 leaves on its canonical side
-        assert np.all(bip_bool[:, :n_leaves].sum(axis=1) >= 2)
+        # pendant edges have exactly 1 leaf; internal bipartitions have ≥ 2
+        assert np.all(bip_bool[:, :n_leaves].sum(axis=1) >= 1)
 
     def test_bip_clade_bytes_canonical_side_excludes_first_leaf(self):
-        """In unrooted mode bit 0 (first leaf) is never set in any bipartition row."""
-        _, _, _, n_bip, _, bip_clade_bytes = self._call()
-        # bit 0 of the first byte of every row encodes leaf index 0
-        bip_arr = np.frombuffer(bip_clade_bytes, dtype=np.uint8)
-        bytes_per_bip = len(bip_clade_bytes) // n_bip
-        first_bytes = bip_arr[::bytes_per_bip]
-        assert np.all(first_bytes & 0x01 == 0), "Canonical side must not contain leaf 0 (unrooted)"
+        """Internal bipartitions never have bit 0 (first leaf) set.
+
+        Pendant edges are stored verbatim (no canonicalization), so the pendant
+        of the first leaf alphabetically has bit 0 set.  Only rows with ≥ 2 bits
+        set (internal bipartitions) are subject to the canonical-side guarantee.
+        """
+        _, _, leaf_names, n_bip, _, bip_clade_bytes = self._call()
+        n_leaves = len(leaf_names)
+        bytes_per_bip = (n_leaves + 7) // 8
+        bip_arr = np.frombuffer(bip_clade_bytes, dtype=np.uint8).reshape(n_bip, bytes_per_bip)
+        bip_bool = np.unpackbits(bip_arr, axis=1, bitorder='little')[:, :n_leaves]
+        is_internal = bip_bool.sum(axis=1) >= 2
+        assert np.all(bip_bool[is_internal, 0] == 0), \
+            "Canonical side of internal bipartitions must not contain leaf 0"
 
     def test_bip_clade_bytes_decode_to_valid_names(self):
         """Decoded leaf names for each bipartition are a non-empty subset of the full leaf set."""
@@ -1053,30 +1064,37 @@ class TestPairwiseRFWithSnapshots:
         for j in range(n_bip):
             names_for_bip = {leaf_names[i] for i in np.where(bip_bool[j])[0]}
             assert names_for_bip <= leaf_set
-            assert len(names_for_bip) >= 2
+            assert len(names_for_bip) >= 1  # pendant edges are single-leaf rows
     def test_bip_clade_bytes_simple_tree(self):
         """On a known 4-leaf tree, verify exact canonical-side bitmasks.
 
         Trees: ((A,B),(C,D))  and  ((A,C),(B,D))
         leaf_names = [A, B, C, D]  →  indices 0,1,2,3
-        Bipartitions (sorted ascending):
-          col 0: {B,D}  bits 1,3 → byte = 0b00001010 = 0x0A
-          col 1: {C,D}  bits 2,3 → byte = 0b00001100 = 0x0C
+        Bipartitions sorted ascending (pendant edges then internal):
+          col 0: {A}    bit 0     → 0x01  (pendant)
+          col 1: {B}    bit 1     → 0x02  (pendant)
+          col 2: {C}    bit 2     → 0x04  (pendant)
+          col 3: {D}    bit 3     → 0x08  (pendant)
+          col 4: {B,D}  bits 1,3  → 0x0A  (internal)
+          col 5: {C,D}  bits 2,3  → 0x0C  (internal)
         """
         trees = ["((A,B),(C,D));", "((A,C),(B,D));"]
         names = ["t0", "t1"]
         result = rtd.pairwise_rf_with_snapshots_from_newick_iter(names, iter(trees), [{}], [0, 0])
         _, _, leaf_names, n_bip, _, bip_clade_bytes = result
         assert leaf_names == ["A", "B", "C", "D"]
+        assert n_bip == 6  # 4 pendant + 2 internal
         n_leaves = len(leaf_names)
         bytes_per_bip = (n_leaves + 7) // 8
         bip_arr = np.frombuffer(bip_clade_bytes, dtype=np.uint8).reshape(n_bip, bytes_per_bip)
         bip_bool = np.unpackbits(bip_arr, axis=1, bitorder='little')[:, :n_leaves]
         decoded = [sorted(leaf_names[i] for i in np.where(bip_bool[j])[0]) for j in range(n_bip)]
-        # Both canonical sides have 2 leaves and exclude 'A'
-        assert all(len(d) == 2 for d in decoded)
-        assert all("A" not in d for d in decoded)
-        assert sorted(decoded) == [["B", "D"], ["C", "D"]]
+        pendant = [d for d in decoded if len(d) == 1]
+        internal = [d for d in decoded if len(d) == 2]
+        assert sorted([d[0] for d in pendant]) == ["A", "B", "C", "D"]
+        assert sorted(internal) == [["B", "D"], ["C", "D"]]
+        # internal bipartitions always exclude 'A' (canonical-side guarantee)
+        assert all("A" not in d for d in internal)
 
     def test_bip_clade_bytes_large_complex_trees(self):
         """
@@ -1134,17 +1152,22 @@ class TestPairwiseRFWithSnapshots:
 
         assert leaf_names == list("ABCDEFGHIJKLMNO")
 
-        # Decode bitmasks → frozensets of taxon names for set comparison
+        # Decode bitmasks → frozensets of taxon names for set comparison.
+        # Filter out pendant entries (single-leaf rows); only check internal bipartitions.
         n_leaves = len(leaf_names)
         bytes_per_bip = (n_leaves + 7) // 8
         bip_arr = np.frombuffer(bip_clade_bytes, dtype=np.uint8).reshape(n_bip, bytes_per_bip)
         bip_bool = np.unpackbits(bip_arr, axis=1, bitorder='little')[:, :n_leaves]
-        decoded = {frozenset(leaf_names[i] for i in np.where(row)[0]) for row in bip_bool}
+        decoded = {
+            frozenset(leaf_names[i] for i in np.where(row)[0])
+            for row in bip_bool
+            if row.sum() >= 2  # skip pendant (single-leaf) entries
+        }
 
         def s(*leaves):
             return frozenset(leaves)
 
-        # Expected canonical bipartitions (side NOT containing 'A').
+        # Expected internal bipartitions (side NOT containing 'A').
         # 15 leaves → 12 internal edges per tree.  After dedup: 23 unique.
         expected = {
             # ── shared by all three trees ──────────────────────────────────

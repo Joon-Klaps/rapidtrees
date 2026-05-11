@@ -182,20 +182,28 @@ matrix **and** the bipartition presence matrix in a single parse, returning a
 | `tree_names` | `list[str]` | Tree identifiers (same order as input `names`) |
 | `rf_bytes` | `bytes` | Flat `uint32` RF matrix, row-major, shape `(n, n)` |
 | `leaf_names` | `list[str]` | Sorted taxon names — index `i` corresponds to bit `i` in every bipartition |
-| `n_bip` | `int` | Number of unique bipartitions across all trees |
+| `n_bip` | `int` | Number of unique edges across all trees (internal bipartitions + pendant edges) |
 | `presence_bytes` | `bytes` | Flat `uint8` presence matrix, row-major, shape `(n, n_bip)` |
 | `bipartition_clade_bytes` | `bytes` | Packed bitmasks, shape `(n_bip, ceil(n_leaves/8))` — see below |
 
-The presence matrix entry `presence[i, j]` is `1` if bipartition `j` appears
-in tree `i`, otherwise `0`. Column order is deterministic (ascending `Bitset`
-order) and stable across calls on the same tree set.
+The presence matrix entry `presence[i, j]` is `1` if edge `j` appears in tree
+`i`, otherwise `0`. Column order is deterministic (ascending `Bitset` order)
+and stable across calls on the same tree set.
+
+#### Edge table contents
+
+`n_bip` counts **all** edges: pendant (leaf) edges and internal bipartitions.
+Pendant edges appear as single-bit rows (one bit set), sorted before internal
+bipartitions. Since all trees share the same leaf set, pendant columns are always
+`1` in every row of the presence matrix.
 
 #### Canonicalisation note
 
-For unrooted trees each bipartition is stored on the side that does **not**
-contain the first leaf alphabetically. Bit 0 of every row in
-`bipartition_clade_bytes` is therefore always `0`. The complement side can be
-derived as `~bip_bool[j] & True` (masked to `n_leaves` bits).
+For internal bipartitions (rows with ≥ 2 bits set) the canonical side is the
+half that does **not** contain the first leaf alphabetically, so bit 0 is never
+set in those rows. Pendant edges are stored verbatim (no flip), so the pendant
+of the first leaf has bit 0 set. The complement of an internal bipartition can
+be derived as `~bip_bool[j] & True` (masked to `n_leaves` bits).
 
 #### Bipartition clade bytes format
 
