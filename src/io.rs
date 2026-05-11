@@ -393,6 +393,223 @@ fn parse_taxon_block(content: &str) -> HashMap<String, String> {
         .collect::<HashMap<_, _>>()
 }
 
+#[cfg(test)]
+mod load_tests {
+    use super::*;
+
+    fn hiv2_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/hiv2.trees")
+    }
+
+    // ── strip_beast_annotations ───────────────────────────────────────────────
+
+    #[test]
+    fn test_strip_annotations_removes_bracketed_content() {
+        let input = "(A[&rate=0.5]:1.0,B[&rate=0.3]:2.0):0.0;";
+        assert_eq!(strip_beast_annotations(input), "(A:1.0,B:2.0):0.0;");
+    }
+
+    #[test]
+    fn test_strip_annotations_passthrough_plain_newick() {
+        let input = "((A:1,B:1):1,(C:1,D:1):1);";
+        assert_eq!(strip_beast_annotations(input), input);
+    }
+
+    #[test]
+    fn test_strip_annotations_removes_leading_r_flag() {
+        // [&R] marks a rooted tree in BEAST output
+        let input = "[&R] ((A:1,B:1):1,(C:1,D:1):1);";
+        assert_eq!(
+            strip_beast_annotations(input),
+            " ((A:1,B:1):1,(C:1,D:1):1);"
+        );
+    }
+
+    // ── extract_name_state ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_name_state_standard() {
+        let (name, state) = extract_name_state("tree STATE_10000 [&lnP=-123.4]");
+        assert_eq!(name, "STATE_10000");
+        assert_eq!(state, 10000);
+    }
+
+    #[test]
+    fn test_extract_name_state_zero() {
+        let (name, state) = extract_name_state("tree STATE_0 [&lnP=-123.4]");
+        assert_eq!(name, "STATE_0");
+        assert_eq!(state, 0);
+    }
+
+    #[test]
+    fn test_extract_name_state_no_state_keyword_returns_empty() {
+        let (name, state) = extract_name_state("tree my_tree");
+        assert_eq!(name, "");
+        assert_eq!(state, 0);
+    }
+
+    // ── parse_taxon_block ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_taxon_block_basic() {
+        let content =
+            "Begin trees;\n\tTranslate\n\t\t1 'Alpha',\n\t\t2 'Beta',\n\t\t3 'Gamma'\n\t;\nEnd;\n";
+        let map = parse_taxon_block(content);
+        assert_eq!(map.len(), 3);
+        assert_eq!(map.get("1").map(String::as_str), Some("Alpha"));
+        assert_eq!(map.get("2").map(String::as_str), Some("Beta"));
+        assert_eq!(map.get("3").map(String::as_str), Some("Gamma"));
+    }
+
+    #[test]
+    fn test_parse_taxon_block_empty_when_no_translate() {
+        let content = "#NEXUS\nBegin trees;\ntree t1 = (A:1,B:1);\nEnd;\n";
+        assert!(parse_taxon_block(content).is_empty());
+    }
+
+    // ── collect_tree_blocks ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_collect_tree_blocks_count() {
+        let content = "Begin trees;\ntree t1 = (A:1,B:1);\ntree t2 = (A:2,B:2);\nEnd;\n";
+        let blocks = collect_tree_blocks(content);
+        assert_eq!(blocks.len(), 2);
+    }
+
+    #[test]
+    fn test_collect_tree_blocks_header_and_body() {
+        let content = "Begin trees;\ntree STATE_0 = (A:1,B:1);\nEnd;\n";
+        let blocks = collect_tree_blocks(content);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].header, "tree STATE_0");
+        assert_eq!(blocks[0].body, "(A:1,B:1);");
+    }
+
+    // ── rename_leaf_nodes ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_rename_leaf_nodes_applies_translate() {
+        let translate: HashMap<String, String> = [
+            ("1".to_string(), "Alpha".to_string()),
+            ("2".to_string(), "Beta".to_string()),
+        ]
+        .into();
+        let mut tree = phylotree::tree::Tree::from_newick("(1:1.0,2:1.0);").unwrap();
+        rename_leaf_nodes(&mut tree, &translate);
+        let leaf_names: Vec<_> = tree
+            .get_leaves()
+            .iter()
+            .filter_map(|id| tree.get(id).ok()?.name.clone())
+            .collect();
+        assert!(leaf_names.contains(&"Alpha".to_string()));
+        assert!(leaf_names.contains(&"Beta".to_string()));
+    }
+
+    #[test]
+    fn test_rename_leaf_nodes_noop_on_empty_map() {
+        let mut tree = phylotree::tree::Tree::from_newick("(A:1.0,B:1.0);").unwrap();
+        rename_leaf_nodes(&mut tree, &HashMap::new());
+        let leaf_names: Vec<_> = tree
+            .get_leaves()
+            .iter()
+            .filter_map(|id| tree.get(id).ok()?.name.clone())
+            .collect();
+        assert!(leaf_names.contains(&"A".to_string()));
+        assert!(leaf_names.contains(&"B".to_string()));
+    }
+
+    // ── load_beast_raw ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_load_beast_raw_no_burnin_returns_all_trees() {
+        let (_, pairs) = load_beast_raw(hiv2_path(), 0, 0, false);
+        assert_eq!(pairs.len(), 21);
+    }
+
+    #[test]
+    fn test_load_beast_raw_burnin_by_tree_count() {
+        let (_, pairs) = load_beast_raw(hiv2_path(), 5, 0, false);
+        assert_eq!(pairs.len(), 16);
+    }
+
+    #[test]
+    fn test_load_beast_raw_burnin_by_state() {
+        // hiv2.trees: STATE_0 .. STATE_200000 step 10000 (21 trees)
+        // keep state > 50000 → STATE_60000 .. STATE_200000 = 15 trees
+        let (_, pairs) = load_beast_raw(hiv2_path(), 0, 50000, false);
+        assert_eq!(pairs.len(), 15);
+    }
+
+    #[test]
+    fn test_load_beast_raw_use_real_taxa_populates_map() {
+        let (translate, _) = load_beast_raw(hiv2_path(), 0, 0, true);
+        assert!(!translate.is_empty());
+        assert_eq!(
+            translate.get("1").map(String::as_str),
+            Some("1959.M.CD.59.ZR59")
+        );
+    }
+
+    #[test]
+    fn test_load_beast_raw_use_real_taxa_false_empty_map() {
+        let (translate, _) = load_beast_raw(hiv2_path(), 0, 0, false);
+        assert!(translate.is_empty());
+    }
+
+    #[test]
+    fn test_load_beast_raw_strips_annotations() {
+        let (_, pairs) = load_beast_raw(hiv2_path(), 0, 0, false);
+        for (_, newick) in &pairs {
+            assert!(
+                !newick.contains("[&"),
+                "newick must not contain BEAST annotations after stripping"
+            );
+        }
+    }
+
+    #[test]
+    fn test_load_beast_raw_tree_names_contain_filename_stem() {
+        let (_, pairs) = load_beast_raw(hiv2_path(), 0, 0, false);
+        for (name, _) in &pairs {
+            assert!(
+                name.starts_with("hiv2_"),
+                "expected name to start with 'hiv2_', got '{name}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_load_beast_raw_nonexistent_returns_empty() {
+        let (translate, pairs) = load_beast_raw("nonexistent.trees", 0, 0, false);
+        assert!(pairs.is_empty());
+        assert!(translate.is_empty());
+    }
+
+    // ── load_beast_trees ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_load_beast_trees_returns_correct_count() {
+        let (names, snaps) = load_beast_trees(hiv2_path(), 0, 0, false, false);
+        assert_eq!(names.len(), 21);
+        assert_eq!(snaps.len(), 21);
+        assert!(!snaps.leaf_names.is_empty());
+    }
+
+    #[test]
+    fn test_load_beast_trees_burnin_reduces_count() {
+        let (names, snaps) = load_beast_trees(hiv2_path(), 5, 0, false, false);
+        assert_eq!(names.len(), 16);
+        assert_eq!(snaps.len(), 16);
+    }
+
+    #[test]
+    fn test_load_beast_trees_nonexistent_returns_empty() {
+        let (names, snaps) = load_beast_trees("nonexistent.trees", 0, 0, false, false);
+        assert!(names.is_empty());
+        assert_eq!(snaps.len(), 0);
+    }
+}
+
 #[cfg(all(test, feature = "cli"))]
 mod tests {
     use super::*;
