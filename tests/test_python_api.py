@@ -871,8 +871,7 @@ class TestRPhangornCrossValidation:
     @pytest.mark.parametrize(
         "newick_file", ["hiv1.newick", "hiv2.newick", "hiv3.newick", "hiv4.newick"]
     )
-    # @pytest.mark.parametrize("metric", ["RF", "wRF", "KF"])
-    @pytest.mark.parametrize("metric", ["RF"])
+    @pytest.mark.parametrize("metric", ["RF", "wRF", "KF"])
     def test_hiv_matches_phangorn(self, newick_file, metric):
         """Real BEAST HIV trees (162 taxa) match phangorn across all metrics."""
         path = str(TEST_DATA / newick_file)

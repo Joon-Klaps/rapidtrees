@@ -227,7 +227,7 @@ impl Snapshot {
     ) -> Result<(Vec<Bitset>, Vec<f64>), TreeError> {
         cache
             .iter()
-            .filter(|(node_id, bitset)| **node_id != root_id && bitset.count_ones() > 1)
+            .filter(|(node_id, _)| **node_id != root_id)
             .map(|(node_id, bitset)| {
                 let length = tree.get(node_id)?.parent_edge.unwrap_or(0.0);
                 Ok((bitset.clone(), length))
@@ -300,31 +300,39 @@ impl Snapshot {
         }
 
         // Unrooted bipartition mode: canonicalize, filter trivials, dedup.
-        // Build pairs of (canonical_bitset, length), filtering trivial splits
+        // Build pairs of (canonical_bitset, length).
+        //
+        // Three cases, decided by ones_before (count before any flip):
+        //   ones_before == 1          → pendant (leaf) edge: keep as single-bit
+        //                               bitset, no canonicalization. Pendant edges
+        //                               are always shared between trees with the same
+        //                               leaf set, so they always match in the distance
+        //                               sort-merge and contribute |la − lb| to wRF /
+        //                               (la − lb)² to KF, and 0 to RF.
+        //   ones_before >= num_leaves - 1 → near-full complement of a pendant edge;
+        //                               filter out (the pendant itself is captured above).
+        //   otherwise                 → internal bipartition: canonicalize by storing
+        //                               the side that does NOT contain leaf 0.
         let mut pairs: Vec<(Bitset, f64)> = parts
             .into_iter()
             .zip(lengths)
             .filter_map(|(bitset, length)| {
-                // Check if leaf 0 (bit 0 of word 0) is set
-                let leaf_0_is_set = (bitset.0[0] & 1) != 0;
+                let ones_before = bitset.count_ones();
 
+                if ones_before == 1 {
+                    return Some((bitset, length));
+                }
+
+                if ones_before >= num_leaves - 1 {
+                    return None;
+                }
+
+                let leaf_0_is_set = (bitset.0[0] & 1) != 0;
                 let canonical_bitset = if leaf_0_is_set {
-                    // Flip to complement (side without leaf 0)
                     Self::compute_complement(&bitset, words, num_leaves)
                 } else {
-                    // Already canonical (leaf 0 not in this side)
                     bitset
                 };
-
-                // Filter trivial bipartitions: a split is trivial if either
-                // side has ≤ 1 leaf.  The canonical form stores the side
-                // without leaf 0, so check both sides:
-                //   canonical side:   count_ones
-                //   complement side:  num_leaves - count_ones
-                let ones = canonical_bitset.count_ones();
-                if ones <= 1 || ones >= num_leaves - 1 {
-                    return None; // trivial split
-                }
 
                 Some((canonical_bitset, length))
             })
@@ -702,12 +710,12 @@ mod tests {
         let tree = PhyloTree::from_newick("((A:1,B:1):1,(C:1,D:1):1);").unwrap();
         let snap = Snapshot::from_tree(&tree, false).unwrap();
 
-        // For 4 leaves, an unrooted binary tree has L-3 = 1 non-trivial bipartition.
-        // With dedup, the rooted tree should also have 1 (not 2).
+        // For 4 leaves: 4 pendant edges + 1 internal bipartition = 5 entries.
+        // With dedup, the duplicated root bipartition collapses to 1 internal entry.
         assert_eq!(
             snap.parts.len(),
-            1,
-            "Rooted 4-leaf binary tree should have 1 non-trivial partition after dedup, got {}",
+            5,
+            "Rooted 4-leaf binary tree should have 5 entries (4 pendant + 1 internal) after dedup, got {}",
             snap.parts.len()
         );
     }
@@ -722,22 +730,26 @@ mod tests {
         let tree1 = PhyloTree::from_newick("((A:1,B:1):1,(C:1,D:1):1);").unwrap();
         let tree2 = PhyloTree::from_newick("((A:1,C:1):1,(B:1,D:1):1);").unwrap();
 
-        // Unrooted mode: L-3 = 1 bipartition per tree
+        // Unrooted mode: 4 pendant edges + 1 internal bipartition = 5 entries per tree.
         let snap1_u = Snapshot::from_tree(&tree1, false).unwrap();
         let snap2_u = Snapshot::from_tree(&tree2, false).unwrap();
         assert_eq!(
             snap1_u.parts.len(),
-            1,
-            "Unrooted: 1 bipartition for 4-leaf tree"
+            5,
+            "Unrooted: 4 pendant + 1 internal for 4-leaf tree"
         );
-        assert_eq!(snap2_u.parts.len(), 1);
+        assert_eq!(snap2_u.parts.len(), 5);
         assert_eq!(rf_pair(&snap1_u, &snap2_u), 2, "Unrooted RF = 2");
 
-        // Rooted mode: L-2 = 2 clades per tree
+        // Rooted mode: 4 pendant edges + 2 internal clades = 6 entries per tree.
         let snap1_r = Snapshot::from_tree(&tree1, true).unwrap();
         let snap2_r = Snapshot::from_tree(&tree2, true).unwrap();
-        assert_eq!(snap1_r.parts.len(), 2, "Rooted: 2 clades for 4-leaf tree");
-        assert_eq!(snap2_r.parts.len(), 2);
+        assert_eq!(
+            snap1_r.parts.len(),
+            6,
+            "Rooted: 4 pendant + 2 clades for 4-leaf tree"
+        );
+        assert_eq!(snap2_r.parts.len(), 6);
         assert_eq!(rf_pair(&snap1_r, &snap2_r), 4, "Rooted RF = 4");
 
         // Same topology: both modes give RF = 0
