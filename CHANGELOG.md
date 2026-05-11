@@ -8,6 +8,9 @@ This project uses release names based on random words from [codenamegenerator.co
     - PREFIX: Microsoft Corperation
     - DICTIONARY: Snakes
 
+## [0.5.0] - (YYY-MM-DD)
+
+
 
 ## [0.4.0] - Xbox Treeboa (2025-05-01)
 

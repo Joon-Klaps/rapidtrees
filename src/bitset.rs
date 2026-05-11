@@ -82,6 +82,14 @@ impl Bitset {
         }
     }
 
+    /// Returns true if the bit at the given index is set.
+    #[inline]
+    pub fn get(&self, idx: usize) -> bool {
+        let word = idx >> 6;
+        let bit = idx & 63;
+        (self.0[word] >> bit) & 1 == 1
+    }
+
     /// Counts the number of set bits (population count).
     ///
     /// Returns how many leaves are in this partition.

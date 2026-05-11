@@ -12,7 +12,7 @@ once.
 | Function | Returns |
 | --- | --- |
 | `pairwise_rf_from_newick_iter` | `(names, bytes)` — RF matrix as flat `uint32` bytes, row-major |
-| `pairwise_rf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes)` — RF matrix + bipartition presence matrix |
+| `pairwise_rf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, list[list[int]])` — RF matrix + bipartition presence matrix + bipartition leaf indices |
 | `pairwise_wrf_from_newick_iter` | `(names, list[float])` — Weighted RF, flat row-major |
 | `pairwise_kf_from_newick_iter` | `(names, list[float])` — Kuhner-Felsenstein, flat row-major |
 
@@ -38,7 +38,7 @@ newick strings already use real taxon names, pass `[{}]` and `[0] * n`.
 | `pairwise_rf_from_newick_iter` | `bytes` — flat `uint32`, row-major | `np.frombuffer(b, dtype=np.uint32).reshape(n, n)` |
 | `pairwise_wrf_from_newick_iter` | `list[float]` — flat, row-major | `np.array(lst, dtype=np.float64).reshape(n, n)` |
 | `pairwise_kf_from_newick_iter` | `list[float]` — flat, row-major | `np.array(lst, dtype=np.float64).reshape(n, n)` |
-| `pairwise_rf_with_snapshots_from_newick_iter` | 5-tuple — see below | see below |
+| `pairwise_rf_with_snapshots_from_newick_iter` | 6-tuple — see below | see below |
 
 ### Errors raised
 
@@ -171,26 +171,35 @@ tree_names, rf_bytes = rtd.pairwise_rf_from_newick_iter(
 
 `pairwise_rf_with_snapshots_from_newick_iter` builds both the RF distance
 matrix **and** the bipartition presence matrix in a single parse, returning a
-5-tuple:
+6-tuple:
 
 ```
-(tree_names, rf_bytes, leaf_names, n_bip, presence_bytes)
+(tree_names, rf_bytes, leaf_names, n_bip, presence_bytes, bipartition_leaf_indices)
 ```
 
 | Field | Type | Description |
 | --- | --- | --- |
 | `tree_names` | `list[str]` | Tree identifiers (same order as input `names`) |
 | `rf_bytes` | `bytes` | Flat `uint32` RF matrix, row-major, shape `(n, n)` |
-| `leaf_names` | `list[str]` | Sorted taxon names |
+| `leaf_names` | `list[str]` | Sorted taxon names — index `i` corresponds to bit `i` in every bipartition |
 | `n_bip` | `int` | Number of unique bipartitions across all trees |
 | `presence_bytes` | `bytes` | Flat `uint8` presence matrix, row-major, shape `(n, n_bip)` |
+| `bipartition_leaf_indices` | `list[list[int]]` | For each bipartition column, the indices into `leaf_names` on its canonical side |
 
 The presence matrix entry `presence[i, j]` is `1` if bipartition `j` appears
-in tree `i`, otherwise `0`.  Column order is deterministic (ascending `Bitset`
+in tree `i`, otherwise `0`. Column order is deterministic (ascending `Bitset`
 order) and stable across calls on the same tree set.
 
+#### Canonicalisation note
+
+For unrooted trees each bipartition is stored on the side that does **not**
+contain the first leaf alphabetically. This means every entry in
+`bipartition_leaf_indices` describes the half of the split that excludes the
+first taxon — the complement can be derived via
+`set(range(len(leaf_names))) - set(indices)`.
+
 ```python
-tree_names, rf_bytes, leaf_names, n_bip, pres_bytes = (
+tree_names, rf_bytes, leaf_names, n_bip, pres_bytes, bip_leaf_indices = (
     rtd.pairwise_rf_with_snapshots_from_newick_iter(
         list(names), iter(newicks), [tmap], [0] * len(names)
     )
@@ -206,4 +215,24 @@ for i in range(n):
 
 # Global split frequencies across all trees (useful for Pseudo-ESS / ASDSF)
 split_freq = presence.mean(axis=0)
+```
+
+#### Named presence matrix (post-hoc analysis)
+
+`bipartition_leaf_indices` maps each column of the presence matrix to the leaf
+names that make up that bipartition's canonical side.  Use it to build a
+labelled pandas `DataFrame` for downstream analyses such as tanglegrams,
+identifying unstable splits, or computing per-clade frequencies:
+
+```python
+import pandas as pd
+
+# Build a human-readable column label for each bipartition
+col_labels = [
+    "|".join(leaf_names[i] for i in indices)
+    for indices in bip_leaf_indices
+]
+
+df = pd.DataFrame(presence, index=tree_names, columns=col_labels)
+# e.g.  col "C|D|E" == 1 means the split {C,D,E}|rest is present in that tree
 ```

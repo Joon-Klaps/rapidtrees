@@ -521,18 +521,29 @@ impl Snapshots {
         id_to_col
     }
 
-    /// Build a flat row-major presence matrix `(n_trees × n_bip)` as `Vec<u8>`.
+    /// Build a flat row-major presence matrix `(n_trees × n_bip)` as `Vec<u8>`,
+    /// together with the bipartitions in the same column order.
+    ///
+    /// Returns `(presence_bytes, sorted_bipartitions)`:
+    /// - `presence_bytes`: flat `uint8` buffer, row-major, shape `(n_trees, n_bip)`
+    /// - `sorted_bipartitions`: bipartitions in ascending `Bitset` order, one per column
     ///
     /// Columns are in ascending `Bitset` order (stable across calls on the same tree set).
     /// Each byte is `1` if the split is present in that tree, `0` otherwise.
-    pub fn build_presence_matrix(&self) -> Vec<u8> {
+    pub fn build_presence_matrix(&self) -> (Vec<u8>, Vec<Bitset>) {
         let id_to_col = self.sorted_bip_id_to_col();
         let n_trees = self.snapshots.len();
         let n_bip = self.bipartitions.len();
         let mut presence = vec![0u8; n_trees * n_bip];
 
+        // Build sorted_bipartitions: one Bitset per column, in ascending Bitset order.
+        let mut sorted_bipartitions = vec![Bitset::zeros(self.words_per_bitset); n_bip];
+        for (id, bitset) in self.bipartitions.iter().enumerate() {
+            sorted_bipartitions[id_to_col[id]] = bitset.clone();
+        }
+
         if n_bip == 0 {
-            return presence; // No splits, return empty matrix
+            return (presence, sorted_bipartitions);
         }
 
         // Safely divide the mutable slice into row-sized chunks across threads
@@ -546,7 +557,7 @@ impl Snapshots {
                 }
             });
 
-        presence
+        (presence, sorted_bipartitions)
     }
 
     /// Compute all pairwise Robinson–Foulds distances as a symmetric n×n matrix.
@@ -1003,5 +1014,41 @@ mod tests {
         // Would be stored in snapshot with branch length 0.5
         let length = 0.5;
         assert_eq!(length, 0.5);
+    }
+
+    /// Verify that `build_presence_matrix` returns sorted_bipartitions in ascending Bitset order,
+    /// matching the column order of the presence bytes.
+    ///
+    /// T1 = ((A,B),(C,D)): bipartition {C,D} = bits 2,3 = value 12
+    /// T2 = ((A,C),(B,D)): bipartition {B,D} = bits 1,3 = value 10
+    /// Sorted: {B,D}(10) < {C,D}(12) → col 0 = {B,D}, col 1 = {C,D}
+    /// Presence: T1 has {C,D} → row [0,1]; T2 has {B,D} → row [1,0]
+    #[test]
+    fn test_build_presence_matrix_sorted() {
+        let snaps = Snapshots::from_newicks(
+            &["((A:1,B:1):1,(C:1,D:1):1);", "((A:1,C:1):1,(B:1,D:1):1);"],
+            false,
+        )
+        .unwrap();
+
+        // Leaf order: A=0, B=1, C=2, D=3
+        assert_eq!(snaps.leaf_names, vec!["A", "B", "C", "D"]);
+
+        let (presence, sorted_bips) = snaps.build_presence_matrix();
+        assert_eq!(sorted_bips.len(), 2);
+
+        // {B,D} has bits 1 and 3 set → value = (1<<1)|(1<<3) = 10
+        // {C,D} has bits 2 and 3 set → value = (1<<2)|(1<<3) = 12
+        // sorted: col 0 = {B,D}, col 1 = {C,D}
+        let col0_bits = sorted_bips[0].0[0];
+        let col1_bits = sorted_bips[1].0[0];
+        assert_eq!(col0_bits, 0b1010, "col 0 should be {{B,D}} = 0b1010 = 10");
+        assert_eq!(col1_bits, 0b1100, "col 1 should be {{C,D}} = 0b1100 = 12");
+
+        // Presence matrix: T1 row=[0,1], T2 row=[1,0]
+        assert_eq!(presence[0], 0, "T1,col0 ({{B,D}}): absent");
+        assert_eq!(presence[1], 1, "T1,col1 ({{C,D}}): present");
+        assert_eq!(presence[2], 1, "T2,col0 ({{B,D}}): present");
+        assert_eq!(presence[3], 0, "T2,col1 ({{C,D}}): absent");
     }
 }

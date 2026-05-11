@@ -11,7 +11,14 @@ use std::collections::HashMap;
 
 use crate::snapshot::Snapshots;
 
-type PyRfSnapshotResult = (Vec<String>, Py<PyAny>, Vec<String>, usize, Py<PyAny>);
+type PyRfSnapshotResult = (
+    Vec<String>,
+    Py<PyAny>,
+    Vec<String>,
+    usize,
+    Py<PyAny>,
+    Vec<Vec<u32>>,
+);
 
 /// Collect tree snapshots from a lazy Python iterator of newick strings.
 fn collect_snapshots_from_iter(
@@ -125,6 +132,39 @@ fn pairwise_rf_from_newick_iter(
 /// presence = np.frombuffer(pres_bytes, dtype=np.uint8).reshape(n_trees, n_bip).copy()
 /// ```
 ///
+/// # Bipartition leaf indices
+///
+/// `bipartition_leaf_indices` is a list of length `n_bipartitions`. Each entry is a list
+/// of integer indices into `leaf_names` identifying the leaves on the canonical side of
+/// that bipartition. For unrooted trees the canonical side is defined as the half that
+/// does not contain the first leaf alphabetically.
+///
+/// Use it to build human-readable column labels for the presence matrix:
+/// ```python
+/// col_labels = [
+///     "|".join(leaf_names[i] for i in indices)
+///     for indices in bipartition_leaf_indices
+/// ]
+/// ```
+///
+/// For post-hoc analysis with pandas, construct a named DataFrame directly:
+/// ```python
+/// import pandas as pd
+/// import numpy as np
+///
+/// tree_names, rf_bytes, leaf_names, n_bip, pres_bytes, bip_leaf_indices = (
+///     pairwise_rf_with_snapshots_from_newick_iter(...)
+/// )
+/// presence = np.frombuffer(pres_bytes, dtype=np.uint8).reshape(len(tree_names), n_bip).copy()
+/// col_labels = [
+///     "|".join(leaf_names[i] for i in indices)
+///     for indices in bip_leaf_indices
+/// ]
+/// df = pd.DataFrame(presence, index=tree_names, columns=col_labels)
+/// # Each column is now a named bipartition, e.g. "C|D|E", and each row is a tree.
+/// # Columns that vary across trees (df.std() > 0) are the informative splits.
+/// ```
+///
 /// Args:
 ///     names: Tree identifiers (one per newick).
 ///     newick_iter: Python iterator yielding newick strings.
@@ -133,7 +173,8 @@ fn pairwise_rf_from_newick_iter(
 ///     rooted: If True compare clades; if False compare bipartitions (default: False).
 ///
 /// Returns:
-///     5-tuple (tree_names, rf_matrix_bytes, leaf_names, n_bipartitions, presence_bytes).
+///     6-tuple (tree_names, rf_matrix_bytes, leaf_names, n_bipartitions, presence_bytes,
+///     bipartition_leaf_indices).
 ///
 /// Raises:
 ///     ValueError: If fewer than 2 trees, leaf sets differ, or argument lengths mismatch.
@@ -158,8 +199,18 @@ fn pairwise_rf_with_snapshots_from_newick_iter(
         .collect();
 
     let n_bipartitions = snaps.bipartitions.len();
-    let presence_vec = snaps.build_presence_matrix();
+    let (presence_vec, sorted_bipartitions) = snaps.build_presence_matrix();
     let leaf_names = snaps.leaf_names.clone();
+    let n_leaves = leaf_names.len();
+    let bipartition_leaf_indices: Vec<Vec<u32>> = sorted_bipartitions
+        .iter()
+        .map(|bitset| {
+            (0..n_leaves)
+                .filter(|&i| bitset.get(i))
+                .map(|i| i as u32)
+                .collect()
+        })
+        .collect();
 
     let py_rf = PyBytes::new(py, &rf_bytes);
     let py_pres = PyBytes::new(py, &presence_vec);
@@ -169,6 +220,7 @@ fn pairwise_rf_with_snapshots_from_newick_iter(
         leaf_names,
         n_bipartitions,
         py_pres.into(),
+        bipartition_leaf_indices,
     ))
 }
 
