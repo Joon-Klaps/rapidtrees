@@ -189,7 +189,7 @@ rapidtrees \
 | Function | Returns |
 | --- | --- |
 | `pairwise_rf_from_newick_iter` | `(names, bytes)` — RF matrix as flat `uint32` bytes, row-major |
-| `pairwise_rf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes)` — RF + bipartition presence matrix |
+| `pairwise_rf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, list[list[int]])` — RF + presence matrix + bipartition leaf indices |
 | `pairwise_wrf_from_newick_iter` | `(names, list[float])` — Weighted RF, flat row-major |
 | `pairwise_kf_from_newick_iter` | `(names, list[float])` — Kuhner-Felsenstein, flat row-major |
 
@@ -280,7 +280,7 @@ matrix in memory without writing a file — see the [Python API section](#-pytho
 import rapidtrees as rtd
 import numpy as np
 
-tree_names, rf_bytes, leaf_names, n_bip, pres_bytes = (
+tree_names, rf_bytes, leaf_names, n_bip, pres_bytes, bip_leaf_indices = (
     rtd.pairwise_rf_with_snapshots_from_newick_iter(
         names, iter(newicks), translate_maps, map_indices
     )
@@ -293,6 +293,11 @@ global_freq = presence.mean(axis=0)
 
 # RF distance between any two trees — no recomputation needed
 rf_01 = int((presence[0].astype(int) ^ presence[1].astype(int)).sum())
+
+# Named presence matrix — each column labelled with its bipartition's leaf set
+col_labels = ["|".join(leaf_names[i] for i in indices) for indices in bip_leaf_indices]
+import pandas as pd
+df = pd.DataFrame(presence, index=tree_names, columns=col_labels)
 ```
 
 ---

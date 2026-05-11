@@ -521,18 +521,31 @@ impl Snapshots {
         id_to_col
     }
 
-    /// Build a flat row-major presence matrix `(n_trees × n_bip)` as `Vec<u8>`.
+    /// Build a flat row-major presence matrix `(n_trees × n_bip)` as `Vec<u8>`,
+    /// together with a column-order index into `self.bipartitions`.
+    ///
+    /// Returns `(presence_bytes, col_to_bip_id)`:
+    /// - `presence_bytes`: flat `uint8` buffer, row-major, shape `(n_trees, n_bip)`
+    /// - `col_to_bip_id`: `col_to_bip_id[col]` is the index into `self.bipartitions`
+    ///   for that column, in ascending `Bitset` order
     ///
     /// Columns are in ascending `Bitset` order (stable across calls on the same tree set).
     /// Each byte is `1` if the split is present in that tree, `0` otherwise.
-    pub fn build_presence_matrix(&self) -> Vec<u8> {
+    pub fn build_presence_matrix(&self) -> (Vec<u8>, Vec<usize>) {
         let id_to_col = self.sorted_bip_id_to_col();
         let n_trees = self.snapshots.len();
         let n_bip = self.bipartitions.len();
         let mut presence = vec![0u8; n_trees * n_bip];
 
+        // Invert id_to_col: col_to_bip_id[col] = original bipartition ID.
+        // Returns a cheap Vec<usize> instead of cloning the Bitsets themselves.
+        let mut col_to_bip_id = vec![0usize; n_bip];
+        for (id, &col) in id_to_col.iter().enumerate() {
+            col_to_bip_id[col] = id;
+        }
+
         if n_bip == 0 {
-            return presence; // No splits, return empty matrix
+            return (presence, col_to_bip_id);
         }
 
         // Safely divide the mutable slice into row-sized chunks across threads
@@ -546,7 +559,38 @@ impl Snapshots {
                 }
             });
 
-        presence
+        (presence, col_to_bip_id)
+    }
+
+    /// Export canonical bipartition bitmasks as a flat byte buffer.
+    ///
+    /// Shape: `(n_bip, ceil(n_leaves / 8))` bytes, row-major, in ascending `Bitset`
+    /// (column) order — matching the column order of [`build_presence_matrix`].
+    ///
+    /// Bit `i` of row `j`, using **little-endian bit order within each byte**, is `1`
+    /// if `leaf_names[i]` is on the canonical side of bipartition `j`.
+    ///
+    /// Decode on the Python side:
+    /// ```python
+    /// bytes_per_bip = math.ceil(len(leaf_names) / 8)
+    /// bip_arr  = np.frombuffer(bip_bytes, dtype=np.uint8).reshape(n_bip, bytes_per_bip)
+    /// bip_bool = np.unpackbits(bip_arr, axis=1, bitorder='little')[:, :len(leaf_names)]
+    /// # bip_bool[j, i] == 1  →  leaf_names[i] is on the canonical side of bipartition j
+    /// ```
+    pub fn build_bipartition_bytes(&self, col_to_bip_id: &[usize]) -> Vec<u8> {
+        let n_leaves = self.leaf_names.len();
+        let bytes_per_bip = n_leaves.div_ceil(8);
+        let mut out = Vec::with_capacity(col_to_bip_id.len() * bytes_per_bip);
+        for &id in col_to_bip_id {
+            let bip = &self.bipartitions[id];
+            out.extend(
+                bip.0
+                    .iter()
+                    .flat_map(|&word| word.to_le_bytes())
+                    .take(bytes_per_bip),
+            );
+        }
+        out
     }
 
     /// Compute all pairwise Robinson–Foulds distances as a symmetric n×n matrix.
@@ -1003,5 +1047,67 @@ mod tests {
         // Would be stored in snapshot with branch length 0.5
         let length = 0.5;
         assert_eq!(length, 0.5);
+    }
+
+    /// Verify that `build_bipartition_bytes` exports canonical bitmasks correctly.
+    ///
+    /// T1 = ((A,B),(C,D)): bipartition {C,D} = bits 2,3  → byte 0b00001100 = 0x0C
+    /// T2 = ((A,C),(B,D)): bipartition {B,D} = bits 1,3  → byte 0b00001010 = 0x0A
+    /// Sorted: {B,D}(0x0A) < {C,D}(0x0C) → col 0 = {B,D}, col 1 = {C,D}
+    /// bip_bytes = [0x0A, 0x0C]  (one byte each for 4-leaf trees)
+    #[test]
+    fn test_build_bipartition_bytes() {
+        let snaps = Snapshots::from_newicks(
+            &["((A:1,B:1):1,(C:1,D:1):1);", "((A:1,C:1):1,(B:1,D:1):1);"],
+            false,
+        )
+        .unwrap();
+
+        let (_, col_to_bip_id) = snaps.build_presence_matrix();
+        let bip_bytes = snaps.build_bipartition_bytes(&col_to_bip_id);
+
+        // 2 bipartitions × ceil(4/8) = 1 byte each → 2 bytes total
+        assert_eq!(bip_bytes.len(), 2);
+
+        // col 0 = {B,D}: bits 1 and 3 set → 0b00001010 = 0x0A
+        assert_eq!(bip_bytes[0], 0x0A, "col 0 should be {{B,D}} = 0x0A");
+        // col 1 = {C,D}: bits 2 and 3 set → 0b00001100 = 0x0C
+        assert_eq!(bip_bytes[1], 0x0C, "col 1 should be {{C,D}} = 0x0C");
+    }
+
+    /// Verify that `build_presence_matrix` returns col_to_bip_id in ascending Bitset order,
+    /// matching the column order of the presence bytes.
+    ///
+    /// T1 = ((A,B),(C,D)): bipartition {C,D} = bits 2,3 = value 12
+    /// T2 = ((A,C),(B,D)): bipartition {B,D} = bits 1,3 = value 10
+    /// Sorted: {B,D}(10) < {C,D}(12) → col 0 = {B,D}, col 1 = {C,D}
+    /// Presence: T1 has {C,D} → row [0,1]; T2 has {B,D} → row [1,0]
+    #[test]
+    fn test_build_presence_matrix_sorted() {
+        let snaps = Snapshots::from_newicks(
+            &["((A:1,B:1):1,(C:1,D:1):1);", "((A:1,C:1):1,(B:1,D:1):1);"],
+            false,
+        )
+        .unwrap();
+
+        // Leaf order: A=0, B=1, C=2, D=3
+        assert_eq!(snaps.leaf_names, vec!["A", "B", "C", "D"]);
+
+        let (presence, col_to_bip_id) = snaps.build_presence_matrix();
+        assert_eq!(col_to_bip_id.len(), 2);
+
+        // {B,D} has bits 1 and 3 set → value = (1<<1)|(1<<3) = 10
+        // {C,D} has bits 2 and 3 set → value = (1<<2)|(1<<3) = 12
+        // sorted: col 0 = {B,D}, col 1 = {C,D}
+        let col0_bits = snaps.bipartitions[col_to_bip_id[0]].0[0];
+        let col1_bits = snaps.bipartitions[col_to_bip_id[1]].0[0];
+        assert_eq!(col0_bits, 0b1010, "col 0 should be {{B,D}} = 0b1010 = 10");
+        assert_eq!(col1_bits, 0b1100, "col 1 should be {{C,D}} = 0b1100 = 12");
+
+        // Presence matrix: T1 row=[0,1], T2 row=[1,0]
+        assert_eq!(presence[0], 0, "T1,col0 ({{B,D}}): absent");
+        assert_eq!(presence[1], 1, "T1,col1 ({{C,D}}): present");
+        assert_eq!(presence[2], 1, "T2,col0 ({{B,D}}): present");
+        assert_eq!(presence[3], 0, "T2,col1 ({{C,D}}): absent");
     }
 }

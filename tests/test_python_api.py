@@ -939,7 +939,7 @@ class TestPairwiseRFFromNewickIter:
 
 
 class TestPairwiseRFWithSnapshots:
-    """Tests for pairwise_rf_with_snapshots_from_newick_iter (5-tuple API)."""
+    """Tests for pairwise_rf_with_snapshots_from_newick_iter (6-tuple API)."""
 
     def _call(self, **kwargs):
         defaults = dict(
@@ -951,16 +951,17 @@ class TestPairwiseRFWithSnapshots:
         defaults.update(kwargs)
         return rtd.pairwise_rf_with_snapshots_from_newick_iter(**defaults)
 
-    def test_returns_five_tuple(self):
-        """Function returns a 5-tuple with the correct types."""
+    def test_returns_six_tuple(self):
+        """Function returns a 6-tuple with the correct types."""
         result = self._call()
-        assert len(result) == 5
-        names, rf_bytes, leaf_names, n_bip, pres_bytes = result
+        assert len(result) == 6
+        names, rf_bytes, leaf_names, n_bip, pres_bytes, bip_clade_bytes = result
         assert isinstance(names, list)
         assert isinstance(rf_bytes, bytes)
         assert isinstance(leaf_names, list)
         assert isinstance(n_bip, int)
         assert isinstance(pres_bytes, bytes)
+        assert isinstance(bip_clade_bytes, bytes)
 
     def test_rf_bytes_known_values(self):
         """rf_bytes decodes to the known RF matrix."""
@@ -973,7 +974,7 @@ class TestPairwiseRFWithSnapshots:
 
     def test_presence_bytes_shape_and_range(self):
         """presence_bytes encodes an n_trees × n_bip uint8 matrix of 0s and 1s."""
-        names, _, _, n_bip, pres_bytes = self._call()
+        names, _, _, n_bip, pres_bytes, *_ = self._call()
         n = len(names)
         assert len(pres_bytes) == n * n_bip
         presence = np.frombuffer(pres_bytes, dtype=np.uint8).reshape(n, n_bip)
@@ -981,7 +982,7 @@ class TestPairwiseRFWithSnapshots:
 
     def test_xor_identity(self):
         """sum(presence[i] XOR presence[j]) equals RF(i, j) for every pair."""
-        names, rf_bytes, _, n_bip, pres_bytes = self._call()
+        names, rf_bytes, _, n_bip, pres_bytes, *_ = self._call()
         n = len(names)
         rf = np.frombuffer(rf_bytes, dtype=np.uint32).reshape(n, n)
         presence = np.frombuffer(pres_bytes, dtype=np.uint8).reshape(n, n_bip).astype(np.int32)
@@ -1001,7 +1002,7 @@ class TestPairwiseRFWithSnapshots:
 
     def test_leaf_names_sorted(self):
         """Returned leaf names must be sorted alphabetically."""
-        _, _, leaf_names, _, _ = self._call()
+        _, _, leaf_names, *_ = self._call()
         assert leaf_names == sorted(leaf_names)
 
     def test_deterministic(self):
@@ -1013,6 +1014,260 @@ class TestPairwiseRFWithSnapshots:
         assert r1[2] == r2[2]  # leaf_names
         assert r1[3] == r2[3]  # n_bip
         assert r1[4] == r2[4]  # presence_bytes
+        assert r1[5] == r2[5]  # bip_clade_bytes
+
+    def test_bip_clade_bytes_length(self):
+        """bip_clade_bytes has exactly n_bip * ceil(n_leaves/8) bytes."""
+        _, _, leaf_names, n_bip, _, bip_clade_bytes = self._call()
+        bytes_per_bip = (len(leaf_names) + 7) // 8
+        assert len(bip_clade_bytes) == n_bip * bytes_per_bip
+
+    def test_bip_clade_bytes_valid_range(self):
+        """No padding bits beyond n_leaves are set, and every row has ≥ 2 leaves."""
+        _, _, leaf_names, n_bip, _, bip_clade_bytes = self._call()
+        n_leaves = len(leaf_names)
+        bytes_per_bip = (n_leaves + 7) // 8
+        bip_arr = np.frombuffer(bip_clade_bytes, dtype=np.uint8).reshape(n_bip, bytes_per_bip)
+        bip_bool = np.unpackbits(bip_arr, axis=1, bitorder='little')
+        # padding bits (columns >= n_leaves) must all be zero
+        assert np.all(bip_bool[:, n_leaves:] == 0), "padding bits must be zero"
+        # each bipartition has at least 2 leaves on its canonical side
+        assert np.all(bip_bool[:, :n_leaves].sum(axis=1) >= 2)
+
+    def test_bip_clade_bytes_canonical_side_excludes_first_leaf(self):
+        """In unrooted mode bit 0 (first leaf) is never set in any bipartition row."""
+        _, _, _, n_bip, _, bip_clade_bytes = self._call()
+        # bit 0 of the first byte of every row encodes leaf index 0
+        bip_arr = np.frombuffer(bip_clade_bytes, dtype=np.uint8)
+        bytes_per_bip = len(bip_clade_bytes) // n_bip
+        first_bytes = bip_arr[::bytes_per_bip]
+        assert np.all(first_bytes & 0x01 == 0), "Canonical side must not contain leaf 0 (unrooted)"
+
+    def test_bip_clade_bytes_decode_to_valid_names(self):
+        """Decoded leaf names for each bipartition are a non-empty subset of the full leaf set."""
+        _, _, leaf_names, n_bip, _, bip_clade_bytes = self._call()
+        n_leaves = len(leaf_names)
+        bytes_per_bip = (n_leaves + 7) // 8
+        bip_arr = np.frombuffer(bip_clade_bytes, dtype=np.uint8).reshape(n_bip, bytes_per_bip)
+        bip_bool = np.unpackbits(bip_arr, axis=1, bitorder='little')[:, :n_leaves]
+        leaf_set = set(leaf_names)
+        for j in range(n_bip):
+            names_for_bip = {leaf_names[i] for i in np.where(bip_bool[j])[0]}
+            assert names_for_bip <= leaf_set
+            assert len(names_for_bip) >= 2
+    def test_bip_clade_bytes_simple_tree(self):
+        """On a known 4-leaf tree, verify exact canonical-side bitmasks.
+
+        Trees: ((A,B),(C,D))  and  ((A,C),(B,D))
+        leaf_names = [A, B, C, D]  →  indices 0,1,2,3
+        Bipartitions (sorted ascending):
+          col 0: {B,D}  bits 1,3 → byte = 0b00001010 = 0x0A
+          col 1: {C,D}  bits 2,3 → byte = 0b00001100 = 0x0C
+        """
+        trees = ["((A,B),(C,D));", "((A,C),(B,D));"]
+        names = ["t0", "t1"]
+        result = rtd.pairwise_rf_with_snapshots_from_newick_iter(names, iter(trees), [{}], [0, 0])
+        _, _, leaf_names, n_bip, _, bip_clade_bytes = result
+        assert leaf_names == ["A", "B", "C", "D"]
+        n_leaves = len(leaf_names)
+        bytes_per_bip = (n_leaves + 7) // 8
+        bip_arr = np.frombuffer(bip_clade_bytes, dtype=np.uint8).reshape(n_bip, bytes_per_bip)
+        bip_bool = np.unpackbits(bip_arr, axis=1, bitorder='little')[:, :n_leaves]
+        decoded = [sorted(leaf_names[i] for i in np.where(bip_bool[j])[0]) for j in range(n_bip)]
+        # Both canonical sides have 2 leaves and exclude 'A'
+        assert all(len(d) == 2 for d in decoded)
+        assert all("A" not in d for d in decoded)
+        assert sorted(decoded) == [["B", "D"], ["C", "D"]]
+
+    def test_bip_clade_bytes_large_complex_trees(self):
+        """
+        Verify bipartition canonicalization on 3 heterogeneous 15-leaf trees.
+        Checks that canonical-side bitmasks correctly reflect each topology and
+        that bipartitions shared across trees are not duplicated.
+        """
+        # t0 — right-caterpillar, uniform cherry pairing
+        #  ·
+        #  ├── ·
+        #  │   ├── (A,B)
+        #  │   └── ·
+        #  │       ├── (C,D)
+        #  │       └── ·
+        #  │           ├── (E,F)
+        #  │           └── ·
+        #  │               ├── ·  {G,H,I,J}
+        #  │               │   ├── (G,H)
+        #  │               │   └── (I,J)
+        #  │               └── ·  {K,L,M,N}
+        #  │                   ├── (K,L)
+        #  │                   └── (M,N)
+        #  └── O
+        T0 = "(((A,B),((C,D),((E,F),(((G,H),(I,J)),((K,L),(M,N)))))),O);"
+
+        # t1 — same caterpillar backbone; cherries cross-paired
+        #   (C,E) instead of (C,D)     (D,F) instead of (E,F)
+        #   (G,I)/(H,J) instead of (G,H)/(I,J)
+        #   (K,M)/(L,N) instead of (K,L)/(M,N)
+        T1 = "(((A,B),((C,E),((D,F),(((G,I),(H,J)),((K,M),(L,N)))))),O);"
+
+        # t2 — balanced: {A–F} and {G–N} are sister clades under the root
+        #  ·
+        #  ├── ·
+        #  │   ├── ·  {A,B,C,D,E,F}
+        #  │   │   ├── (A,B)
+        #  │   │   └── ·  {C,D,E,F}
+        #  │   │       ├── (C,D)
+        #  │   │       └── (E,F)
+        #  │   └── ·  {G,H,I,J,K,L,M,N}
+        #  │       ├── ·  {G,H,I,J,K,L}
+        #  │       │   ├── (G,H)
+        #  │       │   └── ·  {I,J,K,L}
+        #  │       │       ├── (I,J)
+        #  │       │       └── (K,L)
+        #  │       └── (M,N)
+        #  └── O
+        T2 = "((((A,B),((C,D),(E,F))),(((G,H),((I,J),(K,L))),(M,N))),O);"
+
+        _, _, leaf_names, n_bip, _, bip_clade_bytes = (
+            rtd.pairwise_rf_with_snapshots_from_newick_iter(
+                ["t0", "t1", "t2"], iter([T0, T1, T2]), [{}], [0, 0, 0]
+            )
+        )
+
+        assert leaf_names == list("ABCDEFGHIJKLMNO")
+
+        # Decode bitmasks → frozensets of taxon names for set comparison
+        n_leaves = len(leaf_names)
+        bytes_per_bip = (n_leaves + 7) // 8
+        bip_arr = np.frombuffer(bip_clade_bytes, dtype=np.uint8).reshape(n_bip, bytes_per_bip)
+        bip_bool = np.unpackbits(bip_arr, axis=1, bitorder='little')[:, :n_leaves]
+        decoded = {frozenset(leaf_names[i] for i in np.where(row)[0]) for row in bip_bool}
+
+        def s(*leaves):
+            return frozenset(leaves)
+
+        # Expected canonical bipartitions (side NOT containing 'A').
+        # 15 leaves → 12 internal edges per tree.  After dedup: 23 unique.
+        expected = {
+            # ── shared by all three trees ──────────────────────────────────
+            s(*"CDEFGHIJKLMNO"),  # canonical of {A,B} | rest
+            s(*"GHIJKLMN"),       # {G–N} clade
+
+            # ── shared by t0 and t1 (same {A,B,O} placement) ──────────────
+            s(*"CDEFGHIJKLMN"),   # canonical of {A,B,O} | rest
+            s(*"GHIJ"),
+            s(*"KLMN"),
+
+            # ── shared by t0 and t2 (same small cherries) ─────────────────
+            s(*"CD"), s(*"EF"), s(*"GH"), s(*"IJ"), s(*"KL"), s(*"MN"),
+
+            # ── unique to t0 ───────────────────────────────────────────────
+            s(*"EFGHIJKLMN"),     # {E–N} clade
+
+            # ── unique to t1 (cross-pairing shifts mid clades) ────────────
+            s(*"CE"), s(*"DF"), s(*"GI"), s(*"HJ"), s(*"KM"), s(*"LN"),
+            s(*"DFGHIJKLMN"),     # {D,F,G–N} clade
+
+            # ── unique to t2 (balanced topology, new upper bipartitions) ───
+            s(*"CDEF"),           # {C,D,E,F} clade
+            s(*"IJKL"),
+            s(*"GHIJKL"),
+            s(*"GHIJKLMNO"),      # canonical of {A,B,C,D,E,F} | rest
+        }
+
+        assert decoded == expected
+
+    def test_bip_presence_matrix_matches_topology(self):
+        """
+        For the same 3 heterogeneous trees, verify that every column of the
+        presence/absence matrix has exactly the 0/1 pattern dictated by the
+        topology — i.e. which trees actually contain each bipartition.
+
+        Expected presence table (rows = t0/t1/t2, cols = bipartitions):
+
+          Bipartition                          t0  t1  t2
+          {C,D}                                 1   0   1
+          {C,E}                                 0   1   0
+          {D,F}                                 0   1   0
+          {E,F}                                 1   0   1
+          {G,H}                                 1   0   1
+          {G,I}                                 0   1   0
+          {H,J}                                 0   1   0
+          {I,J}                                 1   0   1
+          {K,L}                                 1   0   1
+          {K,M}                                 0   1   0
+          {L,N}                                 0   1   0
+          {M,N}                                 1   0   1
+          {C,D,E,F}                             0   0   1
+          {G,H,I,J}                             1   1   0
+          {I,J,K,L}                             0   0   1
+          {K,L,M,N}                             1   1   0
+          {G,H,I,J,K,L}                         0   0   1
+          {G,H,I,J,K,L,M,N}                     1   1   1
+          {G,H,I,J,K,L,M,N,O}                   0   0   1
+          {D,F,G,H,I,J,K,L,M,N}                 0   1   0
+          {E,F,G,H,I,J,K,L,M,N}                 1   0   0
+          {C,D,E,F,G,H,I,J,K,L,M,N}             1   1   0
+          {C,D,E,F,G,H,I,J,K,L,M,N,O}           1   1   1
+        """
+        T0 = "(((A,B),((C,D),((E,F),(((G,H),(I,J)),((K,L),(M,N)))))),O);"
+        T1 = "(((A,B),((C,E),((D,F),(((G,I),(H,J)),((K,M),(L,N)))))),O);"
+        T2 = "((((A,B),((C,D),(E,F))),(((G,H),((I,J),(K,L))),(M,N))),O);"
+
+        _, _, leaf_names, n_bip, pres_bytes, bip_clade_bytes = (
+            rtd.pairwise_rf_with_snapshots_from_newick_iter(
+                ["t0", "t1", "t2"], iter([T0, T1, T2]), [{}], [0, 0, 0]
+            )
+        )
+
+        presence = np.frombuffer(pres_bytes, dtype=np.uint8).reshape(3, n_bip).copy()
+
+        # Decode bitmasks and map each bipartition frozenset → its column index
+        n_leaves = len(leaf_names)
+        bytes_per_bip = (n_leaves + 7) // 8
+        bip_arr = np.frombuffer(bip_clade_bytes, dtype=np.uint8).reshape(n_bip, bytes_per_bip)
+        bip_bool = np.unpackbits(bip_arr, axis=1, bitorder='little')[:, :n_leaves]
+        col_for = {
+            frozenset(leaf_names[i] for i in np.where(bip_bool[col])[0]): col
+            for col in range(n_bip)
+        }
+
+        def s(*leaves):
+            return frozenset(leaves)
+
+        def assert_col(bip, expected_row):
+            col = col_for[bip]
+            actual = list(presence[:, col])
+            assert actual == expected_row, (
+                f"Bipartition {{{','.join(sorted(bip))}}}: "
+                f"expected {expected_row}, got {actual}"
+            )
+
+        # present in all three trees
+        assert_col(s(*"CDEFGHIJKLMNO"), [1, 1, 1])  # canonical of {A,B} | rest
+        assert_col(s(*"GHIJKLMN"),      [1, 1, 1])  # {G–N} clade
+
+        # present in t0 and t1 only (same {A,B,O} placement, same deep clades)
+        assert_col(s(*"CDEFGHIJKLMN"),  [1, 1, 0])  # canonical of {A,B,O} | rest
+        assert_col(s(*"GHIJ"),          [1, 1, 0])
+        assert_col(s(*"KLMN"),          [1, 1, 0])
+
+        # present in t0 and t2 only (same small cherries)
+        for bip in [s(*"CD"), s(*"EF"), s(*"GH"), s(*"IJ"), s(*"KL"), s(*"MN")]:
+            assert_col(bip, [1, 0, 1])
+
+        # present in t0 only
+        assert_col(s(*"EFGHIJKLMN"),    [1, 0, 0])  # {E–N} clade
+
+        # present in t1 only (cross-paired cherries produce distinct mid clades)
+        for bip in [s(*"CE"), s(*"DF"), s(*"GI"), s(*"HJ"), s(*"KM"), s(*"LN")]:
+            assert_col(bip, [0, 1, 0])
+        assert_col(s(*"DFGHIJKLMN"),    [0, 1, 0])  # {D,F,G–N} clade
+
+        # present in t2 only (balanced topology, new upper-level bipartitions)
+        assert_col(s(*"CDEF"),          [0, 0, 1])
+        assert_col(s(*"IJKL"),          [0, 0, 1])
+        assert_col(s(*"GHIJKL"),        [0, 0, 1])
+        assert_col(s(*"GHIJKLMNO"),     [0, 0, 1])  # canonical of {A,B,C,D,E,F} | rest
 
 
 if __name__ == "__main__":
