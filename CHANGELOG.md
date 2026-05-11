@@ -8,17 +8,22 @@ This project uses release names based on random words from [codenamegenerator.co
     - PREFIX: Microsoft Corperation
     - DICTIONARY: Snakes
 
-## [0.5.0] - (YYY-MM-DD)
 
-- Replace `bipartition_leaf_indices: list[list[int]]` with `bipartition_clade_bytes: bytes` in the return value of `pairwise_rf_with_snapshots_from_newick_iter` ([#8](https://github.com/Joon-Klaps/rapidtrees/pull/8)). The new field is a packed bitmask buffer of shape `(n_bip, ceil(n_leaves/8))` — decode with `np.unpackbits(..., bitorder='little')`. This representation is more compact (up to 16× smaller for large trees) and has zero Python object overhead.
+## [0.5.1] - (YYYY-MM-DD)
+
+- wRF and KF distances now match phangorn ([#9](https://github.com/Joon-Klaps/rapidtrees/pull/9)).
+
+## [0.5.0] - Obsidian Sidewinder (2026-05-11)
+
+- Add `bipartition_clade_bytes: bytes` in the return value of `pairwise_rf_with_snapshots_from_newick_iter` ([#8](https://github.com/Joon-Klaps/rapidtrees/pull/8)). The new field is a packed bitmask buffer of shape `(n_bip, ceil(n_leaves/8))` — decode with `np.unpackbits(..., bitorder='little')`. This representation is more compact (up to 16× smaller for large trees) and has zero Python object overhead.
 
 
-## [0.4.0] - Xbox Treeboa (2025-05-01)
+## [0.4.0] - Xbox Treeboa (2026-05-01)
 
 - Interned snapshots for faster RF by @hongsamL in https://github.com/Joon-Klaps/rapidtrees/pull/4
 - Export tree snapshots by @Joon-Klaps in https://github.com/Joon-Klaps/rapidtrees/pull/3
 
-## [0.3.0] - Gale Sidewinder (2025-03-03)
+## [0.3.0] - Gale Sidewinder (2026-03-03)
 
 Release with API changes for compatibility with `treetracer`
 

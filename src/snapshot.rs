@@ -59,18 +59,20 @@ thread_local! {
 /// panic — that is a programming error.
 ///
 /// # Fields
-/// - `parts`: bipartitions, canonicalized and sorted ascending for O(m+n) merge
+/// - `parts`: all edges (internal bipartitions + pendant edges), canonicalized
+///   and sorted ascending for O(m+n) merge
 /// - `lengths`: branch lengths parallel to `parts`
 /// - `leaf_names`: alphabetically sorted taxon names (defines the bit ordering)
 /// - `words`: number of u64 words per bitset
 ///
 /// # Canonicalization
-/// Each bipartition can be represented as two complementary bitsets.
+/// Each internal bipartition can be represented as two complementary bitsets.
 /// We always store the side that does NOT contain the first leaf (index 0)
 /// so identical splits always have identical bitset representations.
+/// Pendant edges are stored as-is (single-bit bitsets, no flip needed).
 #[derive(Debug, Clone)]
 pub struct Snapshot {
-    /// All bipartitions, canonicalized and sorted ascending.
+    /// All edges (internal bipartitions + pendant edges), canonicalized and sorted ascending.
     pub(crate) parts: Vec<Bitset>,
 
     /// Branch lengths, parallel to `parts`.
@@ -148,7 +150,7 @@ impl Snapshot {
             cache.reserve(num_leaves * 2);
             Self::compute_bitsets(root_id, tree, &node_id_to_leaf_index, words, &mut cache)?;
 
-            // Step 4: Collect partitions (with or without trivial partitions)
+            // Step 4: Collect partitions (internal bipartitions + pendant edges)
             let (parts, lengths) = Self::collect_partitions(tree, root_id, &cache)?;
 
             // Step 5: Canonicalize partitions
@@ -208,14 +210,10 @@ impl Snapshot {
         Ok(bitset)
     }
 
-    /// Collect all non-trivial partitions and their branch lengths.
-    ///
-    /// # Parameters
-    /// - `include_trivial`: If true, includes single-leaf partitions (needed for weighted metrics)
+    /// Collect all partitions (internal bipartitions and pendant edges) with branch lengths.
     ///
     /// # What we skip
     /// - Root node (doesn't create a bipartition)
-    /// - Trivial partitions (single leaf) - unless `include_trivial` is true
     ///
     /// # Branch lengths
     /// Some trees may have missing branch lengths.
@@ -227,7 +225,7 @@ impl Snapshot {
     ) -> Result<(Vec<Bitset>, Vec<f64>), TreeError> {
         cache
             .iter()
-            .filter(|(node_id, bitset)| **node_id != root_id && bitset.count_ones() > 1)
+            .filter(|(node_id, _)| **node_id != root_id)
             .map(|(node_id, bitset)| {
                 let length = tree.get(node_id)?.parent_edge.unwrap_or(0.0);
                 Ok((bitset.clone(), length))
@@ -300,31 +298,34 @@ impl Snapshot {
         }
 
         // Unrooted bipartition mode: canonicalize, filter trivials, dedup.
-        // Build pairs of (canonical_bitset, length), filtering trivial splits
+        //
+        // Three cases, decided by ones_before (count before any flip):
+        //   ones_before == 1              → pendant edge: keep as single-bit bitset,
+        //                                   no canonicalization needed.
+        //   ones_before >= num_leaves - 1 → near-full complement of a pendant edge;
+        //                                   filter out (the pendant itself is captured above).
+        //   otherwise                     → internal bipartition: store the side that
+        //                                   does NOT contain leaf 0.
         let mut pairs: Vec<(Bitset, f64)> = parts
             .into_iter()
             .zip(lengths)
             .filter_map(|(bitset, length)| {
-                // Check if leaf 0 (bit 0 of word 0) is set
-                let leaf_0_is_set = (bitset.0[0] & 1) != 0;
+                let ones_before = bitset.count_ones();
 
+                if ones_before == 1 {
+                    return Some((bitset, length));
+                }
+
+                if ones_before >= num_leaves - 1 {
+                    return None;
+                }
+
+                let leaf_0_is_set = (bitset.0[0] & 1) != 0;
                 let canonical_bitset = if leaf_0_is_set {
-                    // Flip to complement (side without leaf 0)
                     Self::compute_complement(&bitset, words, num_leaves)
                 } else {
-                    // Already canonical (leaf 0 not in this side)
                     bitset
                 };
-
-                // Filter trivial bipartitions: a split is trivial if either
-                // side has ≤ 1 leaf.  The canonical form stores the side
-                // without leaf 0, so check both sides:
-                //   canonical side:   count_ones
-                //   complement side:  num_leaves - count_ones
-                let ones = canonical_bitset.count_ones();
-                if ones <= 1 || ones >= num_leaves - 1 {
-                    return None; // trivial split
-                }
 
                 Some((canonical_bitset, length))
             })
@@ -746,12 +747,12 @@ mod tests {
         let tree = PhyloTree::from_newick("((A:1,B:1):1,(C:1,D:1):1);").unwrap();
         let snap = Snapshot::from_tree(&tree, false).unwrap();
 
-        // For 4 leaves, an unrooted binary tree has L-3 = 1 non-trivial bipartition.
-        // With dedup, the rooted tree should also have 1 (not 2).
+        // For 4 leaves: 4 pendant edges + 1 internal bipartition = 5 entries.
+        // With dedup, the duplicated root bipartition collapses to 1 internal entry.
         assert_eq!(
             snap.parts.len(),
-            1,
-            "Rooted 4-leaf binary tree should have 1 non-trivial partition after dedup, got {}",
+            5,
+            "Rooted 4-leaf binary tree should have 5 entries (4 pendant + 1 internal) after dedup, got {}",
             snap.parts.len()
         );
     }
@@ -766,22 +767,26 @@ mod tests {
         let tree1 = PhyloTree::from_newick("((A:1,B:1):1,(C:1,D:1):1);").unwrap();
         let tree2 = PhyloTree::from_newick("((A:1,C:1):1,(B:1,D:1):1);").unwrap();
 
-        // Unrooted mode: L-3 = 1 bipartition per tree
+        // Unrooted mode: 4 pendant edges + 1 internal bipartition = 5 entries per tree.
         let snap1_u = Snapshot::from_tree(&tree1, false).unwrap();
         let snap2_u = Snapshot::from_tree(&tree2, false).unwrap();
         assert_eq!(
             snap1_u.parts.len(),
-            1,
-            "Unrooted: 1 bipartition for 4-leaf tree"
+            5,
+            "Unrooted: 4 pendant + 1 internal for 4-leaf tree"
         );
-        assert_eq!(snap2_u.parts.len(), 1);
+        assert_eq!(snap2_u.parts.len(), 5);
         assert_eq!(rf_pair(&snap1_u, &snap2_u), 2, "Unrooted RF = 2");
 
-        // Rooted mode: L-2 = 2 clades per tree
+        // Rooted mode: 4 pendant edges + 2 internal clades = 6 entries per tree.
         let snap1_r = Snapshot::from_tree(&tree1, true).unwrap();
         let snap2_r = Snapshot::from_tree(&tree2, true).unwrap();
-        assert_eq!(snap1_r.parts.len(), 2, "Rooted: 2 clades for 4-leaf tree");
-        assert_eq!(snap2_r.parts.len(), 2);
+        assert_eq!(
+            snap1_r.parts.len(),
+            6,
+            "Rooted: 4 pendant + 2 clades for 4-leaf tree"
+        );
+        assert_eq!(snap2_r.parts.len(), 6);
         assert_eq!(rf_pair(&snap1_r, &snap2_r), 4, "Rooted RF = 4");
 
         // Same topology: both modes give RF = 0
@@ -1051,10 +1056,10 @@ mod tests {
 
     /// Verify that `build_bipartition_bytes` exports canonical bitmasks correctly.
     ///
-    /// T1 = ((A,B),(C,D)): bipartition {C,D} = bits 2,3  → byte 0b00001100 = 0x0C
-    /// T2 = ((A,C),(B,D)): bipartition {B,D} = bits 1,3  → byte 0b00001010 = 0x0A
-    /// Sorted: {B,D}(0x0A) < {C,D}(0x0C) → col 0 = {B,D}, col 1 = {C,D}
-    /// bip_bytes = [0x0A, 0x0C]  (one byte each for 4-leaf trees)
+    /// Pendant edges are included, so for 4 leaves the table has 6 entries:
+    ///   cols 0-3: pendant edges {A}=0x01, {B}=0x02, {C}=0x04, {D}=0x08
+    ///   col 4: {B,D} = bits 1,3 → 0x0A
+    ///   col 5: {C,D} = bits 2,3 → 0x0C
     #[test]
     fn test_build_bipartition_bytes() {
         let snaps = Snapshots::from_newicks(
@@ -1066,23 +1071,25 @@ mod tests {
         let (_, col_to_bip_id) = snaps.build_presence_matrix();
         let bip_bytes = snaps.build_bipartition_bytes(&col_to_bip_id);
 
-        // 2 bipartitions × ceil(4/8) = 1 byte each → 2 bytes total
-        assert_eq!(bip_bytes.len(), 2);
+        // 6 bipartitions (4 pendant + 2 internal) × ceil(4/8) = 1 byte each → 6 bytes total
+        assert_eq!(bip_bytes.len(), 6);
 
-        // col 0 = {B,D}: bits 1 and 3 set → 0b00001010 = 0x0A
-        assert_eq!(bip_bytes[0], 0x0A, "col 0 should be {{B,D}} = 0x0A");
-        // col 1 = {C,D}: bits 2 and 3 set → 0b00001100 = 0x0C
-        assert_eq!(bip_bytes[1], 0x0C, "col 1 should be {{C,D}} = 0x0C");
+        // cols 0-3: pendant edges, sorted ascending
+        assert_eq!(bip_bytes[0], 0x01, "col 0 should be pendant {{A}} = 0x01");
+        assert_eq!(bip_bytes[1], 0x02, "col 1 should be pendant {{B}} = 0x02");
+        assert_eq!(bip_bytes[2], 0x04, "col 2 should be pendant {{C}} = 0x04");
+        assert_eq!(bip_bytes[3], 0x08, "col 3 should be pendant {{D}} = 0x08");
+        // cols 4-5: internal bipartitions
+        assert_eq!(bip_bytes[4], 0x0A, "col 4 should be {{B,D}} = 0x0A");
+        assert_eq!(bip_bytes[5], 0x0C, "col 5 should be {{C,D}} = 0x0C");
     }
 
-    /// Verify that `build_presence_matrix` returns col_to_bip_id in ascending Bitset order,
-    /// matching the column order of the presence bytes.
+    /// Verify that `build_presence_matrix` returns col_to_bip_id in ascending Bitset order.
     ///
-    /// T1 = ((A,B),(C,D)): bipartition {C,D} = bits 2,3 = value 12
-    /// T2 = ((A,C),(B,D)): bipartition {B,D} = bits 1,3 = value 10
-    /// Sorted: {B,D}(10) < {C,D}(12) → col 0 = {B,D}, col 1 = {C,D}
-    /// Presence: T1 has {C,D} → row [0,1]; T2 has {B,D} → row [1,0]
+    /// Pendant edges appear before internal bipartitions in the sorted table.
+    /// All trees share the same leaf set so pendant columns are all-1.
     #[test]
+    #[allow(clippy::erasing_op)]
     fn test_build_presence_matrix_sorted() {
         let snaps = Snapshots::from_newicks(
             &["((A:1,B:1):1,(C:1,D:1):1);", "((A:1,C:1):1,(B:1,D:1):1);"],
@@ -1094,20 +1101,22 @@ mod tests {
         assert_eq!(snaps.leaf_names, vec!["A", "B", "C", "D"]);
 
         let (presence, col_to_bip_id) = snaps.build_presence_matrix();
-        assert_eq!(col_to_bip_id.len(), 2);
+        // 4 pendant edges + 2 internal bipartitions
+        assert_eq!(col_to_bip_id.len(), 6);
 
-        // {B,D} has bits 1 and 3 set → value = (1<<1)|(1<<3) = 10
-        // {C,D} has bits 2 and 3 set → value = (1<<2)|(1<<3) = 12
-        // sorted: col 0 = {B,D}, col 1 = {C,D}
-        let col0_bits = snaps.bipartitions[col_to_bip_id[0]].0[0];
-        let col1_bits = snaps.bipartitions[col_to_bip_id[1]].0[0];
-        assert_eq!(col0_bits, 0b1010, "col 0 should be {{B,D}} = 0b1010 = 10");
-        assert_eq!(col1_bits, 0b1100, "col 1 should be {{C,D}} = 0b1100 = 12");
+        // cols 4 and 5 are the internal bipartitions in ascending order
+        let col4_bits = snaps.bipartitions[col_to_bip_id[4]].0[0];
+        let col5_bits = snaps.bipartitions[col_to_bip_id[5]].0[0];
+        assert_eq!(col4_bits, 0b1010, "col 4 should be {{B,D}} = 0b1010");
+        assert_eq!(col5_bits, 0b1100, "col 5 should be {{C,D}} = 0b1100");
 
-        // Presence matrix: T1 row=[0,1], T2 row=[1,0]
-        assert_eq!(presence[0], 0, "T1,col0 ({{B,D}}): absent");
-        assert_eq!(presence[1], 1, "T1,col1 ({{C,D}}): present");
-        assert_eq!(presence[2], 1, "T2,col0 ({{B,D}}): present");
-        assert_eq!(presence[3], 0, "T2,col1 ({{C,D}}): absent");
+        // Pendant columns 0-3 are all 1 (both trees share the same leaf set).
+        // T1 has {C,D} (col5=1) but not {B,D} (col4=0).
+        // T2 has {B,D} (col4=1) but not {C,D} (col5=0).
+        let n = 6;
+        assert_eq!(presence[0 * n + 4], 0, "T1,col4 ({{B,D}}): absent");
+        assert_eq!(presence[0 * n + 5], 1, "T1,col5 ({{C,D}}): present");
+        assert_eq!(presence[n + 4], 1, "T2,col4 ({{B,D}}): present");
+        assert_eq!(presence[n + 5], 0, "T2,col5 ({{C,D}}): absent");
     }
 }
