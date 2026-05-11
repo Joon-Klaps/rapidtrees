@@ -955,13 +955,13 @@ class TestPairwiseRFWithSnapshots:
         """Function returns a 6-tuple with the correct types."""
         result = self._call()
         assert len(result) == 6
-        names, rf_bytes, leaf_names, n_bip, pres_bytes, bip_leaf_indices = result
+        names, rf_bytes, leaf_names, n_bip, pres_bytes, bip_clade_bytes = result
         assert isinstance(names, list)
         assert isinstance(rf_bytes, bytes)
         assert isinstance(leaf_names, list)
         assert isinstance(n_bip, int)
         assert isinstance(pres_bytes, bytes)
-        assert isinstance(bip_leaf_indices, list)
+        assert isinstance(bip_clade_bytes, bytes)
 
     def test_rf_bytes_known_values(self):
         """rf_bytes decodes to the known RF matrix."""
@@ -1014,58 +1014,75 @@ class TestPairwiseRFWithSnapshots:
         assert r1[2] == r2[2]  # leaf_names
         assert r1[3] == r2[3]  # n_bip
         assert r1[4] == r2[4]  # presence_bytes
-        assert r1[5] == r2[5]  # bip_leaf_indices
+        assert r1[5] == r2[5]  # bip_clade_bytes
 
-    def test_bip_leaf_indices_length(self):
-        """bip_leaf_indices has one entry per bipartition."""
-        _, _, _, n_bip, _, bip_leaf_indices = self._call()
-        assert len(bip_leaf_indices) == n_bip
+    def test_bip_clade_bytes_length(self):
+        """bip_clade_bytes has exactly n_bip * ceil(n_leaves/8) bytes."""
+        _, _, leaf_names, n_bip, _, bip_clade_bytes = self._call()
+        bytes_per_bip = (len(leaf_names) + 7) // 8
+        assert len(bip_clade_bytes) == n_bip * bytes_per_bip
 
-    def test_bip_leaf_indices_valid_range(self):
-        """Every index in bip_leaf_indices is a valid position into leaf_names."""
-        _, _, leaf_names, _, _, bip_leaf_indices = self._call()
+    def test_bip_clade_bytes_valid_range(self):
+        """No padding bits beyond n_leaves are set, and every row has ≥ 2 leaves."""
+        _, _, leaf_names, n_bip, _, bip_clade_bytes = self._call()
         n_leaves = len(leaf_names)
-        for indices in bip_leaf_indices:
-            assert isinstance(indices, list)
-            for idx in indices:
-                assert isinstance(idx, int)
-                assert 0 <= idx < n_leaves, f"Index {idx} out of range for {n_leaves} leaves"
+        bytes_per_bip = (n_leaves + 7) // 8
+        bip_arr = np.frombuffer(bip_clade_bytes, dtype=np.uint8).reshape(n_bip, bytes_per_bip)
+        bip_bool = np.unpackbits(bip_arr, axis=1, bitorder='little')
+        # padding bits (columns >= n_leaves) must all be zero
+        assert np.all(bip_bool[:, n_leaves:] == 0), "padding bits must be zero"
+        # each bipartition has at least 2 leaves on its canonical side
+        assert np.all(bip_bool[:, :n_leaves].sum(axis=1) >= 2)
 
-    def test_bip_leaf_indices_canonical_side_excludes_first_leaf(self):
-        """In unrooted mode the canonical side never contains the first leaf (index 0)."""
-        _, _, _, _, _, bip_leaf_indices = self._call()
-        for indices in bip_leaf_indices:
-            assert 0 not in indices, "Canonical side must not contain leaf 0 (unrooted)"
+    def test_bip_clade_bytes_canonical_side_excludes_first_leaf(self):
+        """In unrooted mode bit 0 (first leaf) is never set in any bipartition row."""
+        _, _, _, n_bip, _, bip_clade_bytes = self._call()
+        # bit 0 of the first byte of every row encodes leaf index 0
+        bip_arr = np.frombuffer(bip_clade_bytes, dtype=np.uint8)
+        bytes_per_bip = len(bip_clade_bytes) // n_bip
+        first_bytes = bip_arr[::bytes_per_bip]
+        assert np.all(first_bytes & 0x01 == 0), "Canonical side must not contain leaf 0 (unrooted)"
 
-    def test_bip_leaf_indices_decode_to_valid_names(self):
-        """Decoded leaf names for each bipartition are a subset of the full leaf set."""
-        _, _, leaf_names, _, _, bip_leaf_indices = self._call()
+    def test_bip_clade_bytes_decode_to_valid_names(self):
+        """Decoded leaf names for each bipartition are a non-empty subset of the full leaf set."""
+        _, _, leaf_names, n_bip, _, bip_clade_bytes = self._call()
+        n_leaves = len(leaf_names)
+        bytes_per_bip = (n_leaves + 7) // 8
+        bip_arr = np.frombuffer(bip_clade_bytes, dtype=np.uint8).reshape(n_bip, bytes_per_bip)
+        bip_bool = np.unpackbits(bip_arr, axis=1, bitorder='little')[:, :n_leaves]
         leaf_set = set(leaf_names)
-        for indices in bip_leaf_indices:
-            names_for_bip = {leaf_names[i] for i in indices}
+        for j in range(n_bip):
+            names_for_bip = {leaf_names[i] for i in np.where(bip_bool[j])[0]}
             assert names_for_bip <= leaf_set
-    def test_bip_leaf_indices_simple_tree(self):
-        """On a known 4-leaf tree, verify exact canonical-side leaf indices."""
-        # Tree ((A,B),(C,D)) has one non-trivial bipartition: {C,D}|{A,B}.
-        # Canonical side = side not containing A (index 0) = {C, D} = indices [2, 3].
+            assert len(names_for_bip) >= 2
+    def test_bip_clade_bytes_simple_tree(self):
+        """On a known 4-leaf tree, verify exact canonical-side bitmasks.
+
+        Trees: ((A,B),(C,D))  and  ((A,C),(B,D))
+        leaf_names = [A, B, C, D]  →  indices 0,1,2,3
+        Bipartitions (sorted ascending):
+          col 0: {B,D}  bits 1,3 → byte = 0b00001010 = 0x0A
+          col 1: {C,D}  bits 2,3 → byte = 0b00001100 = 0x0C
+        """
         trees = ["((A,B),(C,D));", "((A,C),(B,D));"]
         names = ["t0", "t1"]
-        result = rtd.pairwise_rf_with_snapshots_from_newick_iter( names, iter(trees), [{}], [0, 0] )
-        _, _, leaf_names, _, _, bip_leaf_indices = result
+        result = rtd.pairwise_rf_with_snapshots_from_newick_iter(names, iter(trees), [{}], [0, 0])
+        _, _, leaf_names, n_bip, _, bip_clade_bytes = result
         assert leaf_names == ["A", "B", "C", "D"]
-        # Decode to names for readability
-        decoded = [sorted(leaf_names[i] for i in indices) for indices in bip_leaf_indices]
-        # Both bipartitions should decode to 2-leaf canonical sides
+        n_leaves = len(leaf_names)
+        bytes_per_bip = (n_leaves + 7) // 8
+        bip_arr = np.frombuffer(bip_clade_bytes, dtype=np.uint8).reshape(n_bip, bytes_per_bip)
+        bip_bool = np.unpackbits(bip_arr, axis=1, bitorder='little')[:, :n_leaves]
+        decoded = [sorted(leaf_names[i] for i in np.where(bip_bool[j])[0]) for j in range(n_bip)]
+        # Both canonical sides have 2 leaves and exclude 'A'
         assert all(len(d) == 2 for d in decoded)
-        # Neither canonical side should include 'A'
         assert all("A" not in d for d in decoded)
-        # The two bipartitions present are {C,D} and {B,D}
         assert sorted(decoded) == [["B", "D"], ["C", "D"]]
 
-    def test_bip_leaf_indices_large_complex_trees(self):
+    def test_bip_clade_bytes_large_complex_trees(self):
         """
         Verify bipartition canonicalization on 3 heterogeneous 15-leaf trees.
-        Checks that canonical-side indices correctly reflect each topology and
+        Checks that canonical-side bitmasks correctly reflect each topology and
         that bipartitions shared across trees are not duplicated.
         """
         # t0 — right-caterpillar, uniform cherry pairing
@@ -1110,7 +1127,7 @@ class TestPairwiseRFWithSnapshots:
         #  └── O
         T2 = "((((A,B),((C,D),(E,F))),(((G,H),((I,J),(K,L))),(M,N))),O);"
 
-        _, _, leaf_names, _, _, bip_leaf_indices = (
+        _, _, leaf_names, n_bip, _, bip_clade_bytes = (
             rtd.pairwise_rf_with_snapshots_from_newick_iter(
                 ["t0", "t1", "t2"], iter([T0, T1, T2]), [{}], [0, 0, 0]
             )
@@ -1118,8 +1135,12 @@ class TestPairwiseRFWithSnapshots:
 
         assert leaf_names == list("ABCDEFGHIJKLMNO")
 
-        # Decode index lists → frozensets of taxon names for set comparison
-        decoded = {frozenset(leaf_names[i] for i in idx) for idx in bip_leaf_indices}
+        # Decode bitmasks → frozensets of taxon names for set comparison
+        n_leaves = len(leaf_names)
+        bytes_per_bip = (n_leaves + 7) // 8
+        bip_arr = np.frombuffer(bip_clade_bytes, dtype=np.uint8).reshape(n_bip, bytes_per_bip)
+        bip_bool = np.unpackbits(bip_arr, axis=1, bitorder='little')[:, :n_leaves]
+        decoded = {frozenset(leaf_names[i] for i in np.where(row)[0]) for row in bip_bool}
 
         def s(*leaves):
             return frozenset(leaves)
@@ -1192,7 +1213,7 @@ class TestPairwiseRFWithSnapshots:
         T1 = "(((A,B),((C,E),((D,F),(((G,I),(H,J)),((K,M),(L,N)))))),O);"
         T2 = "((((A,B),((C,D),(E,F))),(((G,H),((I,J),(K,L))),(M,N))),O);"
 
-        _, _, leaf_names, n_bip, pres_bytes, bip_leaf_indices = (
+        _, _, leaf_names, n_bip, pres_bytes, bip_clade_bytes = (
             rtd.pairwise_rf_with_snapshots_from_newick_iter(
                 ["t0", "t1", "t2"], iter([T0, T1, T2]), [{}], [0, 0, 0]
             )
@@ -1200,10 +1221,14 @@ class TestPairwiseRFWithSnapshots:
 
         presence = np.frombuffer(pres_bytes, dtype=np.uint8).reshape(3, n_bip).copy()
 
-        # Map each bipartition (as a frozenset of names) to its column index
+        # Decode bitmasks and map each bipartition frozenset → its column index
+        n_leaves = len(leaf_names)
+        bytes_per_bip = (n_leaves + 7) // 8
+        bip_arr = np.frombuffer(bip_clade_bytes, dtype=np.uint8).reshape(n_bip, bytes_per_bip)
+        bip_bool = np.unpackbits(bip_arr, axis=1, bitorder='little')[:, :n_leaves]
         col_for = {
-            frozenset(leaf_names[i] for i in idx): col
-            for col, idx in enumerate(bip_leaf_indices)
+            frozenset(leaf_names[i] for i in np.where(bip_bool[col])[0]): col
+            for col in range(n_bip)
         }
 
         def s(*leaves):

@@ -59,22 +59,11 @@ struct Args {
     quiet: bool,
 }
 
-#[derive(Copy, Clone, Debug, ValueEnum)]
+#[derive(Copy, Clone, Debug, PartialEq, ValueEnum)]
 enum MetricArg {
     Rf,
     Weighted,
     Kf,
-}
-
-impl PartialEq for MetricArg {
-    fn eq(&self, other: &Self) -> bool {
-        matches!(
-            (self, other),
-            (MetricArg::Rf, MetricArg::Rf)
-                | (MetricArg::Weighted, MetricArg::Weighted)
-                | (MetricArg::Kf, MetricArg::Kf)
-        )
-    }
 }
 
 fn main() {

@@ -12,7 +12,7 @@ once.
 | Function | Returns |
 | --- | --- |
 | `pairwise_rf_from_newick_iter` | `(names, bytes)` — RF matrix as flat `uint32` bytes, row-major |
-| `pairwise_rf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, list[list[int]])` — RF matrix + bipartition presence matrix + bipartition leaf indices |
+| `pairwise_rf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, bytes)` — RF matrix + bipartition presence matrix + bipartition clade bitmasks |
 | `pairwise_wrf_from_newick_iter` | `(names, list[float])` — Weighted RF, flat row-major |
 | `pairwise_kf_from_newick_iter` | `(names, list[float])` — Kuhner-Felsenstein, flat row-major |
 
@@ -174,7 +174,7 @@ matrix **and** the bipartition presence matrix in a single parse, returning a
 6-tuple:
 
 ```
-(tree_names, rf_bytes, leaf_names, n_bip, presence_bytes, bipartition_leaf_indices)
+(tree_names, rf_bytes, leaf_names, n_bip, presence_bytes, bipartition_clade_bytes)
 ```
 
 | Field | Type | Description |
@@ -184,7 +184,7 @@ matrix **and** the bipartition presence matrix in a single parse, returning a
 | `leaf_names` | `list[str]` | Sorted taxon names — index `i` corresponds to bit `i` in every bipartition |
 | `n_bip` | `int` | Number of unique bipartitions across all trees |
 | `presence_bytes` | `bytes` | Flat `uint8` presence matrix, row-major, shape `(n, n_bip)` |
-| `bipartition_leaf_indices` | `list[list[int]]` | For each bipartition column, the indices into `leaf_names` on its canonical side |
+| `bipartition_clade_bytes` | `bytes` | Packed bitmasks, shape `(n_bip, ceil(n_leaves/8))` — see below |
 
 The presence matrix entry `presence[i, j]` is `1` if bipartition `j` appears
 in tree `i`, otherwise `0`. Column order is deterministic (ascending `Bitset`
@@ -193,13 +193,31 @@ order) and stable across calls on the same tree set.
 #### Canonicalisation note
 
 For unrooted trees each bipartition is stored on the side that does **not**
-contain the first leaf alphabetically. This means every entry in
-`bipartition_leaf_indices` describes the half of the split that excludes the
-first taxon — the complement can be derived via
-`set(range(len(leaf_names))) - set(indices)`.
+contain the first leaf alphabetically. Bit 0 of every row in
+`bipartition_clade_bytes` is therefore always `0`. The complement side can be
+derived as `~bip_bool[j] & True` (masked to `n_leaves` bits).
+
+#### Bipartition clade bytes format
+
+`bipartition_clade_bytes` is a flat `bytes` buffer of shape
+`(n_bip, ceil(n_leaves / 8))`. Each row encodes the canonical leaf membership
+of one bipartition as a **little-endian bitmask**: bit `i` within each row is
+`1` if `leaf_names[i]` is on that bipartition's canonical side.
+
+Decode with NumPy:
 
 ```python
-tree_names, rf_bytes, leaf_names, n_bip, pres_bytes, bip_leaf_indices = (
+import math
+import numpy as np
+
+bytes_per_bip = math.ceil(len(leaf_names) / 8)
+bip_arr  = np.frombuffer(bipartition_clade_bytes, dtype=np.uint8).reshape(n_bip, bytes_per_bip)
+bip_bool = np.unpackbits(bip_arr, axis=1, bitorder='little')[:, :len(leaf_names)]
+# bip_bool[j, i] == 1  →  leaf_names[i] is in bipartition j
+```
+
+```python
+tree_names, rf_bytes, leaf_names, n_bip, pres_bytes, bip_clade_bytes = (
     rtd.pairwise_rf_with_snapshots_from_newick_iter(
         list(names), iter(newicks), [tmap], [0] * len(names)
     )
@@ -219,18 +237,22 @@ split_freq = presence.mean(axis=0)
 
 #### Named presence matrix (post-hoc analysis)
 
-`bipartition_leaf_indices` maps each column of the presence matrix to the leaf
-names that make up that bipartition's canonical side.  Use it to build a
-labelled pandas `DataFrame` for downstream analyses such as tanglegrams,
-identifying unstable splits, or computing per-clade frequencies:
+Decode `bipartition_clade_bytes` to build human-readable column labels for the
+presence matrix, enabling downstream analyses such as tanglegrams, identifying
+unstable splits, or computing per-clade frequencies:
 
 ```python
+import math
 import pandas as pd
+
+bytes_per_bip = math.ceil(len(leaf_names) / 8)
+bip_arr  = np.frombuffer(bip_clade_bytes, dtype=np.uint8).reshape(n_bip, bytes_per_bip)
+bip_bool = np.unpackbits(bip_arr, axis=1, bitorder='little')[:, :len(leaf_names)]
 
 # Build a human-readable column label for each bipartition
 col_labels = [
-    "|".join(leaf_names[i] for i in indices)
-    for indices in bip_leaf_indices
+    "|".join(n for i, n in enumerate(leaf_names) if bip_bool[j, i])
+    for j in range(n_bip)
 ]
 
 df = pd.DataFrame(presence, index=tree_names, columns=col_labels)
