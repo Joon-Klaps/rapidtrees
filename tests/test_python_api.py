@@ -1292,6 +1292,256 @@ class TestPairwiseRFWithSnapshots:
         assert_col(s(*"GHIJKLMNO"),     [0, 0, 1])  # canonical of {A,B,C,D,E,F} | rest
 
 
+@pytest.mark.skipif(not RUST_MODULE_AVAILABLE, reason="rapidtrees not available")
+class TestPairwiseWrfWithSnapshots:
+    """Tests for pairwise_wrf_with_snapshots_from_newick_iter (6-tuple API)."""
+
+    SIMPLE_TREES = [
+        "(A:0.1,(B:0.2,C:0.3):0.4);",
+        "(A:0.5,(C:0.1,B:0.2):0.3);",
+        "((A:0.1,B:0.1):0.2,C:0.4);",
+    ]
+    SIMPLE_NAMES = ["s0", "s1", "s2"]
+
+    def _call(self, **kwargs):
+        defaults = dict(
+            names=self.SIMPLE_NAMES,
+            newick_iter=iter(self.SIMPLE_TREES),
+            translate_maps=[{}],
+            map_indices=[0, 0, 0],
+        )
+        defaults.update(kwargs)
+        return rtd.pairwise_wrf_with_snapshots_from_newick_iter(**defaults)
+
+    def test_returns_six_tuple(self):
+        """Function returns a 6-tuple with the correct types."""
+        result = self._call()
+        assert len(result) == 6
+        names, wrf_bytes, leaf_names, n_bip, bl_bytes, bip_clade_bytes = result
+        assert isinstance(names, list)
+        assert isinstance(wrf_bytes, bytes)
+        assert isinstance(leaf_names, list)
+        assert isinstance(n_bip, int)
+        assert isinstance(bl_bytes, bytes)
+        assert isinstance(bip_clade_bytes, bytes)
+
+    def test_wrf_bytes_shape(self):
+        """wrf_bytes is n² × 8 bytes (float64) with zero diagonal and symmetric."""
+        names, wrf_bytes, *_ = self._call()
+        n = len(names)
+        assert len(wrf_bytes) == n * n * 8
+        wrf = np.frombuffer(wrf_bytes, dtype=np.float64).reshape(n, n)
+        assert np.allclose(np.diag(wrf), 0.0)
+        assert np.allclose(wrf, wrf.T)
+
+    def test_branch_length_bytes_shape(self):
+        """branch_length_bytes is n_trees × n_bip × 8 bytes (float64)."""
+        names, _, _, n_bip, bl_bytes, _ = self._call()
+        n = len(names)
+        assert len(bl_bytes) == n * n_bip * 8
+
+    def test_wrf_identity(self):
+        """sum(|bl[i,:] - bl[j,:]|) == wrf[i,j] for all pairs (L1 identity)."""
+        names, wrf_bytes, _, n_bip, bl_bytes, _ = self._call()
+        n = len(names)
+        wrf = np.frombuffer(wrf_bytes, dtype=np.float64).reshape(n, n)
+        bl = np.frombuffer(bl_bytes, dtype=np.float64).reshape(n, n_bip)
+        for i in range(n):
+            for j in range(n):
+                computed = float(np.sum(np.abs(bl[i] - bl[j])))
+                assert abs(computed - wrf[i, j]) < 1e-9, (
+                    f"wRF identity failed at [{i},{j}]: "
+                    f"L1={computed:.6f} vs wrf={wrf[i,j]:.6f}"
+                )
+
+    def test_kf_derivable(self):
+        """sqrt(sum((bl[i,:]-bl[j,:])**2)) matches pairwise_kf_from_newick_iter."""
+        names, _, _, n_bip, bl_bytes, _ = self._call()
+        n = len(names)
+        bl = np.frombuffer(bl_bytes, dtype=np.float64).reshape(n, n_bip)
+
+        _, kf_flat = rtd.pairwise_kf_from_newick_iter(
+            self.SIMPLE_NAMES, iter(self.SIMPLE_TREES), [{}], [0, 0, 0]
+        )
+        kf_ref = np.array(kf_flat, dtype=np.float64).reshape(n, n)
+
+        for i in range(n):
+            for j in range(n):
+                computed = float(np.sqrt(np.sum((bl[i] - bl[j]) ** 2)))
+                assert abs(computed - kf_ref[i, j]) < 1e-9, (
+                    f"KF derivation failed at [{i},{j}]: "
+                    f"sqrt(L2)={computed:.6f} vs kf={kf_ref[i,j]:.6f}"
+                )
+
+    def test_wrf_matches_pairwise_wrf(self):
+        """wrf_bytes matches pairwise_wrf_from_newick_iter for the same input."""
+        names_s, wrf_bytes_s, *_ = self._call()
+        names_i, wrf_flat = rtd.pairwise_wrf_from_newick_iter(
+            self.SIMPLE_NAMES, iter(self.SIMPLE_TREES), [{}], [0, 0, 0]
+        )
+        n = len(names_s)
+        wrf_s = np.frombuffer(wrf_bytes_s, dtype=np.float64).reshape(n, n)
+        wrf_i = np.array(wrf_flat, dtype=np.float64).reshape(n, n)
+        assert np.allclose(wrf_s, wrf_i)
+
+    def test_pendant_columns_nonzero(self):
+        """Pendant-edge columns (rows with exactly 1 bit set in bip_clade_bytes) are always > 0."""
+        names, _, leaf_names, n_bip, bl_bytes, bip_clade_bytes = self._call()
+        n = len(names)
+        n_leaves = len(leaf_names)
+        bytes_per_bip = (n_leaves + 7) // 8
+        bip_arr = np.frombuffer(bip_clade_bytes, dtype=np.uint8).reshape(n_bip, bytes_per_bip)
+        bip_bool = np.unpackbits(bip_arr, axis=1, bitorder='little')[:, :n_leaves]
+        pendant_cols = np.where(bip_bool.sum(axis=1) == 1)[0]
+        bl = np.frombuffer(bl_bytes, dtype=np.float64).reshape(n, n_bip)
+        assert len(pendant_cols) == n_leaves
+        for col in pendant_cols:
+            assert np.all(bl[:, col] > 0.0), f"Pendant column {col} has a zero entry"
+
+    def test_bip_clade_bytes_matches_rf_snapshot(self):
+        """bip_clade_bytes is identical to the one from pairwise_rf_with_snapshots."""
+        _, _, leaf_names_w, n_bip_w, _, bip_w = self._call()
+        _, _, leaf_names_r, n_bip_r, _, bip_r = rtd.pairwise_rf_with_snapshots_from_newick_iter(
+            self.SIMPLE_NAMES, iter(self.SIMPLE_TREES), [{}], [0, 0, 0]
+        )
+        assert leaf_names_w == leaf_names_r
+        assert n_bip_w == n_bip_r
+        assert bip_w == bip_r
+
+    def test_leaf_names_sorted(self):
+        """Returned leaf names are alphabetically sorted."""
+        _, _, leaf_names, *_ = self._call()
+        assert leaf_names == sorted(leaf_names)
+
+    def test_deterministic(self):
+        """Two calls on identical input produce identical byte buffers."""
+        r1 = self._call()
+        r2 = self._call()
+        for i in range(6):
+            assert r1[i] == r2[i]
+
+
+@pytest.mark.skipif(not RUST_MODULE_AVAILABLE, reason="rapidtrees not available")
+class TestPairwiseKfWithSnapshots:
+    """Tests for pairwise_kf_with_snapshots_from_newick_iter (6-tuple API)."""
+
+    SIMPLE_TREES = [
+        "(A:0.1,(B:0.2,C:0.3):0.4);",
+        "(A:0.5,(C:0.1,B:0.2):0.3);",
+        "((A:0.1,B:0.1):0.2,C:0.4);",
+    ]
+    SIMPLE_NAMES = ["s0", "s1", "s2"]
+
+    def _call(self, **kwargs):
+        defaults = dict(
+            names=self.SIMPLE_NAMES,
+            newick_iter=iter(self.SIMPLE_TREES),
+            translate_maps=[{}],
+            map_indices=[0, 0, 0],
+        )
+        defaults.update(kwargs)
+        return rtd.pairwise_kf_with_snapshots_from_newick_iter(**defaults)
+
+    def test_returns_six_tuple(self):
+        """Function returns a 6-tuple with the correct types."""
+        result = self._call()
+        assert len(result) == 6
+        names, kf_bytes, leaf_names, n_bip, bl_bytes, bip_clade_bytes = result
+        assert isinstance(names, list)
+        assert isinstance(kf_bytes, bytes)
+        assert isinstance(leaf_names, list)
+        assert isinstance(n_bip, int)
+        assert isinstance(bl_bytes, bytes)
+        assert isinstance(bip_clade_bytes, bytes)
+
+    def test_kf_bytes_shape(self):
+        """kf_bytes is n² × 8 bytes (float64) with zero diagonal and symmetric."""
+        names, kf_bytes, *_ = self._call()
+        n = len(names)
+        assert len(kf_bytes) == n * n * 8
+        kf = np.frombuffer(kf_bytes, dtype=np.float64).reshape(n, n)
+        assert np.allclose(np.diag(kf), 0.0)
+        assert np.allclose(kf, kf.T)
+
+    def test_branch_length_bytes_shape(self):
+        """branch_length_bytes is n_trees × n_bip × 8 bytes (float64)."""
+        names, _, _, n_bip, bl_bytes, _ = self._call()
+        n = len(names)
+        assert len(bl_bytes) == n * n_bip * 8
+
+    def test_kf_identity(self):
+        """sqrt(sum((bl[i,:]-bl[j,:])**2)) == kf[i,j] for all pairs (L2 identity)."""
+        names, kf_bytes, _, n_bip, bl_bytes, _ = self._call()
+        n = len(names)
+        kf = np.frombuffer(kf_bytes, dtype=np.float64).reshape(n, n)
+        bl = np.frombuffer(bl_bytes, dtype=np.float64).reshape(n, n_bip)
+        for i in range(n):
+            for j in range(n):
+                computed = float(np.sqrt(np.sum((bl[i] - bl[j]) ** 2)))
+                assert abs(computed - kf[i, j]) < 1e-9, (
+                    f"KF identity failed at [{i},{j}]: "
+                    f"sqrt(L2)={computed:.6f} vs kf={kf[i,j]:.6f}"
+                )
+
+    def test_kf_matches_pairwise_kf(self):
+        """kf_bytes matches pairwise_kf_from_newick_iter for the same input."""
+        names_s, kf_bytes_s, *_ = self._call()
+        names_i, kf_flat = rtd.pairwise_kf_from_newick_iter(
+            self.SIMPLE_NAMES, iter(self.SIMPLE_TREES), [{}], [0, 0, 0]
+        )
+        n = len(names_s)
+        kf_s = np.frombuffer(kf_bytes_s, dtype=np.float64).reshape(n, n)
+        kf_i = np.array(kf_flat, dtype=np.float64).reshape(n, n)
+        assert np.allclose(kf_s, kf_i)
+
+    def test_branch_length_matches_wrf_snapshot(self):
+        """branch_length_bytes is identical to the one from pairwise_wrf_with_snapshots."""
+        _, _, leaf_names_k, n_bip_k, bl_k, bip_k = self._call()
+        _, _, leaf_names_w, n_bip_w, bl_w, bip_w = rtd.pairwise_wrf_with_snapshots_from_newick_iter(
+            self.SIMPLE_NAMES, iter(self.SIMPLE_TREES), [{}], [0, 0, 0]
+        )
+        assert leaf_names_k == leaf_names_w
+        assert n_bip_k == n_bip_w
+        assert bl_k == bl_w
+        assert bip_k == bip_w
+
+    def test_pendant_columns_nonzero(self):
+        """Pendant-edge columns are always > 0 in every tree."""
+        names, _, leaf_names, n_bip, bl_bytes, bip_clade_bytes = self._call()
+        n = len(names)
+        n_leaves = len(leaf_names)
+        bytes_per_bip = (n_leaves + 7) // 8
+        bip_arr = np.frombuffer(bip_clade_bytes, dtype=np.uint8).reshape(n_bip, bytes_per_bip)
+        bip_bool = np.unpackbits(bip_arr, axis=1, bitorder='little')[:, :n_leaves]
+        pendant_cols = np.where(bip_bool.sum(axis=1) == 1)[0]
+        bl = np.frombuffer(bl_bytes, dtype=np.float64).reshape(n, n_bip)
+        assert len(pendant_cols) == n_leaves
+        for col in pendant_cols:
+            assert np.all(bl[:, col] > 0.0), f"Pendant column {col} has a zero entry"
+
+    def test_bip_clade_bytes_matches_rf_snapshot(self):
+        """bip_clade_bytes is identical to the one from pairwise_rf_with_snapshots."""
+        _, _, leaf_names_k, n_bip_k, _, bip_k = self._call()
+        _, _, leaf_names_r, n_bip_r, _, bip_r = rtd.pairwise_rf_with_snapshots_from_newick_iter(
+            self.SIMPLE_NAMES, iter(self.SIMPLE_TREES), [{}], [0, 0, 0]
+        )
+        assert leaf_names_k == leaf_names_r
+        assert n_bip_k == n_bip_r
+        assert bip_k == bip_r
+
+    def test_leaf_names_sorted(self):
+        """Returned leaf names are alphabetically sorted."""
+        _, _, leaf_names, *_ = self._call()
+        assert leaf_names == sorted(leaf_names)
+
+    def test_deterministic(self):
+        """Two calls on identical input produce identical byte buffers."""
+        r1 = self._call()
+        r2 = self._call()
+        for i in range(6):
+            assert r1[i] == r2[i]
+
+
 if __name__ == "__main__":
     # Allow running tests directly
     pytest.main([__file__, "-v"])

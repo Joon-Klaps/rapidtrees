@@ -1,6 +1,6 @@
 # Python API reference
 
-`rapidtrees` exposes four functions from its Rust core via PyO3. All accept a
+`rapidtrees` exposes six functions from its Rust core via PyO3. All accept a
 Python **iterator** of newick strings, which lets the library stream through
 arbitrarily large tree files without materialising all strings in memory at
 once.
@@ -14,9 +14,11 @@ once.
 | `pairwise_rf_from_newick_iter` | `(names, bytes)` — RF matrix as flat `uint32` bytes, row-major |
 | `pairwise_rf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, bytes)` — RF matrix + bipartition presence matrix + bipartition clade bitmasks |
 | `pairwise_wrf_from_newick_iter` | `(names, list[float])` — Weighted RF, flat row-major |
+| `pairwise_wrf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, bytes)` — wRF matrix + branch-length matrix + bipartition clade bitmasks |
 | `pairwise_kf_from_newick_iter` | `(names, list[float])` — Kuhner-Felsenstein, flat row-major |
+| `pairwise_kf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, bytes)` — KF matrix + branch-length matrix + bipartition clade bitmasks |
 
-All four share the same call signature:
+All six share the same call signature:
 
 ```python
 func(
@@ -39,6 +41,8 @@ newick strings already use real taxon names, pass `[{}]` and `[0] * n`.
 | `pairwise_wrf_from_newick_iter` | `list[float]` — flat, row-major | `np.array(lst, dtype=np.float64).reshape(n, n)` |
 | `pairwise_kf_from_newick_iter` | `list[float]` — flat, row-major | `np.array(lst, dtype=np.float64).reshape(n, n)` |
 | `pairwise_rf_with_snapshots_from_newick_iter` | 6-tuple — see below | see below |
+| `pairwise_wrf_with_snapshots_from_newick_iter` | 6-tuple — see below | see below |
+| `pairwise_kf_with_snapshots_from_newick_iter` | 6-tuple — see below | see below |
 
 ### Errors raised
 
@@ -265,4 +269,100 @@ col_labels = [
 
 df = pd.DataFrame(presence, index=tree_names, columns=col_labels)
 # e.g.  col "C|D|E" == 1 means the split {C,D,E}|rest is present in that tree
+```
+
+---
+
+### wRF + branch-length matrix in one pass
+
+`pairwise_wrf_with_snapshots_from_newick_iter` builds both the pairwise wRF
+distance matrix **and** a per-edge branch-length matrix in a single parse,
+returning a 6-tuple:
+
+```text
+(tree_names, wrf_bytes, leaf_names, n_bip, branch_length_bytes, bipartition_clade_bytes)
+```
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `tree_names` | `list[str]` | Tree identifiers (same order as input `names`) |
+| `wrf_bytes` | `bytes` | Flat `float64` wRF matrix, row-major, shape `(n, n)` |
+| `leaf_names` | `list[str]` | Sorted taxon names — index `i` corresponds to bit `i` in every bipartition |
+| `n_bip` | `int` | Number of unique edges across all trees (pendant + internal) |
+| `branch_length_bytes` | `bytes` | Flat `float64`, shape `(n_trees, n_bip)`, row-major |
+| `bipartition_clade_bytes` | `bytes` | Packed bitmasks, shape `(n_bip, ceil(n_leaves/8))` — identical to RF snapshot |
+
+`branch_length_bytes[i, j]` is the branch length of edge `j` in tree `i`, or
+`0.0` if that edge is absent. Pendant (leaf-edge) columns are always non-zero
+because every tree has every leaf.
+
+Column order matches `bipartition_clade_bytes` (ascending `Bitset` order,
+deterministic and stable across calls on the same tree set).
+
+#### Decode and compute Fréchet ESS traces
+
+```python
+import rapidtrees as rtd
+import numpy as np
+
+tree_names, wrf_bytes, leaf_names, n_bip, bl_bytes, bip_clade_bytes = (
+    rtd.pairwise_wrf_with_snapshots_from_newick_iter(
+        list(names), iter(newicks), [tmap], [0] * len(names)
+    )
+)
+n = len(tree_names)
+# Actual wRF distance matrix (trees x trees)
+wrf = np.frombuffer(wrf_bytes, dtype=np.float64).reshape(n, n)
+
+# Branch length matrix (trees x bipartitions)
+bl  = np.frombuffer(bl_bytes,  dtype=np.float64).reshape(n, n_bip)
+
+# We can recompute distances relative to one reference tree using the branch-length matrix:
+ref_idx = 0
+wrf_trace = np.sum(np.abs(bl[ref_idx, :] - bl), axis=1)           # shape (n,)
+kf_trace  = np.sqrt(np.sum((bl[ref_idx, :] - bl) ** 2, axis=1))   # shape (n,)
+
+# Verify L1 identity: sum(|bl[i,:] - bl[j,:]|) == wrf[i,j]
+for i in range(n):
+    for j in range(n):
+        assert abs(float(np.sum(np.abs(bl[i] - bl[j]))) - wrf[i, j]) < 1e-9
+```
+
+---
+
+### KF + branch-length matrix in one pass
+
+`pairwise_kf_with_snapshots_from_newick_iter` is identical to the wRF variant
+except the distance matrix uses the Kuhner–Felsenstein (Branch Score) metric.
+The branch-length matrix is metric-agnostic and bit-for-bit identical across
+both functions for the same input.
+
+```text
+(tree_names, kf_bytes, leaf_names, n_bip, branch_length_bytes, bipartition_clade_bytes)
+```
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `tree_names` | `list[str]` | Tree identifiers |
+| `kf_bytes` | `bytes` | Flat `float64` KF matrix, row-major, shape `(n, n)` |
+| `leaf_names` | `list[str]` | Sorted taxon names |
+| `n_bip` | `int` | Number of unique edges |
+| `branch_length_bytes` | `bytes` | Flat `float64`, shape `(n_trees, n_bip)` — same as wRF variant |
+| `bipartition_clade_bytes` | `bytes` | Packed bitmasks — same as RF/wRF snapshot |
+
+```python
+tree_names, kf_bytes, leaf_names, n_bip, bl_bytes, bip_clade_bytes = (
+    rtd.pairwise_kf_with_snapshots_from_newick_iter(
+        list(names), iter(newicks), [tmap], [0] * len(names)
+    )
+)
+n = len(tree_names)
+
+# Actual KF distance matrix (trees x trees)
+kf = np.frombuffer(kf_bytes, dtype=np.float64).reshape(n, n)
+
+# Branch length matrix (trees x bipartitions)
+bl  = np.frombuffer(bl_bytes, dtype=np.float64).reshape(n, n_bip)
+
+# L2 identity: sqrt(sum((bl[i,:]-bl[j,:])**2)) == kf[i,j]
 ```

@@ -210,6 +210,129 @@ fn pairwise_rf_with_snapshots_from_newick_iter(
     ))
 }
 
+/// Compute pairwise WRF distances and export a branch-length matrix in a single pass.
+///
+/// Parses each newick once, building both the pairwise WRF distance matrix and a
+/// per-edge branch-length matrix encoding the branch length of every edge in each tree.
+///
+/// # Branch-length matrix format
+///
+/// Shape `(n_trees, n_bip)`, encoded as a flat row-major `float64` byte buffer.
+/// `branch_length_bytes[i, j]` is the branch length of edge `j` in tree `i`, or `0.0`
+/// if that edge is absent. Pendant (leaf) edges are always present in every tree.
+/// Column order matches `bipartition_clade_bytes` (ascending `Bitset` order, stable).
+///
+/// Reconstruct and compute Fréchet traces on the Python side:
+/// ```python
+/// bl = np.frombuffer(branch_length_bytes, dtype=np.float64).reshape(n_trees, n_bip)
+/// wrf_trace = np.sum(np.abs(bl[ref_idx, :] - bl), axis=1)   # wRF to one reference
+/// kf_trace  = np.sqrt(np.sum((bl[ref_idx, :] - bl)**2, axis=1))  # KF to one reference
+/// ```
+///
+/// Args:
+///     names: Tree identifiers (one per newick).
+///     newick_iter: Python iterator yielding newick strings.
+///     translate_maps: List of translate maps (number → taxon name).
+///     map_indices: Per-tree index into translate_maps.
+///     rooted: If True compare clades; if False compare bipartitions (default: False).
+///
+/// Returns:
+///     6-tuple (tree_names, wrf_matrix_bytes, leaf_names, n_bip,
+///     branch_length_bytes, bipartition_clade_bytes).
+///     wrf_matrix_bytes is flat float64 bytes (row-major n×n).
+///
+/// Raises:
+///     ValueError: If fewer than 2 trees, leaf sets differ, or argument lengths mismatch.
+#[pyfunction]
+#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false))]
+fn pairwise_wrf_with_snapshots_from_newick_iter(
+    py: Python<'_>,
+    names: Vec<String>,
+    newick_iter: Bound<'_, PyIterator>,
+    translate_maps: Vec<HashMap<String, String>>,
+    map_indices: Vec<usize>,
+    rooted: bool,
+) -> PyResult<PyRfSnapshotResult> {
+    validate_iter_args(&names, &map_indices, &translate_maps)?;
+
+    let snaps = collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted)?;
+
+    let wrf_matrix = snaps.pairwise_wrf();
+    let wrf_bytes: Vec<u8> = wrf_matrix.iter().flat_map(|&v| v.to_ne_bytes()).collect();
+
+    let n_bip = snaps.bipartitions.len();
+    let leaf_names = snaps.leaf_names.clone();
+    let (bl_bytes, col_to_bip_id) = snaps.build_branch_length_matrix();
+    let bip_bytes = snaps.build_bipartition_bytes(&col_to_bip_id);
+
+    let py_wrf = PyBytes::new(py, &wrf_bytes);
+    let py_bl = PyBytes::new(py, &bl_bytes);
+    let py_bip = PyBytes::new(py, &bip_bytes);
+    Ok((
+        names,
+        py_wrf.into(),
+        leaf_names,
+        n_bip,
+        py_bl.into(),
+        py_bip.into(),
+    ))
+}
+
+/// Compute pairwise KF distances and export a branch-length matrix in a single pass.
+///
+/// Identical to `pairwise_wrf_with_snapshots_from_newick_iter` except the distance
+/// matrix uses the Kuhner–Felsenstein (Branch Score) metric instead of Weighted RF.
+/// The branch-length matrix is metric-agnostic and identical in both functions.
+///
+/// Args:
+///     names: Tree identifiers (one per newick).
+///     newick_iter: Python iterator yielding newick strings.
+///     translate_maps: List of translate maps (number → taxon name).
+///     map_indices: Per-tree index into translate_maps.
+///     rooted: If True compare clades; if False compare bipartitions (default: False).
+///
+/// Returns:
+///     6-tuple (tree_names, kf_matrix_bytes, leaf_names, n_bip,
+///     branch_length_bytes, bipartition_clade_bytes).
+///     kf_matrix_bytes is flat float64 bytes (row-major n×n).
+///
+/// Raises:
+///     ValueError: If fewer than 2 trees, leaf sets differ, or argument lengths mismatch.
+#[pyfunction]
+#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false))]
+fn pairwise_kf_with_snapshots_from_newick_iter(
+    py: Python<'_>,
+    names: Vec<String>,
+    newick_iter: Bound<'_, PyIterator>,
+    translate_maps: Vec<HashMap<String, String>>,
+    map_indices: Vec<usize>,
+    rooted: bool,
+) -> PyResult<PyRfSnapshotResult> {
+    validate_iter_args(&names, &map_indices, &translate_maps)?;
+
+    let snaps = collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted)?;
+
+    let kf_matrix = snaps.pairwise_kf();
+    let kf_bytes: Vec<u8> = kf_matrix.iter().flat_map(|&v| v.to_ne_bytes()).collect();
+
+    let n_bip = snaps.bipartitions.len();
+    let leaf_names = snaps.leaf_names.clone();
+    let (bl_bytes, col_to_bip_id) = snaps.build_branch_length_matrix();
+    let bip_bytes = snaps.build_bipartition_bytes(&col_to_bip_id);
+
+    let py_kf = PyBytes::new(py, &kf_bytes);
+    let py_bl = PyBytes::new(py, &bl_bytes);
+    let py_bip = PyBytes::new(py, &bip_bytes);
+    Ok((
+        names,
+        py_kf.into(),
+        leaf_names,
+        n_bip,
+        py_bl.into(),
+        py_bip.into(),
+    ))
+}
+
 /// Compute pairwise Weighted Robinson-Foulds distances from a lazy Python iterator.
 ///
 /// Args:
@@ -276,6 +399,14 @@ fn rapidtrees(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pairwise_rf_from_newick_iter, m)?)?;
     m.add_function(wrap_pyfunction!(
         pairwise_rf_with_snapshots_from_newick_iter,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        pairwise_wrf_with_snapshots_from_newick_iter,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        pairwise_kf_with_snapshots_from_newick_iter,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(pairwise_wrf_from_newick_iter, m)?)?;

@@ -13,6 +13,7 @@ This project uses release names based on random words from [codenamegenerator.co
 
 - wRF and KF distances now match phangorn ([#9](https://github.com/Joon-Klaps/rapidtrees/pull/9)).
 - include tests for load_beast_raw in io.rs ([#10](https://github.com/Joon-Klaps/rapidtrees/pull/10)).
+- Add `pairwise_wrf_with_snapshots_from_newick_iter` and `pairwise_kf_with_snapshots_from_newick_iter`. Instead of absence-presence matrix for every bipartition, `branch_length_bytes` field is a flat `float64` matrix of shape `(n_trees, n_bip)` where entry `[i, j]` is the branch length of edge `j` in tree `i` (0.0 if absent). ([#11](https://github.com/Joon-Klaps/rapidtrees/pull/11))
 
 ## [0.5.0] - Obsidian Sidewinder (2026-05-11)
 
