@@ -1344,7 +1344,7 @@ mod tests {
     /// Three-tree case: a bipartition absent from the middle tree must have a
     /// 0.0 branch length in that row and non-zero in the others.
     #[test]
-    #[warn(clippy::erasing_op)]
+    #[allow(clippy::erasing_op)]
     fn test_build_branch_length_matrix_absent_split_is_zero() {
         // T0 and T2 share bipartition {C,D}, T1 does not.
         let trees = [
