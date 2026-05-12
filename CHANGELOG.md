@@ -9,7 +9,7 @@ This project uses release names based on random words from [codenamegenerator.co
     - DICTIONARY: Snakes
 
 
-## [0.5.1] - (YYYY-MM-DD)
+## [0.5.1] - 0.5.1 - Azure Mamba (2026-05-12)
 
 - wRF and KF distances now match phangorn ([#9](https://github.com/Joon-Klaps/rapidtrees/pull/9)).
 - include tests for load_beast_raw in io.rs ([#10](https://github.com/Joon-Klaps/rapidtrees/pull/10)).
