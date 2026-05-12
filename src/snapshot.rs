@@ -563,6 +563,59 @@ impl Snapshots {
         (presence, col_to_bip_id)
     }
 
+    /// Build a flat row-major branch-length matrix `(n_trees × n_bip)` as native-endian
+    /// `float64` bytes, together with a column-order index into `self.bipartitions`.
+    ///
+    /// Returns `(branch_length_bytes, col_to_bip_id)`:
+    /// - `branch_length_bytes`: flat `float64` buffer, row-major, shape `(n_trees, n_bip)`
+    /// - `col_to_bip_id`: `col_to_bip_id[col]` is the index into `self.bipartitions`
+    ///   for that column, in ascending `Bitset` order
+    ///
+    /// `branch_length_bytes[i, j]` is the branch length of edge `j` in tree `i`, or `0.0`
+    /// if that edge is absent from tree `i`. Pendant (leaf) edges are always present in
+    /// every tree and therefore always have a non-zero value.
+    ///
+    /// Column order matches [`build_presence_matrix`] (ascending `Bitset` order, stable
+    /// across calls on the same tree set).
+    ///
+    /// Decode on the Python side:
+    /// ```python
+    /// bl = np.frombuffer(branch_length_bytes, dtype=np.float64).reshape(n_trees, n_bip)
+    /// # Fréchet ESS traces without materialising the n×n distance matrix:
+    /// wrf_trace = np.sum(np.abs(bl[ref_idx, :] - bl), axis=1)
+    /// kf_trace  = np.sqrt(np.sum((bl[ref_idx, :] - bl) ** 2, axis=1))
+    /// ```
+    pub fn build_branch_length_matrix(&self) -> (Vec<u8>, Vec<usize>) {
+        let id_to_col = self.sorted_bip_id_to_col();
+        let n_trees = self.snapshots.len();
+        let n_bip = self.bipartitions.len();
+
+        let mut col_to_bip_id = vec![0usize; n_bip];
+        for (id, &col) in id_to_col.iter().enumerate() {
+            col_to_bip_id[col] = id;
+        }
+
+        if n_bip == 0 {
+            return (Vec::new(), col_to_bip_id);
+        }
+
+        let mut matrix = vec![0.0f64; n_trees * n_bip];
+        matrix
+            .par_chunks_mut(n_bip)
+            .zip(&self.snapshots)
+            .for_each(|(row, snap)| {
+                for (&split_id, &length) in snap.split_ids.iter().zip(&snap.lengths) {
+                    row[id_to_col[split_id as usize]] = length;
+                }
+            });
+
+        let mut bytes = Vec::with_capacity(matrix.len() * 8);
+        for &v in &matrix {
+            bytes.extend_from_slice(&v.to_ne_bytes());
+        }
+        (bytes, col_to_bip_id)
+    }
+
     /// Export canonical bipartition bitmasks as a flat byte buffer.
     ///
     /// Shape: `(n_bip, ceil(n_leaves / 8))` bytes, row-major, in ascending `Bitset`
