@@ -10,6 +10,7 @@
 
 use crate::snapshot::{InternSnap, Snapshot, Snapshots};
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(test)]
 use itertools::Itertools;
@@ -210,6 +211,23 @@ where
     T: Copy + Default + Send,
     F: Fn(&InternSnap, &InternSnap) -> T + Sync,
 {
+    pairwise_symmetric_counted(snaps, metric, None)
+}
+
+/// Same as [`pairwise_symmetric`], but bumps `progress` by `n - i - 1` after every
+/// row `i` completes. `progress = None` is equivalent to [`pairwise_symmetric`].
+///
+/// The increment is the number of upper-triangle pairs produced by that row, so
+/// when all rows have finished `progress` equals `n*(n-1)/2`.
+pub(crate) fn pairwise_symmetric_counted<T, F>(
+    snaps: &Snapshots,
+    metric: F,
+    progress: Option<&AtomicUsize>,
+) -> Vec<T>
+where
+    T: Copy + Default + Send,
+    F: Fn(&InternSnap, &InternSnap) -> T + Sync,
+{
     let n = snaps.snapshots.len();
 
     // 1. Single contiguous allocation
@@ -219,6 +237,10 @@ where
     matrix.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
         for (j, dist) in row.iter_mut().enumerate().take(n).skip(i + 1) {
             *dist = metric(&snaps.snapshots[i], &snaps.snapshots[j]);
+        }
+        if let Some(counter) = progress {
+            // Pairs produced by this row: indices (i, i+1), ..., (i, n-1).
+            counter.fetch_add(n.saturating_sub(i + 1), Ordering::Relaxed);
         }
     });
 

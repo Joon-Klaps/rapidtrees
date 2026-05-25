@@ -9,6 +9,11 @@ This project uses release names based on random words from [codenamegenerator.co
     - DICTIONARY: Snakes
 
 
+## [Unreleased]
+
+- Added optional `progress_callback: Callable[[float], None]` argument to all six pairwise distance entry points (`pairwise_rf_from_newick_iter`, `pairwise_wrf_from_newick_iter`, `pairwise_kf_from_newick_iter`, and their three `*_with_snapshots_from_newick_iter` variants). The callback receives the fraction of upper-triangle pairs completed (`0.0`–`1.0`), is invoked at roughly 10 Hz by a dedicated monitor thread, and always receives a final `1.0`. The default `None` preserves the previous zero-overhead behaviour. As a bonus, `KeyboardInterrupt` now propagates out of long pairwise calls.
+- CLI: when stderr is a TTY and `--quiet` is not set, the `rapidtrees` binary now renders a live progress bar to stderr during pairwise distance computation (e.g. `[█████████░░░░░] 64.2% (3211/5000 pairs, ETA 4.1s)`). Piped/redirected runs are unaffected — the bar auto-suppresses when stderr is not a terminal.
+
 ## [0.5.1] - 0.5.1 - Azure Mamba (2026-05-12)
 
 - wRF and KF distances now match phangorn ([#9](https://github.com/Joon-Klaps/rapidtrees/pull/9)).

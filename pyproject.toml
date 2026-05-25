@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "rapidtrees"
-version = "0.5.1"
+version = "0.6.0"
 description = "Fast tree distance calculations (Robinson-Foulds, Weighted RF, Kuhner-Felsenstein) for phylogenetic trees"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -66,7 +66,7 @@ py311 = ["py311"]
 py312 = ["py312"]
 
 [tool.pixi.tasks]
-test-rust = { cmd = "cargo test --lib", description = "Run Rust unit tests" }
+test-rust = { cmd = "cargo test --lib --features python", description = "Run Rust unit tests (with the python feature so progress.rs tests are included)" }
 test-python = { cmd = "pytest tests/test_python_api.py -v", description = "Run Python API tests" }
 test-python-cov = { cmd = "pytest tests/test_python_api.py -v --cov=rapidtrees --cov-report=xml:python-coverage.xml", description = "Run Python tests with coverage" }
 develop = { cmd = "maturin develop --uv", description = "Build and install in editable mode" }
@@ -74,3 +74,5 @@ fmt = { cmd = "cargo fmt --check", description = "Check Rust formatting" }
 clippy = { cmd = "cargo clippy --all-targets --all-features -- -D warnings", description = "Run Clippy linter" }
 bench = { cmd = "cargo bench", description = "Run performance benchmarks" }
 pre-commit = { cmd = "prek run --config .pre-commit-config.yaml --all-files" }
+run-treetracer = { cmd = "cd ../treetracer && uv sync --reinstall-package rapidtrees && uv run treetracer", description = "Rebuild rapidtrees (in treetracer's venv) and launch the desktop app against it" }
+run-treetracer-browser = { cmd = "cd ../treetracer && uv sync --reinstall-package rapidtrees && uv run treetracer --browser", description = "Rebuild rapidtrees (in treetracer's venv) and launch treetracer in a browser tab" }

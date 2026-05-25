@@ -22,16 +22,49 @@ All six share the same call signature:
 
 ```python
 func(
-    names,           # list[str]            — one identifier per tree
-    newick_iter,     # Iterator[str]        — newick strings, consumed once left to right
-    translate_maps,  # list[dict[str, str]] — taxon-ID → name mappings (BEAST TRANSLATE block)
-    map_indices,     # list[int]            — which translate map applies to each tree
-    rooted=False,    # bool                 — compare clades (True) or bipartitions (False)
+    names,                    # list[str]            — one identifier per tree
+    newick_iter,              # Iterator[str]        — newick strings, consumed once left to right
+    translate_maps,           # list[dict[str, str]] — taxon-ID → name mappings (BEAST TRANSLATE block)
+    map_indices,              # list[int]            — which translate map applies to each tree
+    rooted=False,             # bool                 — compare clades (True) or bipartitions (False)
+    progress_callback=None,   # Callable[[float], None] | None — see "Progress reporting" below
 )
 ```
 
 `translate_maps` and `map_indices` handle BEAST numeric taxon IDs.  If your
 newick strings already use real taxon names, pass `[{}]` and `[0] * n`.
+
+### Progress reporting
+
+For UIs that need a progress bar (e.g. `treetracer`), pass any callable as
+`progress_callback`. It receives a single `float` in `[0.0, 1.0]` — the
+fraction of `n*(n-1)/2` upper-triangle pairs that have completed — and is
+invoked roughly every 100 ms. The very last call is always exactly `1.0`.
+
+```python
+from tqdm import tqdm
+
+with tqdm(total=100, unit="%") as bar:
+    def cb(frac: float) -> None:
+        bar.n = int(frac * 100)
+        bar.refresh()
+
+    names, rf = rapidtrees.pairwise_rf_from_newick_iter(
+        names, iter(newicks), translate_maps, map_indices,
+        progress_callback=cb,
+    )
+```
+
+Notes:
+
+- `progress_callback=None` (the default) keeps the GIL held for the full
+  computation and adds zero overhead — identical to the pre-`0.6.0` behaviour.
+- When a callback is supplied the GIL is released during the rayon loop, so
+  other Python threads run normally. The monitor thread acquires the GIL only
+  to invoke the callback.
+- Exceptions raised inside the callback (including `KeyboardInterrupt`) abort
+  the computation and propagate out of the pairwise function. `Ctrl-C` from a
+  REPL now interrupts long pairwise calls cleanly.
 
 ### Return types
 

@@ -1542,6 +1542,127 @@ class TestPairwiseKfWithSnapshots:
             assert r1[i] == r2[i]
 
 
+class TestProgressCallback:
+    """Tests for the optional ``progress_callback`` argument on all six
+    pairwise distance functions."""
+
+    # 50 trees → 1225 pairs. Big enough to give the 100 ms monitor a chance to
+    # fire mid-computation on slower CI runners.
+    LARGE_NEWICKS = REFERENCE_NEWICKS * 5
+    LARGE_NAMES = [f"t{i}" for i in range(len(LARGE_NEWICKS))]
+    LARGE_TRANSLATE = [{}]
+    LARGE_MAP_INDICES = [0] * len(LARGE_NEWICKS)
+
+    @staticmethod
+    def _assert_valid_trace(fracs):
+        """Common invariants for a captured callback trace."""
+        assert fracs, "progress_callback was never invoked"
+        for f in fracs:
+            assert isinstance(f, float)
+            assert 0.0 <= f <= 1.0
+        for prev, curr in zip(fracs, fracs[1:]):
+            assert curr >= prev, f"progress went backwards: {prev} → {curr}"
+        assert fracs[-1] == 1.0, f"final progress must be 1.0, got {fracs[-1]}"
+
+    def test_default_none_unchanged_rf(self):
+        """Omitting the kwarg matches the pre-existing behaviour exactly."""
+        _, baseline = rtd.pairwise_rf_from_newick_iter(
+            FIXTURE_NAMES, iter(FIXTURE_TREES),
+            FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES,
+        )
+        _, with_none = rtd.pairwise_rf_from_newick_iter(
+            FIXTURE_NAMES, iter(FIXTURE_TREES),
+            FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES,
+            progress_callback=None,
+        )
+        assert baseline == with_none
+
+    def test_callback_invoked_rf(self):
+        """For a >= 50-tree input the callback receives at least the final 1.0."""
+        fracs = []
+        rtd.pairwise_rf_from_newick_iter(
+            self.LARGE_NAMES, iter(self.LARGE_NEWICKS),
+            self.LARGE_TRANSLATE, self.LARGE_MAP_INDICES,
+            progress_callback=lambda f: fracs.append(f),
+        )
+        self._assert_valid_trace(fracs)
+
+    def test_values_unchanged_rf(self):
+        """Result is bit-identical with and without a callback."""
+        _, baseline = rtd.pairwise_rf_from_newick_iter(
+            FIXTURE_NAMES, iter(FIXTURE_TREES),
+            FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES,
+        )
+        _, with_cb = rtd.pairwise_rf_from_newick_iter(
+            FIXTURE_NAMES, iter(FIXTURE_TREES),
+            FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES,
+            progress_callback=lambda _f: None,
+        )
+        assert baseline == with_cb
+
+    def test_values_unchanged_wrf(self):
+        _, baseline = rtd.pairwise_wrf_from_newick_iter(
+            FIXTURE_NAMES, iter(FIXTURE_TREES),
+            FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES,
+        )
+        _, with_cb = rtd.pairwise_wrf_from_newick_iter(
+            FIXTURE_NAMES, iter(FIXTURE_TREES),
+            FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES,
+            progress_callback=lambda _f: None,
+        )
+        assert baseline == with_cb
+
+    def test_values_unchanged_kf(self):
+        _, baseline = rtd.pairwise_kf_from_newick_iter(
+            FIXTURE_NAMES, iter(FIXTURE_TREES),
+            FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES,
+        )
+        _, with_cb = rtd.pairwise_kf_from_newick_iter(
+            FIXTURE_NAMES, iter(FIXTURE_TREES),
+            FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES,
+            progress_callback=lambda _f: None,
+        )
+        assert baseline == with_cb
+
+    def test_callback_fires_on_all_with_snapshots_variants(self):
+        """All three *_with_snapshots variants accept and invoke the callback."""
+        for func in (
+            rtd.pairwise_rf_with_snapshots_from_newick_iter,
+            rtd.pairwise_wrf_with_snapshots_from_newick_iter,
+            rtd.pairwise_kf_with_snapshots_from_newick_iter,
+        ):
+            fracs = []
+            func(
+                self.LARGE_NAMES, iter(self.LARGE_NEWICKS),
+                self.LARGE_TRANSLATE, self.LARGE_MAP_INDICES,
+                progress_callback=lambda f, _bin=fracs: _bin.append(f),
+            )
+            assert fracs and fracs[-1] == 1.0, (
+                f"{func.__name__} did not call back with 1.0 (got {fracs!r})"
+            )
+
+    def test_callback_exception_propagates(self):
+        """An exception raised inside the callback propagates out of the call."""
+        def boom(_frac):
+            raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            rtd.pairwise_rf_from_newick_iter(
+                self.LARGE_NAMES, iter(self.LARGE_NEWICKS),
+                self.LARGE_TRANSLATE, self.LARGE_MAP_INDICES,
+                progress_callback=boom,
+            )
+
+    def test_wrong_callback_signature_raises(self):
+        """A callback with the wrong arity surfaces as a TypeError."""
+        with pytest.raises(TypeError):
+            rtd.pairwise_rf_from_newick_iter(
+                self.LARGE_NAMES, iter(self.LARGE_NEWICKS),
+                self.LARGE_TRANSLATE, self.LARGE_MAP_INDICES,
+                progress_callback=lambda: None,  # missing the float arg
+            )
+
+
 if __name__ == "__main__":
     # Allow running tests directly
     pytest.main([__file__, "-v"])
