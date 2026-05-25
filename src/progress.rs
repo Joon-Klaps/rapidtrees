@@ -215,4 +215,46 @@ mod tests {
         };
         assert_eq!(with_none, with_counter);
     }
+
+    #[test]
+    fn pairwise_rf_counted_matches_uncounted_and_increments() {
+        // Exercises `Snapshots::pairwise_rf_counted` end-to-end: the matrix
+        // must be identical to the uncounted `pairwise_rf`, and the counter
+        // must land on exactly n*(n-1)/2.
+        let snaps = small_snapshot_set();
+        let n = 6;
+        let counter = AtomicUsize::new(0);
+        let counted = snaps.pairwise_rf_counted(&counter);
+        let uncounted = snaps.pairwise_rf();
+        assert_eq!(
+            counted, uncounted,
+            "pairwise_rf_counted must produce the same matrix as pairwise_rf"
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), n * (n - 1) / 2);
+    }
+
+    #[test]
+    fn pairwise_wrf_counted_matches_uncounted_and_increments() {
+        // Same contract for WRF — confirms the f64 metric path also hits the
+        // `counter.fetch_add` line in `pairwise_symmetric_counted`.
+        let snaps = small_snapshot_set();
+        let n = 6;
+        let counter = AtomicUsize::new(0);
+        let counted = snaps.pairwise_wrf_counted(&counter);
+        let uncounted = snaps.pairwise_wrf();
+        assert_eq!(counted, uncounted);
+        assert_eq!(counter.load(Ordering::Relaxed), n * (n - 1) / 2);
+    }
+
+    #[test]
+    fn pairwise_kf_counted_matches_uncounted_and_increments() {
+        // Same contract for KF.
+        let snaps = small_snapshot_set();
+        let n = 6;
+        let counter = AtomicUsize::new(0);
+        let counted = snaps.pairwise_kf_counted(&counter);
+        let uncounted = snaps.pairwise_kf();
+        assert_eq!(counted, uncounted);
+        assert_eq!(counter.load(Ordering::Relaxed), n * (n - 1) / 2);
+    }
 }

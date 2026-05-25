@@ -28,7 +28,7 @@ jobs:
               uses: taiki-e/install-action@cargo-llvm-cov
 
             - name: Generate Rust coverage
-              run: cargo llvm-cov --lib --lcov --output-path rust-lcov.info
+              run: cargo llvm-cov --lib --features python --lcov --output-path rust-lcov.info
 
             - name: Upload Rust coverage to Codecov
               uses: codecov/codecov-action@v5
