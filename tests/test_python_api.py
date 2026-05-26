@@ -1542,125 +1542,144 @@ class TestPairwiseKfWithSnapshots:
             assert r1[i] == r2[i]
 
 
-class TestProgressCallback:
-    """Tests for the optional ``progress_callback`` argument on all six
-    pairwise distance functions."""
+class TestProgressCounter:
+    """Tests for ``ProgressCounter`` — the sole progress interface.
 
-    # 50 trees → 1225 pairs. Big enough to give the 100 ms monitor a chance to
-    # fire mid-computation on slower CI runners.
+    Instantiate, hand to a pairwise function, and poll ``.value()`` /
+    ``.total()`` / ``.fraction()`` from another Python thread."""
+
+    # 60 trees → 1770 pairs. Enough for a polling thread to observe at least
+    # one mid-flight value before completion even on fast hardware.
     LARGE_NEWICKS = REFERENCE_NEWICKS * 5
     LARGE_NAMES = [f"t{i}" for i in range(len(LARGE_NEWICKS))]
     LARGE_TRANSLATE = [{}]
     LARGE_MAP_INDICES = [0] * len(LARGE_NEWICKS)
 
-    @staticmethod
-    def _assert_valid_trace(fracs):
-        """Common invariants for a captured callback trace."""
-        assert fracs, "progress_callback was never invoked"
-        for f in fracs:
-            assert isinstance(f, float)
-            assert 0.0 <= f <= 1.0
-        for prev, curr in zip(fracs, fracs[1:]):
-            assert curr >= prev, f"progress went backwards: {prev} → {curr}"
-        assert fracs[-1] == 1.0, f"final progress must be 1.0, got {fracs[-1]}"
+    def test_progress_counter_class_exists(self):
+        """rapidtrees exposes a ProgressCounter type with the expected methods."""
+        pc = rtd.ProgressCounter()
+        assert hasattr(pc, "value")
+        assert hasattr(pc, "total")
+        assert hasattr(pc, "fraction")
+        assert hasattr(pc, "reset")
 
-    def test_default_none_unchanged_rf(self):
-        """Omitting the kwarg matches the pre-existing behaviour exactly."""
-        _, baseline = rtd.pairwise_rf_from_newick_iter(
+    def test_initial_state_is_zero(self):
+        pc = rtd.ProgressCounter()
+        assert pc.value() == 0
+        assert pc.total() == 0
+        assert pc.fraction() == 0.0
+
+    def test_reset_clears_state(self):
+        pc = rtd.ProgressCounter()
+        rtd.pairwise_rf_from_newick_iter(
             FIXTURE_NAMES, iter(FIXTURE_TREES),
             FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES,
+            progress=pc,
         )
-        _, with_none = rtd.pairwise_rf_from_newick_iter(
-            FIXTURE_NAMES, iter(FIXTURE_TREES),
-            FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES,
-            progress_callback=None,
-        )
-        assert baseline == with_none
+        # After a call, total is set and value equals total.
+        assert pc.total() > 0
+        assert pc.value() == pc.total()
+        pc.reset()
+        assert pc.value() == 0
+        assert pc.total() == 0
 
-    def test_callback_invoked_rf(self):
-        """For a >= 50-tree input the callback receives at least the final 1.0."""
-        fracs = []
+    def test_counter_reaches_total_after_call(self):
+        """After ``pairwise_rf_from_newick_iter`` returns, the counter must
+        report ``value == total`` and ``total == n*(n-1)/2``."""
+        pc = rtd.ProgressCounter()
+        n = len(self.LARGE_NAMES)
         rtd.pairwise_rf_from_newick_iter(
             self.LARGE_NAMES, iter(self.LARGE_NEWICKS),
             self.LARGE_TRANSLATE, self.LARGE_MAP_INDICES,
-            progress_callback=lambda f: fracs.append(f),
+            progress=pc,
         )
-        self._assert_valid_trace(fracs)
+        assert pc.total() == n * (n - 1) // 2
+        assert pc.value() == pc.total()
+        assert pc.fraction() == 1.0
 
-    def test_values_unchanged_rf(self):
-        """Result is bit-identical with and without a callback."""
+    def test_values_unchanged_with_counter(self):
+        """Passing a counter produces a bit-identical result."""
+        pc = rtd.ProgressCounter()
         _, baseline = rtd.pairwise_rf_from_newick_iter(
             FIXTURE_NAMES, iter(FIXTURE_TREES),
             FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES,
         )
-        _, with_cb = rtd.pairwise_rf_from_newick_iter(
+        _, with_counter = rtd.pairwise_rf_from_newick_iter(
             FIXTURE_NAMES, iter(FIXTURE_TREES),
             FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES,
-            progress_callback=lambda _f: None,
+            progress=pc,
         )
-        assert baseline == with_cb
+        assert baseline == with_counter
 
-    def test_values_unchanged_wrf(self):
-        _, baseline = rtd.pairwise_wrf_from_newick_iter(
-            FIXTURE_NAMES, iter(FIXTURE_TREES),
-            FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES,
-        )
-        _, with_cb = rtd.pairwise_wrf_from_newick_iter(
-            FIXTURE_NAMES, iter(FIXTURE_TREES),
-            FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES,
-            progress_callback=lambda _f: None,
-        )
-        assert baseline == with_cb
+    def test_polling_thread_sees_mid_flight_value(self):
+        """The whole point of the pull interface: while ``pairwise_rf`` runs in
+        a background thread, the main thread can poll ``.value()`` and observe
+        progress strictly between 0 and total.
 
-    def test_values_unchanged_kf(self):
-        _, baseline = rtd.pairwise_kf_from_newick_iter(
-            FIXTURE_NAMES, iter(FIXTURE_TREES),
-            FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES,
-        )
-        _, with_cb = rtd.pairwise_kf_from_newick_iter(
-            FIXTURE_NAMES, iter(FIXTURE_TREES),
-            FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES,
-            progress_callback=lambda _f: None,
-        )
-        assert baseline == with_cb
+        Also implicitly verifies that the GIL is released during the call —
+        if it weren't, the polling thread would never get to run.
+        """
+        import threading
+        import time
 
-    def test_callback_fires_on_all_with_snapshots_variants(self):
-        """All three *_with_snapshots variants accept and invoke the callback."""
-        for func in (
+        pc = rtd.ProgressCounter()
+        observed = []
+        done_flag = threading.Event()
+
+        def worker():
+            try:
+                rtd.pairwise_rf_from_newick_iter(
+                    self.LARGE_NAMES, iter(self.LARGE_NEWICKS),
+                    self.LARGE_TRANSLATE, self.LARGE_MAP_INDICES,
+                    progress=pc,
+                )
+            finally:
+                done_flag.set()
+
+        t = threading.Thread(target=worker)
+        t.start()
+        # Poll while the worker runs. We can't guarantee timing on every
+        # platform, but for 1770 pairs there is *some* mid-flight window.
+        for _ in range(200):
+            if done_flag.is_set():
+                break
+            observed.append(pc.value())
+            time.sleep(0.001)
+        t.join()
+
+        assert observed, "polling loop never recorded a sample"
+        # Final state must be fully done.
+        assert pc.value() == pc.total()
+        # All observed samples must be in [0, total] and monotonically rising.
+        total = pc.total()
+        for sample in observed:
+            assert 0 <= sample <= total
+        for prev, curr in zip(observed, observed[1:]):
+            assert curr >= prev, f"counter went backwards: {prev} → {curr}"
+
+    def test_works_on_all_six_functions(self):
+        """All six pairwise functions accept the counter and end at 1.0."""
+        funcs = [
+            rtd.pairwise_rf_from_newick_iter,
+            rtd.pairwise_wrf_from_newick_iter,
+            rtd.pairwise_kf_from_newick_iter,
             rtd.pairwise_rf_with_snapshots_from_newick_iter,
             rtd.pairwise_wrf_with_snapshots_from_newick_iter,
             rtd.pairwise_kf_with_snapshots_from_newick_iter,
-        ):
-            fracs = []
-            func(
-                self.LARGE_NAMES, iter(self.LARGE_NEWICKS),
-                self.LARGE_TRANSLATE, self.LARGE_MAP_INDICES,
-                progress_callback=lambda f, _bin=fracs: _bin.append(f),
+        ]
+        for f in funcs:
+            pc = rtd.ProgressCounter()
+            f(
+                FIXTURE_NAMES, iter(FIXTURE_TREES),
+                FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES,
+                progress=pc,
             )
-            assert fracs and fracs[-1] == 1.0, (
-                f"{func.__name__} did not call back with 1.0 (got {fracs!r})"
-            )
+            assert pc.fraction() == 1.0, f"{f.__name__} did not finish at 1.0"
 
-    def test_callback_exception_propagates(self):
-        """An exception raised inside the callback propagates out of the call."""
-        def boom(_frac):
-            raise RuntimeError("boom")
-
-        with pytest.raises(RuntimeError, match="boom"):
-            rtd.pairwise_rf_from_newick_iter(
-                self.LARGE_NAMES, iter(self.LARGE_NEWICKS),
-                self.LARGE_TRANSLATE, self.LARGE_MAP_INDICES,
-                progress_callback=boom,
-            )
-
-    def test_wrong_callback_signature_raises(self):
-        """A callback with the wrong arity surfaces as a TypeError."""
-        with pytest.raises(TypeError):
-            rtd.pairwise_rf_from_newick_iter(
-                self.LARGE_NAMES, iter(self.LARGE_NEWICKS),
-                self.LARGE_TRANSLATE, self.LARGE_MAP_INDICES,
-                progress_callback=lambda: None,  # missing the float arg
-            )
+    def test_repr_includes_state(self):
+        pc = rtd.ProgressCounter()
+        r = repr(pc)
+        assert "ProgressCounter" in r and "value=0" in r and "total=0" in r
 
 
 if __name__ == "__main__":

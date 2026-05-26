@@ -9,10 +9,10 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyIterator};
 use std::collections::HashMap;
 
-use crate::progress::with_progress;
+use crate::progress::{ProgressCounter, with_counter};
 use crate::snapshot::Snapshots;
 
-/// Number of upper-triangle pairs for `n` trees — what a `progress_callback`
+/// Number of upper-triangle pairs for `n` trees — what a [`ProgressCounter`]
 /// counts up to as "100% done".
 #[inline]
 fn n_pairs(n: usize) -> usize {
@@ -95,13 +95,13 @@ fn validate_iter_args(
 ///     translate_maps: List of translate maps (number → taxon name).
 ///     map_indices: Per-tree index into translate_maps.
 ///     rooted: If True compare clades; if False compare bipartitions (default: False).
-///     progress_callback: Optional callable invoked periodically (~10 Hz) with a
-///         single ``float`` argument in ``[0.0, 1.0]`` representing the fraction
-///         of pairs completed. The final call always receives ``1.0``. Exceptions
-///         raised by the callback (including ``KeyboardInterrupt``) propagate
-///         out of this function. ``None`` (default) disables progress reporting
-///         entirely — no overhead and the GIL is held throughout, matching the
-///         pre-progress behaviour.
+///     progress: Optional ``rapidtrees.ProgressCounter``. Instantiate one,
+///         hand it in, then read ``.value()`` / ``.total()`` / ``.fraction()``
+///         from any other Python thread to observe live progress. While the
+///         counter is in use the GIL is released for the duration of the
+///         pairwise loop, so a polling thread runs unimpeded. When ``None``
+///         (the default) the call has zero progress-related overhead and the
+///         GIL stays held throughout.
 ///
 /// Returns:
 ///     (tree_names, rf_matrix_bytes) — rf_matrix_bytes is flat u32 bytes (row-major n×n).
@@ -109,7 +109,7 @@ fn validate_iter_args(
 /// Raises:
 ///     ValueError: If fewer than 2 trees, leaf sets differ, or argument lengths mismatch.
 #[pyfunction]
-#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false, progress_callback=None))]
+#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false, progress=None))]
 fn pairwise_rf_from_newick_iter(
     py: Python<'_>,
     names: Vec<String>,
@@ -117,14 +117,14 @@ fn pairwise_rf_from_newick_iter(
     translate_maps: Vec<HashMap<String, String>>,
     map_indices: Vec<usize>,
     rooted: bool,
-    progress_callback: Option<Py<PyAny>>,
+    progress: Option<Py<ProgressCounter>>,
 ) -> PyResult<(Vec<String>, Py<PyAny>)> {
     validate_iter_args(&names, &map_indices, &translate_maps)?;
 
     let snaps = collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted)?;
 
     let n = snaps.snapshots.len();
-    let rf_matrix = with_progress(py, progress_callback, n_pairs(n), |counter| {
+    let rf_matrix = with_counter(py, progress, n_pairs(n), |counter| {
         snaps.pairwise_rf_counted(counter)
     })?;
     let rf_bytes: Vec<u8> = rf_matrix
@@ -184,8 +184,9 @@ fn pairwise_rf_from_newick_iter(
 ///     translate_maps: List of translate maps (number → taxon name).
 ///     map_indices: Per-tree index into translate_maps.
 ///     rooted: If True compare clades; if False compare bipartitions (default: False).
-///     progress_callback: Optional ``Callable[[float], None]`` invoked with the
-///         fraction of pairs completed (final call is ``1.0``). See
+///     progress: Optional ``rapidtrees.ProgressCounter`` whose ``.value()`` /
+///         ``.total()`` / ``.fraction()`` reflect live progress. Typically
+///         polled from another Python thread. See
 ///         ``pairwise_rf_from_newick_iter`` for details.
 ///
 /// Returns:
@@ -195,7 +196,7 @@ fn pairwise_rf_from_newick_iter(
 /// Raises:
 ///     ValueError: If fewer than 2 trees, leaf sets differ, or argument lengths mismatch.
 #[pyfunction]
-#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false, progress_callback=None))]
+#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false, progress=None))]
 fn pairwise_rf_with_snapshots_from_newick_iter(
     py: Python<'_>,
     names: Vec<String>,
@@ -203,14 +204,14 @@ fn pairwise_rf_with_snapshots_from_newick_iter(
     translate_maps: Vec<HashMap<String, String>>,
     map_indices: Vec<usize>,
     rooted: bool,
-    progress_callback: Option<Py<PyAny>>,
+    progress: Option<Py<ProgressCounter>>,
 ) -> PyResult<PyRfSnapshotResult> {
     validate_iter_args(&names, &map_indices, &translate_maps)?;
 
     let snaps = collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted)?;
 
     let n = snaps.snapshots.len();
-    let rf_matrix = with_progress(py, progress_callback, n_pairs(n), |counter| {
+    let rf_matrix = with_counter(py, progress, n_pairs(n), |counter| {
         snaps.pairwise_rf_counted(counter)
     })?;
     let rf_bytes: Vec<u8> = rf_matrix
@@ -261,8 +262,9 @@ fn pairwise_rf_with_snapshots_from_newick_iter(
 ///     translate_maps: List of translate maps (number → taxon name).
 ///     map_indices: Per-tree index into translate_maps.
 ///     rooted: If True compare clades; if False compare bipartitions (default: False).
-///     progress_callback: Optional ``Callable[[float], None]`` invoked with the
-///         fraction of pairs completed (final call is ``1.0``). See
+///     progress: Optional ``rapidtrees.ProgressCounter`` whose ``.value()`` /
+///         ``.total()`` / ``.fraction()`` reflect live progress. Typically
+///         polled from another Python thread. See
 ///         ``pairwise_rf_from_newick_iter`` for details.
 ///
 /// Returns:
@@ -273,7 +275,7 @@ fn pairwise_rf_with_snapshots_from_newick_iter(
 /// Raises:
 ///     ValueError: If fewer than 2 trees, leaf sets differ, or argument lengths mismatch.
 #[pyfunction]
-#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false, progress_callback=None))]
+#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false, progress=None))]
 fn pairwise_wrf_with_snapshots_from_newick_iter(
     py: Python<'_>,
     names: Vec<String>,
@@ -281,14 +283,14 @@ fn pairwise_wrf_with_snapshots_from_newick_iter(
     translate_maps: Vec<HashMap<String, String>>,
     map_indices: Vec<usize>,
     rooted: bool,
-    progress_callback: Option<Py<PyAny>>,
+    progress: Option<Py<ProgressCounter>>,
 ) -> PyResult<PyRfSnapshotResult> {
     validate_iter_args(&names, &map_indices, &translate_maps)?;
 
     let snaps = collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted)?;
 
     let n = snaps.snapshots.len();
-    let wrf_matrix = with_progress(py, progress_callback, n_pairs(n), |counter| {
+    let wrf_matrix = with_counter(py, progress, n_pairs(n), |counter| {
         snaps.pairwise_wrf_counted(counter)
     })?;
     let wrf_bytes: Vec<u8> = wrf_matrix.iter().flat_map(|&v| v.to_ne_bytes()).collect();
@@ -323,8 +325,9 @@ fn pairwise_wrf_with_snapshots_from_newick_iter(
 ///     translate_maps: List of translate maps (number → taxon name).
 ///     map_indices: Per-tree index into translate_maps.
 ///     rooted: If True compare clades; if False compare bipartitions (default: False).
-///     progress_callback: Optional ``Callable[[float], None]`` invoked with the
-///         fraction of pairs completed (final call is ``1.0``). See
+///     progress: Optional ``rapidtrees.ProgressCounter`` whose ``.value()`` /
+///         ``.total()`` / ``.fraction()`` reflect live progress. Typically
+///         polled from another Python thread. See
 ///         ``pairwise_rf_from_newick_iter`` for details.
 ///
 /// Returns:
@@ -335,7 +338,7 @@ fn pairwise_wrf_with_snapshots_from_newick_iter(
 /// Raises:
 ///     ValueError: If fewer than 2 trees, leaf sets differ, or argument lengths mismatch.
 #[pyfunction]
-#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false, progress_callback=None))]
+#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false, progress=None))]
 fn pairwise_kf_with_snapshots_from_newick_iter(
     py: Python<'_>,
     names: Vec<String>,
@@ -343,14 +346,14 @@ fn pairwise_kf_with_snapshots_from_newick_iter(
     translate_maps: Vec<HashMap<String, String>>,
     map_indices: Vec<usize>,
     rooted: bool,
-    progress_callback: Option<Py<PyAny>>,
+    progress: Option<Py<ProgressCounter>>,
 ) -> PyResult<PyRfSnapshotResult> {
     validate_iter_args(&names, &map_indices, &translate_maps)?;
 
     let snaps = collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted)?;
 
     let n = snaps.snapshots.len();
-    let kf_matrix = with_progress(py, progress_callback, n_pairs(n), |counter| {
+    let kf_matrix = with_counter(py, progress, n_pairs(n), |counter| {
         snaps.pairwise_kf_counted(counter)
     })?;
     let kf_bytes: Vec<u8> = kf_matrix.iter().flat_map(|&v| v.to_ne_bytes()).collect();
@@ -381,8 +384,9 @@ fn pairwise_kf_with_snapshots_from_newick_iter(
 ///     translate_maps: List of translate maps (number → taxon name).
 ///     map_indices: Per-tree index into translate_maps.
 ///     rooted: If True compare clades; if False compare bipartitions (default: False).
-///     progress_callback: Optional ``Callable[[float], None]`` invoked with the
-///         fraction of pairs completed (final call is ``1.0``). See
+///     progress: Optional ``rapidtrees.ProgressCounter`` whose ``.value()`` /
+///         ``.total()`` / ``.fraction()`` reflect live progress. Typically
+///         polled from another Python thread. See
 ///         ``pairwise_rf_from_newick_iter`` for details.
 ///
 /// Returns:
@@ -391,7 +395,7 @@ fn pairwise_kf_with_snapshots_from_newick_iter(
 /// Raises:
 ///     ValueError: If fewer than 2 trees, leaf sets differ, or argument lengths mismatch.
 #[pyfunction]
-#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false, progress_callback=None))]
+#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false, progress=None))]
 fn pairwise_wrf_from_newick_iter(
     py: Python<'_>,
     names: Vec<String>,
@@ -399,14 +403,14 @@ fn pairwise_wrf_from_newick_iter(
     translate_maps: Vec<HashMap<String, String>>,
     map_indices: Vec<usize>,
     rooted: bool,
-    progress_callback: Option<Py<PyAny>>,
+    progress: Option<Py<ProgressCounter>>,
 ) -> PyResult<(Vec<String>, Vec<f64>)> {
     validate_iter_args(&names, &map_indices, &translate_maps)?;
 
     let snaps = collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted)?;
 
     let n = snaps.snapshots.len();
-    let matrix = with_progress(py, progress_callback, n_pairs(n), |counter| {
+    let matrix = with_counter(py, progress, n_pairs(n), |counter| {
         snaps.pairwise_wrf_counted(counter)
     })?;
     Ok((names, matrix))
@@ -420,8 +424,9 @@ fn pairwise_wrf_from_newick_iter(
 ///     translate_maps: List of translate maps (number → taxon name).
 ///     map_indices: Per-tree index into translate_maps.
 ///     rooted: If True compare clades; if False compare bipartitions (default: False).
-///     progress_callback: Optional ``Callable[[float], None]`` invoked with the
-///         fraction of pairs completed (final call is ``1.0``). See
+///     progress: Optional ``rapidtrees.ProgressCounter`` whose ``.value()`` /
+///         ``.total()`` / ``.fraction()`` reflect live progress. Typically
+///         polled from another Python thread. See
 ///         ``pairwise_rf_from_newick_iter`` for details.
 ///
 /// Returns:
@@ -430,7 +435,7 @@ fn pairwise_wrf_from_newick_iter(
 /// Raises:
 ///     ValueError: If fewer than 2 trees, leaf sets differ, or argument lengths mismatch.
 #[pyfunction]
-#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false, progress_callback=None))]
+#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false, progress=None))]
 fn pairwise_kf_from_newick_iter(
     py: Python<'_>,
     names: Vec<String>,
@@ -438,14 +443,14 @@ fn pairwise_kf_from_newick_iter(
     translate_maps: Vec<HashMap<String, String>>,
     map_indices: Vec<usize>,
     rooted: bool,
-    progress_callback: Option<Py<PyAny>>,
+    progress: Option<Py<ProgressCounter>>,
 ) -> PyResult<(Vec<String>, Vec<f64>)> {
     validate_iter_args(&names, &map_indices, &translate_maps)?;
 
     let snaps = collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted)?;
 
     let n = snaps.snapshots.len();
-    let matrix = with_progress(py, progress_callback, n_pairs(n), |counter| {
+    let matrix = with_counter(py, progress, n_pairs(n), |counter| {
         snaps.pairwise_kf_counted(counter)
     })?;
     Ok((names, matrix))
@@ -469,6 +474,7 @@ fn rapidtrees(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(pairwise_wrf_from_newick_iter, m)?)?;
     m.add_function(wrap_pyfunction!(pairwise_kf_from_newick_iter, m)?)?;
+    m.add_class::<ProgressCounter>()?;
     Ok(())
 }
 

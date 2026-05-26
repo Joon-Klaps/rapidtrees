@@ -97,6 +97,24 @@ pixi run test-python         # pytest tests/test_python_api.py -v
 pixi run cargo bench
 ```
 
+### Pixi auto-sync gotcha
+
+Pixi's `[tool.pixi.pypi-dependencies]` declares `rapidtrees = { path = ".", editable = true }`, which means **every `pixi run X` first re-syncs the editable install from pixi's own cached wheel**. If you just edited Rust code and then run any pixi task, that sync silently overwrites your fresh `maturin develop` build with the cached (old) `.so`.
+
+Symptoms: tests pass on the Rust side (`cargo test`) but the Python side reports `AttributeError`/missing functions or shows behaviour from a previous build, with the installed `.so` mysteriously reverting to an older size/timestamp.
+
+Workarounds (in order of preference):
+1. After `pixi run develop`, run python tests with the env interpreter directly to bypass the sync:
+   ```bash
+   .pixi/envs/default/bin/python -m pytest tests/test_python_api.py
+   ```
+2. Force a fresh install by deleting the installed package first:
+   ```bash
+   rm -rf .pixi/envs/default/lib/python3.12/site-packages/rapidtrees*
+   pixi run maturin develop --uv
+   ```
+3. If pixi's cache itself is poisoned: `uv cache clean rapidtrees`.
+
 ---
 
 ## CI requirements (must pass on every PR)

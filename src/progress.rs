@@ -1,25 +1,101 @@
 //! Progress reporting for long-running pairwise computations.
 //!
-//! Bridges a thread-safe `AtomicUsize` work counter (incremented from rayon
-//! worker threads) and an optional Python callback. A dedicated monitor
-//! thread polls the counter on a fixed interval and invokes the callback
-//! with a fraction in `[0.0, 1.0]`. The main computation thread releases the
-//! GIL with [`pyo3::Python::detach`] so the monitor can re-acquire it
-//! independently.
+//! A single Python-facing handle, [`ProgressCounter`], that the caller
+//! instantiates and passes to a pairwise function. Internally it wraps an
+//! `Arc<AtomicUsize>` that rayon workers bump as they finish rows; Python
+//! reads `.value()` / `.total()` / `.fraction()` on its own cadence
+//! (typically from another thread while the pairwise call blocks).
 //!
-//! When no callback is supplied, [`with_progress`] short-circuits and runs
-//! the work with a throwaway counter and no GIL release — preserving the
-//! original zero-overhead path.
+//! Reading is a single atomic load (~1 ns). There is no callback, no
+//! monitor thread, no GIL acquisition from Rust — the caller decides when
+//! and how often to look at the counter.
+//!
+//! When no counter is supplied the GIL stays held and the call has zero
+//! progress-related overhead.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::thread;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pyo3::prelude::*;
 
-/// How often the monitor thread wakes up to poll the counter.
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Thread-safe pair-completion counter that Python code can read on its own
+/// schedule while a Rust pairwise computation runs in another thread.
+///
+/// Construct with `rapidtrees.ProgressCounter()`, pass to any of the
+/// `pairwise_*_from_newick_iter` functions as `progress=...`. The function
+/// (a) resets the counter and sets its `total` to `n*(n-1)/2` at entry,
+/// (b) atomically increments it as rayon workers finish rows, and
+/// (c) releases the GIL while the rayon loop runs so a polling Python thread
+/// can keep reading the counter.
+///
+/// Reading is lock-free: `.value()` is a single atomic load (~1 ns).
+#[pyclass(module = "rapidtrees")]
+#[derive(Clone)]
+pub struct ProgressCounter {
+    /// Pairs completed so far. Bumped by rayon workers via `fetch_add`.
+    value: Arc<AtomicUsize>,
+    /// `n*(n-1)/2` for the current call (0 before any call is in flight).
+    total: Arc<AtomicUsize>,
+}
+
+#[pymethods]
+impl ProgressCounter {
+    /// Construct a fresh counter at `value=0`, `total=0`.
+    #[new]
+    fn new() -> Self {
+        Self {
+            value: Arc::new(AtomicUsize::new(0)),
+            total: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Pairs completed so far (lock-free atomic load).
+    fn value(&self) -> usize {
+        self.value.load(Ordering::Relaxed)
+    }
+
+    /// Total pairs the in-flight call will compute (``n*(n-1)/2``), or ``0``
+    /// before any call has started.
+    fn total(&self) -> usize {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    /// ``value() / total()`` clamped to ``[0.0, 1.0]``. Returns ``0.0`` if
+    /// no call has started yet (``total == 0``).
+    fn fraction(&self) -> f64 {
+        frac_done(self.value(), self.total())
+    }
+
+    /// Reset `value` and `total` to ``0``. Called automatically at the start
+    /// of every pairwise call that takes this counter; exposed so consumers
+    /// can also reset between manual runs.
+    fn reset(&self) {
+        self.value.store(0, Ordering::Relaxed);
+        self.total.store(0, Ordering::Relaxed);
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ProgressCounter(value={}, total={})",
+            self.value(),
+            self.total()
+        )
+    }
+}
+
+impl ProgressCounter {
+    /// Take a snapshot of the internal atomics so they can be shared with
+    /// rayon worker threads without holding a `Py<…>` reference.
+    pub(crate) fn arc_value(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.value)
+    }
+
+    /// Initialise the counter for a new pairwise call.
+    pub(crate) fn begin(&self, total: usize) {
+        self.value.store(0, Ordering::Relaxed);
+        self.total.store(total, Ordering::Relaxed);
+    }
+}
 
 /// Convert a (done, total) pair into a fraction in `[0.0, 1.0]`.
 ///
@@ -35,27 +111,20 @@ fn frac_done(done: usize, total: usize) -> f64 {
     }
 }
 
-/// Run `f` while reporting progress to an optional Python `callback`.
+/// Run `f` while exposing live progress through an optional
+/// [`ProgressCounter`].
 ///
-/// `f` receives a reference to an [`AtomicUsize`] that it must increment as
-/// work units complete. `total` is the count that corresponds to "100% done"
-/// — the callback receives `done / total` clamped to `[0.0, 1.0]`.
+/// `f` receives a reference to the [`AtomicUsize`] that it must increment as
+/// work units complete. When `counter` is `Some`, that atomic is shared with
+/// the user's `ProgressCounter` (so `.value()` reads the live count) and the
+/// GIL is released for the duration of `f` — without this a Python polling
+/// thread couldn't run.
 ///
-/// Behaviour:
-/// - **`callback == None`**: `f` is invoked directly with a dummy counter.
-///   No monitor thread, no GIL release, no callbacks fired. Zero overhead.
-/// - **`callback == Some(cb)`**:
-///   1. A monitor thread is spawned that polls every `POLL_INTERVAL`.
-///   2. `f` runs inside `py.allow_threads(|| ...)` so the monitor can grab
-///      the GIL and invoke `cb(frac)` periodically.
-///   3. The monitor also calls `Python::check_signals()`, so a Python
-///      `KeyboardInterrupt` propagates through the callback as a `PyErr`.
-///   4. After `f` returns, a final `cb(1.0)` is fired and any error from
-///      the callback (or `check_signals`) is propagated as the function's
-///      `Err` return.
-pub(crate) fn with_progress<R, F>(
+/// When `counter` is `None` we take the fast path: no Arc, no GIL release,
+/// same cost as a plain function call.
+pub(crate) fn with_counter<R, F>(
     py: Python<'_>,
-    callback: Option<Py<PyAny>>,
+    counter: Option<Py<ProgressCounter>>,
     total: usize,
     f: F,
 ) -> PyResult<R>
@@ -63,61 +132,24 @@ where
     R: Send,
     F: Send + FnOnce(&AtomicUsize) -> R,
 {
-    // Fast path: no callback supplied → run inline, no monitor, no GIL release.
-    let Some(cb) = callback else {
-        let counter = AtomicUsize::new(0);
-        return Ok(f(&counter));
+    let Some(pc) = counter else {
+        // Fast path: GIL stays held, single stack-allocated counter.
+        let local = AtomicUsize::new(0);
+        return Ok(f(&local));
     };
 
-    let counter = Arc::new(AtomicUsize::new(0));
-    let terminate = Arc::new(AtomicBool::new(false));
-    // Shared slot for an error raised by the Python callback (or check_signals).
-    let cb_error: Arc<std::sync::Mutex<Option<PyErr>>> = Arc::new(std::sync::Mutex::new(None));
+    // Share the user's atomic so .value() reflects what the rayon workers see.
+    let work_counter = {
+        let pc_ref = pc.borrow(py);
+        pc_ref.begin(total);
+        pc_ref.arc_value()
+    };
 
-    let monitor_counter = Arc::clone(&counter);
-    let monitor_terminate = Arc::clone(&terminate);
-    let monitor_error = Arc::clone(&cb_error);
-    let monitor_cb = cb.clone_ref(py);
+    let result = py.detach(|| f(&work_counter));
 
-    let monitor = thread::spawn(move || {
-        let mut last_frac: f64 = -1.0;
-        loop {
-            thread::sleep(POLL_INTERVAL);
-            if monitor_terminate.load(Ordering::Relaxed) {
-                return;
-            }
-            let done = monitor_counter.load(Ordering::Relaxed);
-            let frac = frac_done(done, total);
-            if frac == last_frac {
-                continue;
-            }
-            last_frac = frac;
-
-            let outcome: PyResult<()> = Python::attach(|py| {
-                monitor_cb.call1(py, (frac,))?;
-                py.check_signals()?;
-                Ok(())
-            });
-            if let Err(err) = outcome {
-                *monitor_error.lock().expect("progress mutex poisoned") = Some(err);
-                return;
-            }
-        }
-    });
-
-    let result = py.detach(|| f(&counter));
-
-    terminate.store(true, Ordering::Relaxed);
-    let _ = monitor.join();
-
-    // Surface any error raised inside the monitor (callback or KeyboardInterrupt).
-    if let Some(err) = cb_error.lock().expect("progress mutex poisoned").take() {
-        return Err(err);
-    }
-
-    // Final callback at exactly 1.0 so consumers can finalise their progress UI.
-    cb.call1(py, (1.0_f64,))?;
-    py.check_signals()?;
+    // Pin the final count at exactly `total` so callers polling for
+    // `value == total` (or `fraction == 1.0`) always observe completion.
+    work_counter.store(total, Ordering::Relaxed);
 
     Ok(result)
 }
@@ -256,5 +288,66 @@ mod tests {
         let uncounted = snaps.pairwise_kf();
         assert_eq!(counted, uncounted);
         assert_eq!(counter.load(Ordering::Relaxed), n * (n - 1) / 2);
+    }
+
+    // -- ProgressCounter (pure-Rust portions) ---------------------------------
+
+    use super::ProgressCounter;
+
+    #[test]
+    fn progress_counter_new_is_zero() {
+        let pc = ProgressCounter::new();
+        assert_eq!(pc.value(), 0);
+        assert_eq!(pc.total(), 0);
+        assert_eq!(pc.fraction(), 0.0);
+    }
+
+    #[test]
+    fn progress_counter_begin_sets_total_and_resets_value() {
+        let pc = ProgressCounter::new();
+        // Simulate a prior call leaving the value non-zero.
+        pc.arc_value().store(123, Ordering::Relaxed);
+        pc.begin(500);
+        assert_eq!(pc.value(), 0);
+        assert_eq!(pc.total(), 500);
+        assert_eq!(pc.fraction(), 0.0);
+    }
+
+    #[test]
+    fn progress_counter_fraction_endpoints_and_overshoot() {
+        let pc = ProgressCounter::new();
+        pc.begin(10);
+        assert_eq!(pc.fraction(), 0.0);
+        pc.arc_value().store(5, Ordering::Relaxed);
+        assert!((pc.fraction() - 0.5).abs() < 1e-12);
+        pc.arc_value().store(10, Ordering::Relaxed);
+        assert_eq!(pc.fraction(), 1.0);
+        // Overshoot must still report 1.0 (matches the callback monitor's
+        // clamping behaviour — UIs assume the fraction never exceeds 1.0).
+        pc.arc_value().store(99, Ordering::Relaxed);
+        assert_eq!(pc.fraction(), 1.0);
+    }
+
+    #[test]
+    fn progress_counter_reset_clears_both_fields() {
+        let pc = ProgressCounter::new();
+        pc.begin(42);
+        pc.arc_value().store(7, Ordering::Relaxed);
+        pc.reset();
+        assert_eq!(pc.value(), 0);
+        assert_eq!(pc.total(), 0);
+    }
+
+    #[test]
+    fn progress_counter_arc_value_is_shared() {
+        // Cloning the inner Arc must give us a handle to the SAME atomic that
+        // ProgressCounter's `.value()` reads. This is the invariant
+        // `with_counter` relies on to make rayon writes visible to Python.
+        let pc = ProgressCounter::new();
+        pc.begin(100);
+        let shared = pc.arc_value();
+        shared.fetch_add(33, Ordering::Relaxed);
+        assert_eq!(pc.value(), 33);
+        assert!((pc.fraction() - 0.33).abs() < 1e-12);
     }
 }

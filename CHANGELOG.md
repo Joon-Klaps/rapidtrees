@@ -11,7 +11,7 @@ This project uses release names based on random words from [codenamegenerator.co
 
 ## [Unreleased]
 
-- Added optional `progress_callback: Callable[[float], None]` argument to all six pairwise distance entry points (`pairwise_rf_from_newick_iter`, `pairwise_wrf_from_newick_iter`, `pairwise_kf_from_newick_iter`, and their three `*_with_snapshots_from_newick_iter` variants). The callback receives the fraction of upper-triangle pairs completed (`0.0`–`1.0`), is invoked at roughly 10 Hz by a dedicated monitor thread, and always receives a final `1.0`. The default `None` preserves the previous zero-overhead behaviour. As a bonus, `KeyboardInterrupt` now propagates out of long pairwise calls.
+- Added `rapidtrees.ProgressCounter` — a lock-free, Python-facing handle for observing live progress of a pairwise distance call. Instantiate one, pass it as `progress=` to any of the six `pairwise_*_from_newick_iter` functions, and read `.value()` / `.total()` / `.fraction()` from another Python thread while the call blocks. The GIL is released for the duration of the rayon loop only when a counter is supplied; passing `None` (the default) preserves the original zero-overhead, GIL-held behaviour. Reading is a single atomic load (~1 ns) — no callback, no GIL acquisition from Rust, no monitor thread.
 - CLI: when stderr is a TTY and `--quiet` is not set, the `rapidtrees` binary now renders a live progress bar to stderr during pairwise distance computation (e.g. `[█████████░░░░░] 64.2% (3211/5000 pairs, ETA 4.1s)`). Piped/redirected runs are unaffected — the bar auto-suppresses when stderr is not a terminal.
 
 ## [0.5.1] - 0.5.1 - Azure Mamba (2026-05-12)
