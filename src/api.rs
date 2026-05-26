@@ -540,3 +540,267 @@ mod tests {
         assert!(pairs.is_empty());
     }
 }
+
+/// Embedded-Python integration tests that exercise every PyO3 entry point
+/// from Rust.
+///
+/// **Why** — `cargo test --lib` would normally never enter any `#[pyfunction]`
+/// body or `ProgressCounter`'s `#[pymethods]`: they are only reachable through
+/// the Python interpreter that loads the wheel. That made codecov report all
+/// PyO3 surface as `FNDA:0` (untested) even though pytest exercised it.
+///
+/// This module pulls the Python interpreter into the test binary instead.
+/// `append_to_inittab!(rapidtrees)` registers the `#[pymodule] rapidtrees`
+/// function into the interpreter's built-in module table, and
+/// `prepare_freethreaded_python()` initialises CPython. From then on we can
+/// `py.import("rapidtrees")` and call the real `pairwise_*` / `ProgressCounter`
+/// functions exactly like Python would. cargo test now measures coverage of
+/// the whole PyO3 surface without needing pytest to be run under
+/// `cargo llvm-cov`.
+///
+/// Requires `cargo test --features python` (no `extension-module`, so the
+/// test binary links libpython) and `DYLD_LIBRARY_PATH` / `LD_LIBRARY_PATH`
+/// pointing at the python lib dir — pixi tasks set those for you.
+#[cfg(test)]
+mod py_integration_tests {
+    use pyo3::prelude::*;
+    use pyo3::types::{PyDict, PyList};
+    use std::sync::Once;
+
+    // Bring the `#[pymodule] fn rapidtrees` from the parent module into scope
+    // so the `append_to_inittab!` macro can find it by name.
+    use super::rapidtrees;
+
+    /// Initialise the embedded interpreter exactly once across all tests
+    /// running in this process.
+    fn ensure_python() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            pyo3::append_to_inittab!(rapidtrees);
+            Python::initialize();
+        });
+    }
+
+    /// Three small newicks with a known RF profile, ready to hand to a
+    /// pairwise function from Python.
+    fn fixture<'py>(py: Python<'py>) -> (Bound<'py, PyList>, Bound<'py, PyList>) {
+        let trees = PyList::new(
+            py,
+            [
+                "(A:0.1,(B:0.1,C:0.1):0.1);",
+                "(A:0.1,(C:0.1,B:0.1):0.1);",
+                "((A:0.1,B:0.1):0.1,C:0.1);",
+            ],
+        )
+        .unwrap();
+        let names = PyList::new(py, ["t0", "t1", "t2"]).unwrap();
+        (names, trees)
+    }
+
+    fn call_pairwise<'py>(
+        py: Python<'py>,
+        func_name: &str,
+        progress: Option<&Bound<'py, PyAny>>,
+    ) -> Bound<'py, PyAny> {
+        let rapidtrees = py.import("rapidtrees").expect("import rapidtrees");
+        let func = rapidtrees.getattr(func_name).expect(func_name);
+        let (names, trees) = fixture(py);
+        let translate_maps = PyList::new(py, [PyDict::new(py)]).unwrap();
+        let map_indices = PyList::new(py, [0i64, 0, 0]).unwrap();
+        let kwargs = PyDict::new(py);
+        if let Some(pc) = progress {
+            kwargs.set_item("progress", pc).unwrap();
+        }
+        func.call(
+            (
+                names,
+                trees.try_iter().unwrap(),
+                translate_maps,
+                map_indices,
+            ),
+            Some(&kwargs),
+        )
+        .unwrap_or_else(|e| panic!("{func_name} call failed: {e}"))
+    }
+
+    #[test]
+    fn rapidtrees_module_exports_expected_symbols() {
+        ensure_python();
+        Python::attach(|py| {
+            let m = py.import("rapidtrees").unwrap();
+            for name in [
+                "pairwise_rf_from_newick_iter",
+                "pairwise_wrf_from_newick_iter",
+                "pairwise_kf_from_newick_iter",
+                "pairwise_rf_with_snapshots_from_newick_iter",
+                "pairwise_wrf_with_snapshots_from_newick_iter",
+                "pairwise_kf_with_snapshots_from_newick_iter",
+                "ProgressCounter",
+            ] {
+                assert!(
+                    m.hasattr(name).unwrap(),
+                    "rapidtrees module is missing `{name}`"
+                );
+            }
+        });
+    }
+
+    /// Build a fresh ProgressCounter for tests that want to drive the
+    /// counter-bearing branch of `with_counter`. Without this the
+    /// counter-handling closure for that metric+variant monomorphization
+    /// stays at FNDA:0 in lcov.
+    fn fresh_counter<'py>(py: Python<'py>) -> Bound<'py, PyAny> {
+        py.import("rapidtrees")
+            .unwrap()
+            .getattr("ProgressCounter")
+            .unwrap()
+            .call0()
+            .unwrap()
+    }
+
+    #[test]
+    fn pairwise_rf_via_python_returns_bytes() {
+        ensure_python();
+        Python::attach(|py| {
+            let pc = fresh_counter(py);
+            let result = call_pairwise(py, "pairwise_rf_from_newick_iter", Some(&pc));
+            let tuple: (Vec<String>, Vec<u8>) = result.extract().unwrap();
+            assert_eq!(tuple.0.len(), 3);
+            assert_eq!(tuple.1.len(), 3 * 3 * 4); // n*n*sizeof(u32)
+            // Also exercises with_counter's `Some` branch + final `store` line.
+            let frac: f64 = pc.call_method0("fraction").unwrap().extract().unwrap();
+            assert_eq!(frac, 1.0);
+        });
+    }
+
+    #[test]
+    fn pairwise_wrf_via_python() {
+        ensure_python();
+        Python::attach(|py| {
+            let pc = fresh_counter(py);
+            let result = call_pairwise(py, "pairwise_wrf_from_newick_iter", Some(&pc));
+            let (_names, matrix): (Vec<String>, Vec<f64>) = result.extract().unwrap();
+            assert_eq!(matrix.len(), 9);
+        });
+    }
+
+    #[test]
+    fn pairwise_kf_via_python() {
+        ensure_python();
+        Python::attach(|py| {
+            let pc = fresh_counter(py);
+            let result = call_pairwise(py, "pairwise_kf_from_newick_iter", Some(&pc));
+            let (_names, matrix): (Vec<String>, Vec<f64>) = result.extract().unwrap();
+            assert_eq!(matrix.len(), 9);
+        });
+    }
+
+    #[test]
+    fn pairwise_rf_with_snapshots_via_python() {
+        ensure_python();
+        Python::attach(|py| {
+            let pc = fresh_counter(py);
+            let _ = call_pairwise(py, "pairwise_rf_with_snapshots_from_newick_iter", Some(&pc));
+        });
+    }
+
+    #[test]
+    fn pairwise_wrf_with_snapshots_via_python() {
+        ensure_python();
+        Python::attach(|py| {
+            let pc = fresh_counter(py);
+            let _ = call_pairwise(
+                py,
+                "pairwise_wrf_with_snapshots_from_newick_iter",
+                Some(&pc),
+            );
+        });
+    }
+
+    #[test]
+    fn pairwise_kf_with_snapshots_via_python() {
+        ensure_python();
+        Python::attach(|py| {
+            let pc = fresh_counter(py);
+            let _ = call_pairwise(py, "pairwise_kf_with_snapshots_from_newick_iter", Some(&pc));
+        });
+    }
+
+    /// One call without a counter, exercising the fast path inside
+    /// `with_counter` (the `None` arm — different code path from the
+    /// counter-bearing branch the rest of the tests cover).
+    #[test]
+    fn pairwise_without_counter_takes_fast_path() {
+        ensure_python();
+        Python::attach(|py| {
+            let result = call_pairwise(py, "pairwise_rf_from_newick_iter", None);
+            let tuple: (Vec<String>, Vec<u8>) = result.extract().unwrap();
+            assert_eq!(tuple.0.len(), 3);
+        });
+    }
+
+    #[test]
+    fn progress_counter_lifecycle() {
+        ensure_python();
+        Python::attach(|py| {
+            let m = py.import("rapidtrees").unwrap();
+            let pc_class = m.getattr("ProgressCounter").unwrap();
+            let pc = pc_class.call0().unwrap();
+
+            // Initial state — exercises ProgressCounter::value/total/fraction.
+            let zero: usize = pc.call_method0("value").unwrap().extract().unwrap();
+            assert_eq!(zero, 0);
+            let zero_total: usize = pc.call_method0("total").unwrap().extract().unwrap();
+            assert_eq!(zero_total, 0);
+            let zero_frac: f64 = pc.call_method0("fraction").unwrap().extract().unwrap();
+            assert_eq!(zero_frac, 0.0);
+
+            // __repr__ — codecov was flagging this as uncovered.
+            let repr = pc.repr().unwrap().to_string();
+            assert!(repr.contains("ProgressCounter"));
+            assert!(repr.contains("value=0"));
+            assert!(repr.contains("total=0"));
+
+            // Drive the counter through a real pairwise call. After the call
+            // value == total and fraction == 1.0.
+            let _ = call_pairwise(py, "pairwise_rf_from_newick_iter", Some(&pc));
+            let total: usize = pc.call_method0("total").unwrap().extract().unwrap();
+            let value: usize = pc.call_method0("value").unwrap().extract().unwrap();
+            let frac: f64 = pc.call_method0("fraction").unwrap().extract().unwrap();
+            assert_eq!(total, 3); // n*(n-1)/2 for n=3
+            assert_eq!(value, total);
+            assert_eq!(frac, 1.0);
+
+            // reset() — only line in __pymethod_reset__ that the unit tests
+            // alone never hit.
+            pc.call_method0("reset").unwrap();
+            let after: usize = pc.call_method0("value").unwrap().extract().unwrap();
+            let after_total: usize = pc.call_method0("total").unwrap().extract().unwrap();
+            assert_eq!(after, 0);
+            assert_eq!(after_total, 0);
+        });
+    }
+
+    #[test]
+    fn invalid_args_raise_value_error() {
+        ensure_python();
+        Python::attach(|py| {
+            // names < 2 → ValueError from validate_iter_args.
+            let m = py.import("rapidtrees").unwrap();
+            let func = m.getattr("pairwise_rf_from_newick_iter").unwrap();
+            let names = PyList::new(py, ["only-one"]).unwrap();
+            let trees = PyList::new(py, ["(A:0.1,B:0.1);"]).unwrap();
+            let translate_maps = PyList::new(py, [PyDict::new(py)]).unwrap();
+            let map_indices = PyList::new(py, [0i64]).unwrap();
+            let err = func
+                .call1((
+                    names,
+                    trees.try_iter().unwrap(),
+                    translate_maps,
+                    map_indices,
+                ))
+                .expect_err("expected ValueError for n<2");
+            assert!(err.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+        });
+    }
+}

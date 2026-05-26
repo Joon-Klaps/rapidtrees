@@ -41,6 +41,12 @@ jobs:
                       target
                   key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+            - name: Setup pixi
+              uses: prefix-dev/setup-pixi@v0
+              with:
+                  pixi-version: latest
+                  locked: true
+
             - name: Check formatting
               run: cargo fmt --all -- --check
 
@@ -51,7 +57,12 @@ jobs:
               run: cargo build --verbose
 
             - name: Run tests
-              # --features python pulls in progress.rs and its unit tests
+              # --features python compiles src/api.rs + src/progress.rs and
+              # their unit + embedded-Python integration tests.
+              env:
+                  PYO3_PYTHON: ${{ github.workspace }}/.pixi/envs/default/bin/python
+                  LD_LIBRARY_PATH: ${{ github.workspace }}/.pixi/envs/default/lib
+                  DYLD_LIBRARY_PATH: ${{ github.workspace }}/.pixi/envs/default/lib
               run: cargo test --verbose --lib --features python
 
             - name: Build release

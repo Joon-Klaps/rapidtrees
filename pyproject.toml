@@ -32,7 +32,7 @@ Repository = "https://github.com/Joon-Klaps/rapidtrees"
 dev = ["pytest", "numpy>=2.2.6", "pytest-cov"]
 
 [tool.maturin]
-features = ["python"]
+features = ["extension-module"]
 module-name = "rapidtrees"
 
 [tool.pixi.workspace]
@@ -66,7 +66,8 @@ py311 = ["py311"]
 py312 = ["py312"]
 
 [tool.pixi.tasks]
-test-rust = { cmd = "cargo test --lib --features python", description = "Run Rust unit tests (with the python feature so progress.rs tests are included)" }
+test-rust = { cmd = "cargo test --lib --features python", description = "Run Rust unit tests (with the python feature so progress.rs + embedded-Python integration tests are included)", env = { PYO3_PYTHON = "$CONDA_PREFIX/bin/python", LD_LIBRARY_PATH = "$CONDA_PREFIX/lib", DYLD_LIBRARY_PATH = "$CONDA_PREFIX/lib" } }
+test-rust-cov = { cmd = "cargo llvm-cov --lib --features python --lcov --output-path rust-lcov.info", description = "Run Rust + embedded-Python tests under llvm-cov and write rust-lcov.info", env = { PYO3_PYTHON = "$CONDA_PREFIX/bin/python", LD_LIBRARY_PATH = "$CONDA_PREFIX/lib", DYLD_LIBRARY_PATH = "$CONDA_PREFIX/lib" } }
 test-python = { cmd = "pytest tests/test_python_api.py -v", description = "Run Python API tests" }
 test-python-cov = { cmd = "pytest tests/test_python_api.py -v --cov=rapidtrees --cov-report=xml:python-coverage.xml", description = "Run Python tests with coverage" }
 develop = { cmd = "maturin develop --uv", description = "Build and install in editable mode" }
