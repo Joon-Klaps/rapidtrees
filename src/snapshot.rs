@@ -662,6 +662,34 @@ impl Snapshots {
         crate::distances::pairwise_symmetric(self, crate::distances::kf_distance_fast)
     }
 
+    /// Same as [`Self::pairwise_rf`], but increments `progress` by `n - i - 1`
+    /// after each row `i` finishes (so the counter reaches `n*(n-1)/2`).
+    pub fn pairwise_rf_counted(&self, progress: &std::sync::atomic::AtomicUsize) -> Vec<usize> {
+        crate::distances::pairwise_symmetric_counted(
+            self,
+            crate::distances::rf_distance_fast,
+            Some(progress),
+        )
+    }
+
+    /// Same as [`Self::pairwise_wrf`] but reports progress via `progress`.
+    pub fn pairwise_wrf_counted(&self, progress: &std::sync::atomic::AtomicUsize) -> Vec<f64> {
+        crate::distances::pairwise_symmetric_counted(
+            self,
+            crate::distances::wrf_distance_fast,
+            Some(progress),
+        )
+    }
+
+    /// Same as [`Self::pairwise_kf`] but reports progress via `progress`.
+    pub fn pairwise_kf_counted(&self, progress: &std::sync::atomic::AtomicUsize) -> Vec<f64> {
+        crate::distances::pairwise_symmetric_counted(
+            self,
+            crate::distances::kf_distance_fast,
+            Some(progress),
+        )
+    }
+
     /// Build the interning table from a `Vec<Snapshot>` (internal helper).
     fn intern(snaps: Vec<Snapshot>, leaf_names: Vec<String>) -> Self {
         let words = snaps.first().map(|s| s.words).unwrap_or(0);

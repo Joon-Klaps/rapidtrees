@@ -9,6 +9,11 @@ This project uses release names based on random words from [codenamegenerator.co
     - DICTIONARY: Snakes
 
 
+## [Unreleased]
+
+- Added `rapidtrees.ProgressCounter` — a lock-free, Python-facing handle for observing live progress of a pairwise distance call. Instantiate one, pass it as `progress=` to any of the six `pairwise_*_from_newick_iter` functions, and read `.value()` / `.total()` / `.fraction()` from another Python thread while the call blocks. The GIL is released for the duration of the rayon loop only when a counter is supplied; passing `None` (the default) preserves the original zero-overhead, GIL-held behaviour. Reading is a single atomic load (~1 ns) — no callback, no GIL acquisition from Rust, no monitor thread.
+- CLI: when stderr is a TTY and `--quiet` is not set, the `rapidtrees` binary now renders a live progress bar to stderr during pairwise distance computation (e.g. `[█████████░░░░░] 64.2% (3211/5000 pairs, ETA 4.1s)`). Piped/redirected runs are unaffected — the bar auto-suppresses when stderr is not a terminal.
+
 ## [0.5.1] - 0.5.1 - Azure Mamba (2026-05-12)
 
 - wRF and KF distances now match phangorn ([#9](https://github.com/Joon-Klaps/rapidtrees/pull/9)).

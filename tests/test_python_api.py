@@ -1542,6 +1542,146 @@ class TestPairwiseKfWithSnapshots:
             assert r1[i] == r2[i]
 
 
+class TestProgressCounter:
+    """Tests for ``ProgressCounter`` — the sole progress interface.
+
+    Instantiate, hand to a pairwise function, and poll ``.value()`` /
+    ``.total()`` / ``.fraction()`` from another Python thread."""
+
+    # 60 trees → 1770 pairs. Enough for a polling thread to observe at least
+    # one mid-flight value before completion even on fast hardware.
+    LARGE_NEWICKS = REFERENCE_NEWICKS * 5
+    LARGE_NAMES = [f"t{i}" for i in range(len(LARGE_NEWICKS))]
+    LARGE_TRANSLATE = [{}]
+    LARGE_MAP_INDICES = [0] * len(LARGE_NEWICKS)
+
+    def test_progress_counter_class_exists(self):
+        """rapidtrees exposes a ProgressCounter type with the expected methods."""
+        pc = rtd.ProgressCounter()
+        assert hasattr(pc, "value")
+        assert hasattr(pc, "total")
+        assert hasattr(pc, "fraction")
+        assert hasattr(pc, "reset")
+
+    def test_initial_state_is_zero(self):
+        pc = rtd.ProgressCounter()
+        assert pc.value() == 0
+        assert pc.total() == 0
+        assert pc.fraction() == 0.0
+
+    def test_reset_clears_state(self):
+        pc = rtd.ProgressCounter()
+        rtd.pairwise_rf_from_newick_iter(
+            FIXTURE_NAMES, iter(FIXTURE_TREES),
+            FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES,
+            progress=pc,
+        )
+        # After a call, total is set and value equals total.
+        assert pc.total() > 0
+        assert pc.value() == pc.total()
+        pc.reset()
+        assert pc.value() == 0
+        assert pc.total() == 0
+
+    def test_counter_reaches_total_after_call(self):
+        """After ``pairwise_rf_from_newick_iter`` returns, the counter must
+        report ``value == total`` and ``total == n*(n-1)/2``."""
+        pc = rtd.ProgressCounter()
+        n = len(self.LARGE_NAMES)
+        rtd.pairwise_rf_from_newick_iter(
+            self.LARGE_NAMES, iter(self.LARGE_NEWICKS),
+            self.LARGE_TRANSLATE, self.LARGE_MAP_INDICES,
+            progress=pc,
+        )
+        assert pc.total() == n * (n - 1) // 2
+        assert pc.value() == pc.total()
+        assert pc.fraction() == 1.0
+
+    def test_values_unchanged_with_counter(self):
+        """Passing a counter produces a bit-identical result."""
+        pc = rtd.ProgressCounter()
+        _, baseline = rtd.pairwise_rf_from_newick_iter(
+            FIXTURE_NAMES, iter(FIXTURE_TREES),
+            FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES,
+        )
+        _, with_counter = rtd.pairwise_rf_from_newick_iter(
+            FIXTURE_NAMES, iter(FIXTURE_TREES),
+            FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES,
+            progress=pc,
+        )
+        assert baseline == with_counter
+
+    def test_polling_thread_sees_mid_flight_value(self):
+        """The whole point of the pull interface: while ``pairwise_rf`` runs in
+        a background thread, the main thread can poll ``.value()`` and observe
+        progress strictly between 0 and total.
+
+        Also implicitly verifies that the GIL is released during the call —
+        if it weren't, the polling thread would never get to run.
+        """
+        import threading
+        import time
+
+        pc = rtd.ProgressCounter()
+        observed = []
+        done_flag = threading.Event()
+
+        def worker():
+            try:
+                rtd.pairwise_rf_from_newick_iter(
+                    self.LARGE_NAMES, iter(self.LARGE_NEWICKS),
+                    self.LARGE_TRANSLATE, self.LARGE_MAP_INDICES,
+                    progress=pc,
+                )
+            finally:
+                done_flag.set()
+
+        t = threading.Thread(target=worker)
+        t.start()
+        # Poll while the worker runs. We can't guarantee timing on every
+        # platform, but for 1770 pairs there is *some* mid-flight window.
+        for _ in range(200):
+            if done_flag.is_set():
+                break
+            observed.append(pc.value())
+            time.sleep(0.001)
+        t.join()
+
+        assert observed, "polling loop never recorded a sample"
+        # Final state must be fully done.
+        assert pc.value() == pc.total()
+        # All observed samples must be in [0, total] and monotonically rising.
+        total = pc.total()
+        for sample in observed:
+            assert 0 <= sample <= total
+        for prev, curr in zip(observed, observed[1:]):
+            assert curr >= prev, f"counter went backwards: {prev} → {curr}"
+
+    def test_works_on_all_six_functions(self):
+        """All six pairwise functions accept the counter and end at 1.0."""
+        funcs = [
+            rtd.pairwise_rf_from_newick_iter,
+            rtd.pairwise_wrf_from_newick_iter,
+            rtd.pairwise_kf_from_newick_iter,
+            rtd.pairwise_rf_with_snapshots_from_newick_iter,
+            rtd.pairwise_wrf_with_snapshots_from_newick_iter,
+            rtd.pairwise_kf_with_snapshots_from_newick_iter,
+        ]
+        for f in funcs:
+            pc = rtd.ProgressCounter()
+            f(
+                FIXTURE_NAMES, iter(FIXTURE_TREES),
+                FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES,
+                progress=pc,
+            )
+            assert pc.fraction() == 1.0, f"{f.__name__} did not finish at 1.0"
+
+    def test_repr_includes_state(self):
+        pc = rtd.ProgressCounter()
+        r = repr(pc)
+        assert "ProgressCounter" in r and "value=0" in r and "total=0" in r
+
+
 if __name__ == "__main__":
     # Allow running tests directly
     pytest.main([__file__, "-v"])

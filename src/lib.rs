@@ -14,6 +14,8 @@ pub(crate) mod snapshot;
 
 #[cfg(feature = "python")]
 pub mod api;
+#[cfg(feature = "python")]
+pub(crate) mod progress;
 
 pub use bitset::Bitset;
 #[cfg(feature = "cli")]
