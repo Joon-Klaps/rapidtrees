@@ -1,4 +1,7 @@
+#[cfg(all(feature = "wasm", not(feature = "phylotree")))]
+use crate::phylotree_patch::Tree;
 use crate::snapshot::Snapshots;
+#[cfg(feature = "phylotree")]
 use phylotree::tree::Tree;
 use std::collections::HashMap;
 use std::fs;
@@ -79,14 +82,39 @@ pub(crate) fn load_beast_raw<P: AsRef<Path>>(
         .map(|s| s.trim_end_matches(".trees"))
         .unwrap_or("unknown");
 
-    let taxons = parse_taxon_block(&content);
+    parse_beast_content(
+        &content,
+        base_name,
+        burnin_trees,
+        burnin_states,
+        use_real_taxa,
+    )
+}
+
+/// Parse the contents of a BEAST `.trees` file (as a string) without touching
+/// the filesystem.
+///
+/// This is the filesystem-free core of [`load_beast_raw`], shared with the
+/// WebAssembly entry point (`crate::wasm`). `base_name` is prefixed to each tree
+/// name (the CLI passes the file stem; the browser passes a placeholder).
+///
+/// Returns `(translate_map, [(tree_name, stripped_newick)])`. Burnin filtering
+/// and BEAST annotation stripping are applied but no Newick parsing is done.
+pub(crate) fn parse_beast_content(
+    content: &str,
+    base_name: &str,
+    burnin_trees: usize,
+    burnin_states: usize,
+    use_real_taxa: bool,
+) -> (HashMap<String, String>, Vec<(String, String)>) {
+    let taxons = parse_taxon_block(content);
     let translate_map = if use_real_taxa {
         taxons
     } else {
         HashMap::new()
     };
 
-    let tree_pairs: Vec<(String, String)> = collect_tree_blocks(&content)
+    let tree_pairs: Vec<(String, String)> = collect_tree_blocks(content)
         .into_iter()
         .enumerate()
         .map(|(idx, tree)| {
@@ -582,6 +610,49 @@ mod load_tests {
     fn test_load_beast_raw_nonexistent_returns_empty() {
         let (translate, pairs) = load_beast_raw("nonexistent.trees", 0, 0, false);
         assert!(pairs.is_empty());
+        assert!(translate.is_empty());
+    }
+
+    // ── parse_beast_content (filesystem-free core) ─────────────────────────────
+
+    const SMALL_BEAST: &str = "#NEXUS\n\
+        Begin trees;\n\
+        \tTranslate\n\
+        \t\t1 Alpha,\n\
+        \t\t2 Beta,\n\
+        \t\t3 Gamma\n\
+        \t;\n\
+        tree STATE_0 = (1[&r=1]:1,2:1,3:1);\n\
+        tree STATE_100 = (1:1,2:1,3:1);\n\
+        tree STATE_200 = (1:1,2:1,3:1);\n\
+        End;\n";
+
+    #[test]
+    fn test_parse_beast_content_basic() {
+        let (translate, pairs) = parse_beast_content(SMALL_BEAST, "upload", 0, 0, true);
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(translate.get("1").map(String::as_str), Some("Alpha"));
+        // Names are prefixed with base_name and annotations are stripped.
+        assert!(pairs[0].0.starts_with("upload_"));
+        assert!(!pairs[0].1.contains("[&"));
+    }
+
+    #[test]
+    fn test_parse_beast_content_burnin_by_tree_count() {
+        let (_, pairs) = parse_beast_content(SMALL_BEAST, "upload", 1, 0, false);
+        assert_eq!(pairs.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_beast_content_burnin_by_state() {
+        let (_, pairs) = parse_beast_content(SMALL_BEAST, "upload", 0, 100, false);
+        // keep state > 100 → only STATE_200 survives
+        assert_eq!(pairs.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_beast_content_no_real_taxa_empty_map() {
+        let (translate, _) = parse_beast_content(SMALL_BEAST, "upload", 0, 0, false);
         assert!(translate.is_empty());
     }
 

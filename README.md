@@ -18,6 +18,7 @@
   <a href="#-usage">Usage</a> •
   <a href="#-python-api">Python API</a> •
   <a href="#-snap-format">Snap Format</a> •
+  <a href="#-browser--webassembly">Browser</a> •
   <a href="#%EF%B8%8F-benchmarks">Benchmarks</a>
 </p>
 
@@ -299,6 +300,24 @@ col_labels = ["|".join(leaf_names[i] for i in indices) for indices in bip_leaf_i
 import pandas as pd
 df = pd.DataFrame(presence, index=tree_names, columns=col_labels)
 ```
+
+---
+
+## 🌐 Browser / WebAssembly
+
+`rapidtrees` also runs **entirely in the browser** via WebAssembly. Upload a
+BEAST `.trees` file, pick a metric (RF / WRF / KF), and the pairwise distance
+matrix is computed client-side and streamed to disk as CSV (optionally gzipped)
+— no server, nothing uploaded. The static site lives in [`www/`](www) and is
+deployed to GitHub Pages.
+
+```bash
+pixi run build-wasm   # build the wasm bundle into www/pkg
+pixi run serve-wasm   # serve the site at http://localhost:8000
+```
+
+See [`docs/wasm.md`](docs/wasm.md) for the full build, design, and deployment
+guide.
 
 ---
 

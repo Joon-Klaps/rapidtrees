@@ -9,7 +9,6 @@
 //! interned-integer path internally via the `pub(crate)` helpers in this module.
 
 use crate::snapshot::{InternSnap, Snapshot, Snapshots};
-use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(test)]
@@ -233,8 +232,8 @@ where
     // 1. Single contiguous allocation
     let mut matrix = vec![T::default(); n * n];
 
-    // 2. Safely divide the flat array into mutable chunks (rows)
-    matrix.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
+    // 2. Fill each row's upper triangle (in parallel when rayon is enabled).
+    crate::parallel::for_each_row_mut(&mut matrix, n, |i, row| {
         for (j, dist) in row.iter_mut().enumerate().take(n).skip(i + 1) {
             *dist = metric(&snaps.snapshots[i], &snaps.snapshots[j]);
         }

@@ -29,8 +29,10 @@
 //! analysis typically fits in L2 cache instead of requiring DRAM.
 
 use crate::bitset::Bitset;
+#[cfg(all(feature = "wasm", not(feature = "phylotree")))]
+use crate::phylotree_patch::{Tree as PhyloTree, TreeError};
+#[cfg(feature = "phylotree")]
 use phylotree::tree::{Tree as PhyloTree, TreeError};
-use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
 
@@ -453,11 +455,11 @@ impl Snapshots {
             .map_err(|e| format!("Failed to snapshot tree at index 0: {e}"))?;
         drop(first_tree);
 
-        // Parse all remaining trees in parallel, validating leaf sets.
-        let rest: Vec<Snapshot> = entries[1..]
-            .par_iter()
-            .enumerate()
-            .map(|(j, &(newick, translate))| {
+        // Parse the remaining trees (in parallel when rayon is enabled, else
+        // sequentially for the single-threaded wasm build), validating leaf sets.
+        let rest: Vec<Snapshot> = crate::parallel::try_map_indexed(
+            &entries[1..],
+            |j, &(newick, translate)| {
                 let i = j + 1;
                 let clean = crate::io::strip_beast_annotations(newick);
                 let mut tree = PhyloTree::from_newick(&clean)
@@ -476,8 +478,8 @@ impl Snapshots {
                 }
                 Snapshot::from_tree(&tree, rooted)
                     .map_err(|e| format!("Failed to snapshot tree at index {i}: {e}"))
-            })
-            .collect::<Result<_, _>>()?;
+            },
+        )?;
 
         let mut snaps = Vec::with_capacity(entries.len());
         snaps.push(first_snap);
@@ -549,16 +551,13 @@ impl Snapshots {
             return (presence, col_to_bip_id);
         }
 
-        // Safely divide the mutable slice into row-sized chunks across threads
-        presence
-            .par_chunks_mut(n_bip)
-            .zip(&self.snapshots) // Pair each chunk with its corresponding snapshot
-            .for_each(|(row, snap)| {
-                for &split_id in &snap.split_ids {
-                    // Write directly into the final memory location
-                    row[id_to_col[split_id as usize]] = 1;
-                }
-            });
+        // Fill each tree's presence row (in parallel when rayon is enabled).
+        crate::parallel::for_each_row_mut(&mut presence, n_bip, |i, row| {
+            for &split_id in &self.snapshots[i].split_ids {
+                // Write directly into the final memory location
+                row[id_to_col[split_id as usize]] = 1;
+            }
+        });
 
         (presence, col_to_bip_id)
     }
@@ -600,14 +599,12 @@ impl Snapshots {
         }
 
         let mut matrix = vec![0.0f64; n_trees * n_bip];
-        matrix
-            .par_chunks_mut(n_bip)
-            .zip(&self.snapshots)
-            .for_each(|(row, snap)| {
-                for (&split_id, &length) in snap.split_ids.iter().zip(&snap.lengths) {
-                    row[id_to_col[split_id as usize]] = length;
-                }
-            });
+        crate::parallel::for_each_row_mut(&mut matrix, n_bip, |i, row| {
+            let snap = &self.snapshots[i];
+            for (&split_id, &length) in snap.split_ids.iter().zip(&snap.lengths) {
+                row[id_to_col[split_id as usize]] = length;
+            }
+        });
 
         let mut bytes = Vec::with_capacity(matrix.len() * 8);
         for &v in &matrix {

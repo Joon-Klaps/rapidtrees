@@ -1,0 +1,1750 @@
+diff --git a/.github/workflows/deploy-pages.yml b/.github/workflows/deploy-pages.yml
+new file mode 100644
+index 0000000..8d3d2e2
+--- /dev/null
++++ b/.github/workflows/deploy-pages.yml
+@@ -0,0 +1,69 @@
++name: Deploy WASM site to GitHub Pages
++
++on:
++    push:
++        branches: [master, main]
++        paths:
++            - 'src/**'
++            - 'www/**'
++            - 'Cargo.toml'
++            - '.github/workflows/deploy-pages.yml'
++    workflow_dispatch:
++
++# Allow the GITHUB_TOKEN to deploy to Pages.
++permissions:
++    contents: read
++    pages: write
++    id-token: write
++
++# Only one concurrent deployment; let in-progress runs finish.
++concurrency:
++    group: pages
++    cancel-in-progress: false
++
++jobs:
++    build:
++        name: Build WASM bundle
++        runs-on: ubuntu-latest
++        steps:
++            - uses: actions/checkout@v4
++
++            - name: Setup Rust
++              uses: dtolnay/rust-toolchain@stable
++              with:
++                  targets: wasm32-unknown-unknown
++
++            - name: Cache cargo
++              uses: actions/cache@v4
++              with:
++                  path: |
++                      ~/.cargo/registry
++                      ~/.cargo/git
++                      target
++                  key: ${{ runner.os }}-wasm-${{ hashFiles('Cargo.toml') }}
++
++            - name: Install wasm-pack
++              uses: jetli/wasm-pack-action@v0.4.0
++              with:
++                  version: latest
++
++            - name: Build WASM bundle
++              # wasm-opt is disabled in Cargo.toml metadata, so no binaryen download.
++              run: wasm-pack build --target web --out-dir www/pkg --no-default-features --features wasm
++
++            - name: Upload Pages artifact
++              uses: actions/upload-pages-artifact@v3
++              with:
++                  path: www
++
++    deploy:
++        name: Deploy to Pages
++        needs: build
++        runs-on: ubuntu-latest
++        environment:
++            name: github-pages
++            url: ${{ steps.deployment.outputs.page_url }}
++        steps:
++            - name: Deploy to GitHub Pages
++              id: deployment
++              uses: actions/deploy-pages@v4
+diff --git a/.gitignore b/.gitignore
+index 437716e..a144f37 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -11,3 +11,5 @@ treetracer/
+ # pixi environments
+ .pixi/*
+ !.pixi/config.toml
++# wasm-pack output (built by CI, not committed)
++www/pkg/
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9798a3c..22142cf 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,7 @@ This project uses release names based on random words from [codenamegenerator.co
+ 
+ ## [Unreleased]
+ 
++- **WebAssembly build + browser site.** `rapidtrees` now compiles to `wasm32-unknown-unknown` behind a `wasm` cargo feature, and ships a minimal static site (`www/`) that computes a pairwise distance matrix (RF / WRF / KF) from an uploaded BEAST `.trees` file entirely in the browser — no server, no upload. The matrix is streamed to disk as CSV (optionally gzipped) rather than rendered, so multi-gigabyte results stay off the page. Build with `wasm-pack build --target web --out-dir www/pkg --no-default-features --features wasm` (or `pixi run build-wasm`) and deploy via the new `deploy-pages.yml` GitHub Actions workflow. Because upstream `phylotree` cannot compile to wasm, the wasm build swaps in a small in-crate Newick parser (`src/phylotree-patch.rs`); a native test cross-checks that it produces byte-identical distance matrices to `phylotree`.
+ - Added `rapidtrees.ProgressCounter` — a lock-free, Python-facing handle for observing live progress of a pairwise distance call. Instantiate one, pass it as `progress=` to any of the six `pairwise_*_from_newick_iter` functions, and read `.value()` / `.total()` / `.fraction()` from another Python thread while the call blocks. The GIL is released for the duration of the rayon loop only when a counter is supplied; passing `None` (the default) preserves the original zero-overhead, GIL-held behaviour. Reading is a single atomic load (~1 ns) — no callback, no GIL acquisition from Rust, no monitor thread.
+ - CLI: when stderr is a TTY and `--quiet` is not set, the `rapidtrees` binary now renders a live progress bar to stderr during pairwise distance computation (e.g. `[█████████░░░░░] 64.2% (3211/5000 pairs, ETA 4.1s)`). Piped/redirected runs are unaffected — the bar auto-suppresses when stderr is not a terminal.
+ 
+diff --git a/Cargo.toml b/Cargo.toml
+index ff30dfc..242dd7f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -20,18 +20,26 @@ path = "src/main.rs"
+ required-features = ["cli"]
+ 
+ [dependencies]
+-phylotree = "0.1.3"
++phylotree = { version = "0.1.3", optional = true }
+ pyo3 = { version = "0.27.1", optional = true }
+-rayon = "1"
++rayon = { version = "1", optional = true }
+ clap = { version = "4.5", features = ["derive"], optional = true }
+ flate2 = { version = "1", optional = true }
+ rustc-hash = "2.1"
++thiserror = "2"
++wasm-bindgen = { version = "0.2", optional = true }
++console_error_panic_hook = { version = "0.1", optional = true }
+ 
+ [features]
+ default = ["cli"]
+-cli = ["clap", "flate2"]
+-python = ["pyo3"]
++cli = ["phylotree", "clap", "flate2", "rayon"]
++python = ["phylotree", "pyo3", "rayon"]
+ extension-module = ["python", "pyo3/extension-module"]
++# Browser/WebAssembly build. Mutually exclusive with the phylotree-backed
++# features above: it swaps in the in-crate `phylotree-patch` Newick parser and
++# drops rayon (GitHub Pages can't set the COOP/COEP headers SharedArrayBuffer
++# needs). Build with: `--no-default-features --features wasm`.
++wasm = ["wasm-bindgen", "console_error_panic_hook"]
+ 
+ [dev-dependencies]
+ itertools = "0.14.0"
+@@ -44,3 +52,9 @@ tempfile = "3"
+ [[bench]]
+ name = "memory_time_benchmark"
+ harness = false
++
++# Disable wasm-opt so `wasm-pack build` is self-contained and does not need to
++# download the binaryen toolchain at build time. The bundle is slightly larger;
++# for an aggressively optimised build, install binaryen and flip this to `true`.
++[package.metadata.wasm-pack.profile.release]
++wasm-opt = false
+diff --git a/README.md b/README.md
+index d52a85d..86bb977 100644
+--- a/README.md
++++ b/README.md
+@@ -18,6 +18,7 @@
+   <a href="#-usage">Usage</a> •
+   <a href="#-python-api">Python API</a> •
+   <a href="#-snap-format">Snap Format</a> •
++  <a href="#-browser--webassembly">Browser</a> •
+   <a href="#%EF%B8%8F-benchmarks">Benchmarks</a>
+ </p>
+ 
+@@ -302,6 +303,24 @@ df = pd.DataFrame(presence, index=tree_names, columns=col_labels)
+ 
+ ---
+ 
++## 🌐 Browser / WebAssembly
++
++`rapidtrees` also runs **entirely in the browser** via WebAssembly. Upload a
++BEAST `.trees` file, pick a metric (RF / WRF / KF), and the pairwise distance
++matrix is computed client-side and streamed to disk as CSV (optionally gzipped)
++— no server, nothing uploaded. The static site lives in [`www/`](www) and is
++deployed to GitHub Pages.
++
++```bash
++pixi run build-wasm   # build the wasm bundle into www/pkg
++pixi run serve-wasm   # serve the site at http://localhost:8000
++```
++
++See [`docs/wasm.md`](docs/wasm.md) for the full build, design, and deployment
++guide.
++
++---
++
+ 
+ 
+ ## ⏱️ Benchmarks
+diff --git a/docs/wasm.md b/docs/wasm.md
+new file mode 100644
+index 0000000..ca056e9
+--- /dev/null
++++ b/docs/wasm.md
+@@ -0,0 +1,114 @@
++# rapidtrees in the browser (WebAssembly)
++
++`rapidtrees` compiles to WebAssembly and ships a tiny static site that computes
++pairwise phylogenetic tree distances **entirely in the browser**. You upload a
++BEAST `.trees` file, pick a metric (RF, Weighted RF, or Kuhner–Felsenstein), and
++the resulting distance matrix is streamed straight to a file on your disk.
++Nothing is uploaded to a server.
++
++The site lives in [`www/`](../www) and is deployed to GitHub Pages by
++[`.github/workflows/deploy-pages.yml`](../.github/workflows/deploy-pages.yml).
++
++---
++
++## Why a separate Newick parser?
++
++The native (CLI / Python) builds parse Newick with the [`phylotree`] crate. That
++crate pulls in C-backed dependencies (`needletail`, `ptree`, …) that do not
++compile for `wasm32-unknown-unknown`, so the `wasm` feature swaps in a small
++in-crate parser, [`src/phylotree-patch.rs`](../src/phylotree-patch.rs), that
++mirrors exactly the slice of the `phylotree` API the core uses.
++
++A native test (`cargo test`) cross-checks the two parsers: it asserts they
++produce structurally identical trees (same bipartitions and branch lengths) for
++the same Newick, which guarantees identical distance matrices. The two backends
++are selected at compile time:
++
++```rust
++#[cfg(feature = "phylotree")] use phylotree::tree::{Tree as PhyloTree, TreeError};
++#[cfg(all(feature = "wasm", not(feature = "phylotree")))]
++use crate::phylotree_patch::{Tree as PhyloTree, TreeError};
++```
++
++The `wasm` feature also drops `rayon` (GitHub Pages cannot serve the COOP/COEP
++headers `SharedArrayBuffer`-based threading needs), falling back to sequential
++iterators.
++
++[`phylotree`]: https://crates.io/crates/phylotree
++
++---
++
++## Building locally
++
++You need the wasm target and [`wasm-pack`]:
++
++```bash
++rustup target add wasm32-unknown-unknown
++cargo install wasm-pack            # or download a prebuilt binary
++```
++
++Then build the bundle and serve the site:
++
++```bash
++pixi run build-wasm                # → www/pkg/{rapidtrees.js, rapidtrees_bg.wasm}
++pixi run serve-wasm                # → http://localhost:8000
++```
++
++Equivalently, without pixi:
++
++```bash
++wasm-pack build --target web --out-dir www/pkg --no-default-features --features wasm
++python -m http.server --directory www
++```
++
++`www/pkg/` is generated output and is git-ignored.
++
++> **Note:** `wasm-opt` is disabled in `Cargo.toml`
++> (`[package.metadata.wasm-pack.profile.release] wasm-opt = false`) so the build
++> never needs to download the binaryen toolchain. To produce a smaller bundle,
++> install binaryen and flip that flag to `true`.
++
++[`wasm-pack`]: https://rustwasm.github.io/wasm-pack/
++
++---
++
++## How the page works
++
++`www/main.js`:
++
++1. Loads the wasm module (`import init, { compute_distances } from './pkg/rapidtrees.js'`).
++2. Reads the uploaded file as text and calls
++   `compute_distances(content, method, rooted, burninTrees, burninStates, useRealTaxa)`.
++3. Receives a `DistanceResult` exposing `names`, `n`, `dtype` (`"u32"` for RF,
++   `"f64"` for WRF/KF), and `take_matrix()` — the matrix as a flat,
++   little-endian `Uint8Array`.
++4. Streams the matrix to disk **one CSV row at a time**, decoding each value
++   with a `DataView`. With the gzip toggle on, rows are piped through the
++   browser's native `CompressionStream('gzip')` so no second large buffer is
++   built.
++
++Saving uses the [File System Access API] (`showSaveFilePicker`) on Chromium
++browsers, with a `Blob` + `<a download>` fallback for Firefox/Safari. The
++fallback buffers the whole file in memory, so very large matrices may hit
++browser memory limits there.
++
++[File System Access API]: https://developer.mozilla.org/en-US/docs/Web/API/Window/showSaveFilePicker
++
++---
++
++## Deploying to GitHub Pages
++
++The `deploy-pages.yml` workflow builds the bundle and publishes `www/` on every
++push to `master`/`main` (and on manual dispatch). One-time setup: in the
++repository **Settings → Pages**, set **Source** to **GitHub Actions**.
++
++---
++
++## Limitations
++
++- Single-threaded (no `rayon`); large datasets compute sequentially.
++- `wasm32` has a ~4 GB address-space ceiling, so extremely large tree sets may
++  exhaust memory during computation.
++- The in-crate parser handles standard Newick (nested clades, branch lengths
++  incl. scientific notation, single-quoted labels, `[...]` comments). It keeps
++  underscores literal rather than converting them to spaces.
+diff --git a/pyproject.toml b/pyproject.toml
+index a127eed..ef5b85c 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -72,6 +72,8 @@ develop = { cmd = "maturin develop --uv", description = "Build and install in ed
+ fmt = { cmd = "cargo fmt --check", description = "Check Rust formatting" }
+ clippy = { cmd = "cargo clippy --all-targets --all-features -- -D warnings", description = "Run Clippy linter" }
+ bench = { cmd = "cargo bench", description = "Run performance benchmarks" }
++build-wasm = { cmd = "wasm-pack build --no-default-features --features wasm --target web --out-dir www/pkg", description = "Build the browser WebAssembly bundle into www/pkg" }
++serve-wasm = { cmd = "python -m http.server --directory www", description = "Serve the static site locally (after build-wasm) at http://localhost:8000" }
+ pre-commit = { cmd = "prek run --config .pre-commit-config.yaml --all-files" }
+ run-treetracer = { cmd = "cd ../treetracer && uv sync --reinstall-package rapidtrees && uv run treetracer", description = "Rebuild rapidtrees (in treetracer's venv) and launch the desktop app against it" }
+ run-treetracer-browser = { cmd = "cd ../treetracer && uv sync --reinstall-package rapidtrees && uv run treetracer --browser", description = "Rebuild rapidtrees (in treetracer's venv) and launch treetracer in a browser tab" }
+\ No newline at end of file
+diff --git a/src/distances.rs b/src/distances.rs
+index 0c3e195..4d24371 100644
+--- a/src/distances.rs
++++ b/src/distances.rs
+@@ -9,7 +9,6 @@
+ //! interned-integer path internally via the `pub(crate)` helpers in this module.
+ 
+ use crate::snapshot::{InternSnap, Snapshot, Snapshots};
+-use rayon::prelude::*;
+ use std::sync::atomic::{AtomicUsize, Ordering};
+ 
+ #[cfg(test)]
+@@ -233,8 +232,8 @@ where
+     // 1. Single contiguous allocation
+     let mut matrix = vec![T::default(); n * n];
+ 
+-    // 2. Safely divide the flat array into mutable chunks (rows)
+-    matrix.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
++    // 2. Fill each row's upper triangle (in parallel when rayon is enabled).
++    crate::parallel::for_each_row_mut(&mut matrix, n, |i, row| {
+         for (j, dist) in row.iter_mut().enumerate().take(n).skip(i + 1) {
+             *dist = metric(&snaps.snapshots[i], &snaps.snapshots[j]);
+         }
+diff --git a/src/io.rs b/src/io.rs
+index 076001c..e5fd58f 100644
+--- a/src/io.rs
++++ b/src/io.rs
+@@ -1,4 +1,7 @@
++#[cfg(all(feature = "wasm", not(feature = "phylotree")))]
++use crate::phylotree_patch::Tree;
+ use crate::snapshot::Snapshots;
++#[cfg(feature = "phylotree")]
+ use phylotree::tree::Tree;
+ use std::collections::HashMap;
+ use std::fs;
+@@ -79,14 +82,39 @@ pub(crate) fn load_beast_raw<P: AsRef<Path>>(
+         .map(|s| s.trim_end_matches(".trees"))
+         .unwrap_or("unknown");
+ 
+-    let taxons = parse_taxon_block(&content);
++    parse_beast_content(
++        &content,
++        base_name,
++        burnin_trees,
++        burnin_states,
++        use_real_taxa,
++    )
++}
++
++/// Parse the contents of a BEAST `.trees` file (as a string) without touching
++/// the filesystem.
++///
++/// This is the filesystem-free core of [`load_beast_raw`], shared with the
++/// WebAssembly entry point (`crate::wasm`). `base_name` is prefixed to each tree
++/// name (the CLI passes the file stem; the browser passes a placeholder).
++///
++/// Returns `(translate_map, [(tree_name, stripped_newick)])`. Burnin filtering
++/// and BEAST annotation stripping are applied but no Newick parsing is done.
++pub(crate) fn parse_beast_content(
++    content: &str,
++    base_name: &str,
++    burnin_trees: usize,
++    burnin_states: usize,
++    use_real_taxa: bool,
++) -> (HashMap<String, String>, Vec<(String, String)>) {
++    let taxons = parse_taxon_block(content);
+     let translate_map = if use_real_taxa {
+         taxons
+     } else {
+         HashMap::new()
+     };
+ 
+-    let tree_pairs: Vec<(String, String)> = collect_tree_blocks(&content)
++    let tree_pairs: Vec<(String, String)> = collect_tree_blocks(content)
+         .into_iter()
+         .enumerate()
+         .map(|(idx, tree)| {
+@@ -585,6 +613,49 @@ mod load_tests {
+         assert!(translate.is_empty());
+     }
+ 
++    // ── parse_beast_content (filesystem-free core) ─────────────────────────────
++
++    const SMALL_BEAST: &str = "#NEXUS\n\
++        Begin trees;\n\
++        \tTranslate\n\
++        \t\t1 Alpha,\n\
++        \t\t2 Beta,\n\
++        \t\t3 Gamma\n\
++        \t;\n\
++        tree STATE_0 = (1[&r=1]:1,2:1,3:1);\n\
++        tree STATE_100 = (1:1,2:1,3:1);\n\
++        tree STATE_200 = (1:1,2:1,3:1);\n\
++        End;\n";
++
++    #[test]
++    fn test_parse_beast_content_basic() {
++        let (translate, pairs) = parse_beast_content(SMALL_BEAST, "upload", 0, 0, true);
++        assert_eq!(pairs.len(), 3);
++        assert_eq!(translate.get("1").map(String::as_str), Some("Alpha"));
++        // Names are prefixed with base_name and annotations are stripped.
++        assert!(pairs[0].0.starts_with("upload_"));
++        assert!(!pairs[0].1.contains("[&"));
++    }
++
++    #[test]
++    fn test_parse_beast_content_burnin_by_tree_count() {
++        let (_, pairs) = parse_beast_content(SMALL_BEAST, "upload", 1, 0, false);
++        assert_eq!(pairs.len(), 2);
++    }
++
++    #[test]
++    fn test_parse_beast_content_burnin_by_state() {
++        let (_, pairs) = parse_beast_content(SMALL_BEAST, "upload", 0, 100, false);
++        // keep state > 100 → only STATE_200 survives
++        assert_eq!(pairs.len(), 1);
++    }
++
++    #[test]
++    fn test_parse_beast_content_no_real_taxa_empty_map() {
++        let (translate, _) = parse_beast_content(SMALL_BEAST, "upload", 0, 0, false);
++        assert!(translate.is_empty());
++    }
++
+     // ── load_beast_trees ──────────────────────────────────────────────────────
+ 
+     #[test]
+diff --git a/src/lib.rs b/src/lib.rs
+index b79fd67..e2b5404 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -10,6 +10,7 @@
+ pub mod bitset;
+ pub mod distances;
+ pub mod io;
++pub(crate) mod parallel;
+ pub(crate) mod snapshot;
+ 
+ #[cfg(feature = "python")]
+@@ -17,6 +18,19 @@ pub mod api;
+ #[cfg(feature = "python")]
+ pub(crate) mod progress;
+ 
++// In-crate Newick parser used in place of `phylotree` for the wasm build. Only
++// compiled when it is actually the active backend (wasm without phylotree), plus
++// under `test` so a native test can cross-check it against phylotree.
++#[cfg(any(all(feature = "wasm", not(feature = "phylotree")), test))]
++#[path = "phylotree-patch.rs"]
++pub(crate) mod phylotree_patch;
++
++// WebAssembly bindings. The `compute_distances_core` helper is also compiled
++// under `test` (native) so it can be unit-tested without a browser; only the
++// `#[wasm_bindgen]` wrapper inside requires the `wasm` feature.
++#[cfg(any(feature = "wasm", test))]
++mod wasm;
++
+ pub use bitset::Bitset;
+ #[cfg(feature = "cli")]
+ pub use io::write_matrix_tsv;
+diff --git a/src/parallel.rs b/src/parallel.rs
+new file mode 100644
+index 0000000..3557469
+--- /dev/null
++++ b/src/parallel.rs
+@@ -0,0 +1,69 @@
++//! One small place where "parallel vs sequential" is decided.
++//!
++//! Native builds (CLI / Python) parallelise the hot loops with [`rayon`]. The
++//! WebAssembly build cannot: `wasm32-unknown-unknown` has no threads unless the
++//! page is cross-origin isolated (COOP/COEP headers + `SharedArrayBuffer`),
++//! which a static GitHub Pages site can't provide. So the `wasm` build compiles
++//! without the `rayon` feature and these helpers fall back to plain iterators.
++//!
++//! Centralising the `#[cfg]` here keeps every call site in `distances.rs` and
++//! `snapshot.rs` identical and backend-agnostic — they just call
++//! [`for_each_row_mut`] / [`try_map_indexed`] with no conditional compilation.
++
++/// Apply `f` to each `row_len`-sized mutable chunk ("row") of `data`, passing
++/// the row's index. Runs across rayon's thread pool when the `rayon` feature is
++/// enabled, otherwise sequentially.
++#[cfg(feature = "rayon")]
++pub(crate) fn for_each_row_mut<T, F>(data: &mut [T], row_len: usize, f: F)
++where
++    T: Send,
++    F: Fn(usize, &mut [T]) + Sync,
++{
++    use rayon::prelude::*;
++    data.par_chunks_mut(row_len)
++        .enumerate()
++        .for_each(|(i, row)| f(i, row));
++}
++
++/// Sequential fallback used when the `rayon` feature is disabled (e.g. wasm).
++#[cfg(not(feature = "rayon"))]
++pub(crate) fn for_each_row_mut<T, F>(data: &mut [T], row_len: usize, f: F)
++where
++    F: Fn(usize, &mut [T]),
++{
++    data.chunks_mut(row_len)
++        .enumerate()
++        .for_each(|(i, row)| f(i, row));
++}
++
++/// Map `f` over `items` (with each item's index), collecting into a `Vec` and
++/// short-circuiting on the first `Err`. Runs in parallel via rayon when the
++/// `rayon` feature is enabled, otherwise sequentially.
++#[cfg(feature = "rayon")]
++pub(crate) fn try_map_indexed<T, R, E, F>(items: &[T], f: F) -> Result<Vec<R>, E>
++where
++    T: Sync,
++    R: Send,
++    E: Send,
++    F: Fn(usize, &T) -> Result<R, E> + Sync,
++{
++    use rayon::prelude::*;
++    items
++        .par_iter()
++        .enumerate()
++        .map(|(i, item)| f(i, item))
++        .collect()
++}
++
++/// Sequential fallback used when the `rayon` feature is disabled (e.g. wasm).
++#[cfg(not(feature = "rayon"))]
++pub(crate) fn try_map_indexed<T, R, E, F>(items: &[T], f: F) -> Result<Vec<R>, E>
++where
++    F: Fn(usize, &T) -> Result<R, E>,
++{
++    items
++        .iter()
++        .enumerate()
++        .map(|(i, item)| f(i, item))
++        .collect()
++}
+diff --git a/src/phylotree-patch.rs b/src/phylotree-patch.rs
+new file mode 100644
+index 0000000..3d1dae9
+--- /dev/null
++++ b/src/phylotree-patch.rs
+@@ -0,0 +1,452 @@
++//! Minimal in-crate replacement for the slice of `phylotree` that `rapidtrees`
++//! actually uses, for the `wasm32-unknown-unknown` build.
++//!
++//! Upstream `phylotree 0.1.3` pulls in `needletail` (C-backed compression),
++//! `ptree` (`directories`, no wasm support) and `indicatif` as *unconditional*
++//! dependencies, none of which compile for `wasm32-unknown-unknown`. The core
++//! only ever needs a Newick parser that yields a tree we can walk, so this
++//! module reproduces exactly that surface — nothing more.
++//!
++//! The public API here intentionally mirrors `phylotree::tree::{Tree, Node,
++//! TreeError}` so that `snapshot.rs` and `io.rs` can swap backends with a single
++//! `cfg`-gated type alias and keep `Snapshot::from_tree` / `compute_bitsets` /
++//! `collect_partitions` byte-for-byte unchanged. A native test cross-checks that
++//! this parser produces identical pairwise distance matrices to upstream
++//! phylotree (see `snapshot.rs` tests).
++//!
++//! # Supported Newick
++//! Standard Newick: nested `(...)`, optional internal labels, `:branch_length`
++//! edges (including scientific notation), single-quoted labels with `''`
++//! escaping, `[...]` comments, and a trailing `;`. Underscores are kept literal
++//! (not converted to spaces) — the inputs `rapidtrees` handles use numeric IDs
++//! or plain alphanumeric taxa, and the cross-check test guards equivalence.
++
++use thiserror::Error;
++
++/// Errors surfaced by the Newick parser and tree accessors.
++///
++/// Mirrors the subset of `phylotree::tree::TreeError` that `rapidtrees`
++/// constructs or matches on (`NodeNotFound` is built in `snapshot.rs`).
++#[derive(Debug, Error)]
++pub enum TreeError {
++    /// A node id was requested that does not exist in the arena.
++    #[error("node {0} not found")]
++    NodeNotFound(usize),
++    /// The Newick string could not be parsed.
++    #[error("failed to parse newick: {0}")]
++    ParseError(String),
++}
++
++/// A single tree node in the arena.
++///
++/// Field names and types match the `phylotree` node members read by the core:
++/// `name`, `children`, and `parent_edge` (the length of the edge above this
++/// node, `None` for the root or unspecified edges).
++#[derive(Debug, Clone, Default)]
++pub struct Node {
++    /// Taxon label for leaves; optional internal-node label otherwise.
++    pub name: Option<String>,
++    /// Arena indices of this node's children (empty for leaves).
++    pub children: Vec<usize>,
++    /// Length of the edge connecting this node to its parent, if given.
++    pub parent_edge: Option<f64>,
++}
++
++/// An arena-backed phylogenetic tree parsed from a Newick string.
++///
++/// Nodes are stored in a flat `Vec`; a node id is its index. The root is always
++/// id `0` (the first node created during parsing), but callers should use
++/// [`Tree::get_root`] rather than assume that.
++#[derive(Debug, Clone)]
++pub struct Tree {
++    nodes: Vec<Node>,
++    root: usize,
++}
++
++impl Tree {
++    /// Parse a Newick string into a [`Tree`].
++    ///
++    /// BEAST `[&...]` annotations are tolerated as `[...]` comments, but callers
++    /// in `rapidtrees` strip them beforehand via `io::strip_beast_annotations`.
++    ///
++    /// # Errors
++    /// Returns [`TreeError::ParseError`] on malformed input (unbalanced
++    /// parentheses, missing labels, or invalid branch lengths).
++    pub fn from_newick(newick: &str) -> Result<Self, TreeError> {
++        let mut parser = Parser::new(newick);
++        let root = parser.parse_tree()?;
++        Ok(Tree {
++            nodes: parser.nodes,
++            root,
++        })
++    }
++
++    /// Borrow the node with id `node_id`.
++    ///
++    /// # Errors
++    /// Returns [`TreeError::NodeNotFound`] if `node_id` is out of range.
++    pub fn get(&self, node_id: &usize) -> Result<&Node, TreeError> {
++        self.nodes
++            .get(*node_id)
++            .ok_or(TreeError::NodeNotFound(*node_id))
++    }
++
++    /// Mutably borrow the node with id `node_id` (used to apply translate maps).
++    ///
++    /// # Errors
++    /// Returns [`TreeError::NodeNotFound`] if `node_id` is out of range.
++    pub fn get_mut(&mut self, node_id: &usize) -> Result<&mut Node, TreeError> {
++        self.nodes
++            .get_mut(*node_id)
++            .ok_or(TreeError::NodeNotFound(*node_id))
++    }
++
++    /// Return the id of the root node.
++    ///
++    /// # Errors
++    /// Returns [`TreeError::ParseError`] if the tree is empty.
++    pub fn get_root(&self) -> Result<usize, TreeError> {
++        if self.nodes.is_empty() {
++            return Err(TreeError::ParseError("empty tree".to_string()));
++        }
++        Ok(self.root)
++    }
++
++    /// Return the ids of all leaf nodes (those with no children).
++    ///
++    /// Order is arena order; callers in `rapidtrees` re-sort by taxon name, so
++    /// the ordering here is not significant.
++    pub fn get_leaves(&self) -> Vec<usize> {
++        self.nodes
++            .iter()
++            .enumerate()
++            .filter(|(_, n)| n.children.is_empty())
++            .map(|(id, _)| id)
++            .collect()
++    }
++
++    /// Report whether the tree is rooted, matching phylotree's convention:
++    /// a tree is rooted when its root has exactly two children.
++    ///
++    /// # Errors
++    /// Returns [`TreeError::ParseError`] if the tree is empty.
++    pub fn is_rooted(&self) -> Result<bool, TreeError> {
++        let root = self.get_root()?;
++        Ok(self.nodes[root].children.len() == 2)
++    }
++}
++
++/// Recursive-descent Newick parser over a char buffer.
++struct Parser {
++    chars: Vec<char>,
++    pos: usize,
++    nodes: Vec<Node>,
++}
++
++impl Parser {
++    fn new(s: &str) -> Self {
++        Parser {
++            chars: s.chars().collect(),
++            pos: 0,
++            nodes: Vec::new(),
++        }
++    }
++
++    fn peek(&self) -> Option<char> {
++        self.chars.get(self.pos).copied()
++    }
++
++    fn bump(&mut self) -> Option<char> {
++        let c = self.peek();
++        if c.is_some() {
++            self.pos += 1;
++        }
++        c
++    }
++
++    /// Skip whitespace and `[...]` comment blocks.
++    fn skip_trivia(&mut self) {
++        loop {
++            match self.peek() {
++                Some(c) if c.is_whitespace() => {
++                    self.bump();
++                }
++                Some('[') => {
++                    while let Some(c) = self.bump() {
++                        if c == ']' {
++                            break;
++                        }
++                    }
++                }
++                _ => break,
++            }
++        }
++    }
++
++    /// Allocate a fresh default node and return its id.
++    fn new_node(&mut self) -> usize {
++        let id = self.nodes.len();
++        self.nodes.push(Node::default());
++        id
++    }
++
++    /// Parse a complete tree: a subtree, an optional root branch length, `;`.
++    fn parse_tree(&mut self) -> Result<usize, TreeError> {
++        self.skip_trivia();
++        let root = self.parse_subtree()?;
++        self.skip_trivia();
++        // A root branch length is allowed by the grammar but unused by the core.
++        if self.peek() == Some(':') {
++            self.bump();
++            let _ = self.parse_length()?;
++        }
++        self.skip_trivia();
++        if self.peek() == Some(';') {
++            self.bump();
++        }
++        Ok(root)
++    }
++
++    /// Parse a subtree (internal node `(...)` or a leaf) and return its id.
++    /// The caller is responsible for the optional `:length` that follows.
++    fn parse_subtree(&mut self) -> Result<usize, TreeError> {
++        self.skip_trivia();
++        let id = self.new_node();
++
++        if self.peek() == Some('(') {
++            self.bump(); // consume '('
++            loop {
++                let child = self.parse_subtree()?;
++                self.skip_trivia();
++                if self.peek() == Some(':') {
++                    self.bump();
++                    self.nodes[child].parent_edge = Some(self.parse_length()?);
++                }
++                self.nodes[id].children.push(child);
++                self.skip_trivia();
++                match self.peek() {
++                    Some(',') => {
++                        self.bump();
++                    }
++                    Some(')') => {
++                        self.bump();
++                        break;
++                    }
++                    other => {
++                        return Err(TreeError::ParseError(format!(
++                            "expected ',' or ')', found {other:?}"
++                        )));
++                    }
++                }
++            }
++            // Optional internal-node label.
++            let label = self.parse_label();
++            if !label.is_empty() {
++                self.nodes[id].name = Some(label);
++            }
++        } else {
++            let label = self.parse_label();
++            if label.is_empty() {
++                return Err(TreeError::ParseError(
++                    "expected leaf label or '('".to_string(),
++                ));
++            }
++            self.nodes[id].name = Some(label);
++        }
++
++        Ok(id)
++    }
++
++    /// Parse a node label: either a single-quoted string (with `''` escaping) or
++    /// a bare token terminated by Newick punctuation/whitespace.
++    fn parse_label(&mut self) -> String {
++        self.skip_trivia();
++        if self.peek() == Some('\'') {
++            self.bump(); // opening quote
++            let mut s = String::new();
++            while let Some(c) = self.bump() {
++                if c == '\'' {
++                    if self.peek() == Some('\'') {
++                        self.bump();
++                        s.push('\'');
++                    } else {
++                        break;
++                    }
++                } else {
++                    s.push(c);
++                }
++            }
++            s
++        } else {
++            let mut s = String::new();
++            while let Some(c) = self.peek() {
++                if matches!(c, '(' | ')' | ',' | ':' | ';' | '[') || c.is_whitespace() {
++                    break;
++                }
++                s.push(c);
++                self.bump();
++            }
++            s
++        }
++    }
++
++    /// Parse a branch length (decimal, optionally signed, with exponent).
++    fn parse_length(&mut self) -> Result<f64, TreeError> {
++        self.skip_trivia();
++        let mut s = String::new();
++        while let Some(c) = self.peek() {
++            if c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E') {
++                s.push(c);
++                self.bump();
++            } else {
++                break;
++            }
++        }
++        s.parse::<f64>()
++            .map_err(|_| TreeError::ParseError(format!("invalid branch length: {s:?}")))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn parses_simple_tree() {
++        let t = Tree::from_newick("((A:1,B:2):3,(C:4,D:5):6);").unwrap();
++        assert_eq!(t.get_leaves().len(), 4);
++        assert!(t.is_rooted().unwrap());
++    }
++
++    #[test]
++    fn parses_quoted_labels_and_comments() {
++        let t = Tree::from_newick("('A b':1.0,[comment]C:2.0,D:3.0);").unwrap();
++        let names: Vec<String> = t
++            .get_leaves()
++            .iter()
++            .filter_map(|id| t.get(id).ok()?.name.clone())
++            .collect();
++        assert!(names.contains(&"A b".to_string()));
++        assert!(names.contains(&"C".to_string()));
++        // Trifurcating root → unrooted by phylotree's convention.
++        assert!(!t.is_rooted().unwrap());
++    }
++
++    #[test]
++    fn parses_scientific_branch_lengths() {
++        let t = Tree::from_newick("(A:1.5E-3,B:2.0e2);").unwrap();
++        let lens: Vec<f64> = t
++            .get_leaves()
++            .iter()
++            .filter_map(|id| t.get(id).ok()?.parent_edge)
++            .collect();
++        assert!(lens.contains(&0.0015));
++        assert!(lens.contains(&200.0));
++    }
++
++    #[test]
++    fn rejects_unbalanced_parens() {
++        assert!(Tree::from_newick("((A:1,B:2);").is_err());
++    }
++
++    #[test]
++    fn get_mut_allows_renaming_a_leaf() {
++        // Mirrors how `io::rename_leaf_nodes` applies a BEAST translate map.
++        let mut t = Tree::from_newick("(A:1,B:1);").unwrap();
++        let leaf = t.get_leaves()[0];
++        t.get_mut(&leaf).unwrap().name = Some("Z".to_string());
++        assert_eq!(t.get(&leaf).unwrap().name.as_deref(), Some("Z"));
++    }
++
++    // ── Cross-check against upstream phylotree ────────────────────────────────
++    //
++    // `Snapshot::from_tree` consumes a tree purely as: for every non-root node,
++    // the set of leaf names beneath it plus the edge length above it. If this
++    // parser and phylotree produce the same such signature for the same Newick,
++    // they yield identical `Snapshots` and therefore identical distance
++    // matrices. We compare signatures directly (rather than distances) because
++    // the `PhyloTree` type alias is fixed per build, so we can't run `from_tree`
++    // on both backends in one compilation.
++
++    /// Canonical structural signature: sorted list of
++    /// `(sorted leaf names under node, branch length)` for every non-root node.
++    /// The macro works on either tree type since both expose the same API.
++    macro_rules! signature {
++        ($tree:expr) => {{
++            use std::collections::{BTreeMap, BTreeSet};
++            let tree = &$tree;
++            let root = tree.get_root().unwrap();
++
++            // Pre-order traversal collects every node id (parents before children).
++            let mut order = vec![root];
++            let mut stack = vec![root];
++            while let Some(id) = stack.pop() {
++                for &c in &tree.get(&id).unwrap().children {
++                    order.push(c);
++                    stack.push(c);
++                }
++            }
++
++            // Reverse pre-order = children before parents → bottom-up leaf sets.
++            let mut leafset: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
++            for &id in order.iter().rev() {
++                let node = tree.get(&id).unwrap();
++                let mut set = BTreeSet::new();
++                if node.children.is_empty() {
++                    set.insert(node.name.clone().unwrap_or_default());
++                } else {
++                    for &c in &node.children {
++                        for name in &leafset[&c] {
++                            set.insert(name.clone());
++                        }
++                    }
++                }
++                leafset.insert(id, set);
++            }
++
++            let mut sig: Vec<(Vec<String>, String)> = order
++                .iter()
++                .filter(|&&id| id != root)
++                .map(|&id| {
++                    let node = tree.get(&id).unwrap();
++                    let names: Vec<String> = leafset[&id].iter().cloned().collect();
++                    (names, format!("{:.6}", node.parent_edge.unwrap_or(0.0)))
++                })
++                .collect();
++            sig.sort();
++            sig
++        }};
++    }
++
++    fn assert_matches_phylotree(newick: &str) {
++        let ours = Tree::from_newick(newick).unwrap();
++        let theirs = phylotree::tree::Tree::from_newick(newick).unwrap();
++        assert_eq!(
++            signature!(ours),
++            signature!(theirs),
++            "structural signature mismatch for newick: {newick}"
++        );
++    }
++
++    #[test]
++    fn matches_phylotree_on_balanced_rooted_tree() {
++        assert_matches_phylotree("((A:0.1,B:0.2):0.3,(C:0.4,D:0.5):0.6);");
++    }
++
++    #[test]
++    fn matches_phylotree_on_unrooted_trifurcation() {
++        assert_matches_phylotree("(A:0.1,B:0.2,(C:0.3,D:0.4):0.5);");
++    }
++
++    #[test]
++    fn matches_phylotree_on_deep_caterpillar() {
++        assert_matches_phylotree(
++            "(A:0.1,(B:0.1,(H:0.1,(D:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
++        );
++    }
++
++    #[test]
++    fn matches_phylotree_with_missing_branch_lengths() {
++        assert_matches_phylotree("((A,B),(C,D));");
++    }
++}
+diff --git a/src/snapshot.rs b/src/snapshot.rs
+index bf8b16b..1ae59c4 100644
+--- a/src/snapshot.rs
++++ b/src/snapshot.rs
+@@ -29,8 +29,10 @@
+ //! analysis typically fits in L2 cache instead of requiring DRAM.
+ 
+ use crate::bitset::Bitset;
++#[cfg(all(feature = "wasm", not(feature = "phylotree")))]
++use crate::phylotree_patch::{Tree as PhyloTree, TreeError};
++#[cfg(feature = "phylotree")]
+ use phylotree::tree::{Tree as PhyloTree, TreeError};
+-use rayon::prelude::*;
+ use rustc_hash::FxHashMap;
+ use std::collections::{HashMap, HashSet};
+ 
+@@ -453,11 +455,11 @@ impl Snapshots {
+             .map_err(|e| format!("Failed to snapshot tree at index 0: {e}"))?;
+         drop(first_tree);
+ 
+-        // Parse all remaining trees in parallel, validating leaf sets.
+-        let rest: Vec<Snapshot> = entries[1..]
+-            .par_iter()
+-            .enumerate()
+-            .map(|(j, &(newick, translate))| {
++        // Parse the remaining trees (in parallel when rayon is enabled, else
++        // sequentially for the single-threaded wasm build), validating leaf sets.
++        let rest: Vec<Snapshot> = crate::parallel::try_map_indexed(
++            &entries[1..],
++            |j, &(newick, translate)| {
+                 let i = j + 1;
+                 let clean = crate::io::strip_beast_annotations(newick);
+                 let mut tree = PhyloTree::from_newick(&clean)
+@@ -476,8 +478,8 @@ impl Snapshots {
+                 }
+                 Snapshot::from_tree(&tree, rooted)
+                     .map_err(|e| format!("Failed to snapshot tree at index {i}: {e}"))
+-            })
+-            .collect::<Result<_, _>>()?;
++            },
++        )?;
+ 
+         let mut snaps = Vec::with_capacity(entries.len());
+         snaps.push(first_snap);
+@@ -549,16 +551,13 @@ impl Snapshots {
+             return (presence, col_to_bip_id);
+         }
+ 
+-        // Safely divide the mutable slice into row-sized chunks across threads
+-        presence
+-            .par_chunks_mut(n_bip)
+-            .zip(&self.snapshots) // Pair each chunk with its corresponding snapshot
+-            .for_each(|(row, snap)| {
+-                for &split_id in &snap.split_ids {
+-                    // Write directly into the final memory location
+-                    row[id_to_col[split_id as usize]] = 1;
+-                }
+-            });
++        // Fill each tree's presence row (in parallel when rayon is enabled).
++        crate::parallel::for_each_row_mut(&mut presence, n_bip, |i, row| {
++            for &split_id in &self.snapshots[i].split_ids {
++                // Write directly into the final memory location
++                row[id_to_col[split_id as usize]] = 1;
++            }
++        });
+ 
+         (presence, col_to_bip_id)
+     }
+@@ -600,14 +599,12 @@ impl Snapshots {
+         }
+ 
+         let mut matrix = vec![0.0f64; n_trees * n_bip];
+-        matrix
+-            .par_chunks_mut(n_bip)
+-            .zip(&self.snapshots)
+-            .for_each(|(row, snap)| {
+-                for (&split_id, &length) in snap.split_ids.iter().zip(&snap.lengths) {
+-                    row[id_to_col[split_id as usize]] = length;
+-                }
+-            });
++        crate::parallel::for_each_row_mut(&mut matrix, n_bip, |i, row| {
++            let snap = &self.snapshots[i];
++            for (&split_id, &length) in snap.split_ids.iter().zip(&snap.lengths) {
++                row[id_to_col[split_id as usize]] = length;
++            }
++        });
+ 
+         let mut bytes = Vec::with_capacity(matrix.len() * 8);
+         for &v in &matrix {
+diff --git a/src/wasm.rs b/src/wasm.rs
+new file mode 100644
+index 0000000..2da3c81
+--- /dev/null
++++ b/src/wasm.rs
+@@ -0,0 +1,239 @@
++//! WebAssembly bindings for in-browser pairwise tree-distance computation.
++//!
++//! Kept thin, in the same spirit as `api.rs` (the PyO3 layer): the binding does
++//! validation and return-value assembly only; all real work lives in
++//! [`crate::io::parse_beast_content`], [`crate::snapshot::Snapshots`] and
++//! [`crate::distances`].
++//!
++//! [`compute_distances_core`] is plain Rust (no `wasm_bindgen`) so it can be
++//! unit-tested natively. The `#[wasm_bindgen]` wrapper is gated behind the
++//! `wasm` feature.
++
++use crate::io;
++use crate::snapshot::Snapshots;
++
++/// Output of [`compute_distances_core`]: `(tree_names, matrix_bytes_le, dtype, n)`.
++type ComputedMatrix = (Vec<String>, Vec<u8>, &'static str, usize);
++
++/// Parse a BEAST `.trees` string and compute the requested pairwise distance
++/// matrix, returning it as a flat little-endian byte buffer.
++///
++/// `method` is one of `"rf"`, `"wrf"`, `"kf"`. The matrix is row-major and
++/// square (`n × n`). RF values are emitted as `u32` (4 bytes each, dtype
++/// `"u32"`); WRF/KF values as `f64` (8 bytes each, dtype `"f64"`). Bytes are
++/// always little-endian so the JS side can decode with a fixed `DataView`
++/// byte order.
++///
++/// Returns `(tree_names, matrix_bytes, dtype, n)`.
++///
++/// # Errors
++/// Returns `Err(String)` if the file contains no trees, the trees fail to parse
++/// or have inconsistent leaf sets, or `method` is unrecognised.
++pub(crate) fn compute_distances_core(
++    content: &str,
++    method: &str,
++    rooted: bool,
++    burnin_trees: usize,
++    burnin_states: usize,
++    use_real_taxa: bool,
++) -> Result<ComputedMatrix, String> {
++    let (translate_map, tree_pairs) = io::parse_beast_content(
++        content,
++        "upload",
++        burnin_trees,
++        burnin_states,
++        use_real_taxa,
++    );
++    if tree_pairs.is_empty() {
++        return Err("No trees found in the uploaded file.".to_string());
++    }
++
++    let (names, newicks): (Vec<String>, Vec<String>) = tree_pairs.into_iter().unzip();
++    let entries = newicks.iter().map(|n| (n.as_str(), &translate_map));
++    let snaps = Snapshots::from_newick_iter(entries, rooted)?;
++    let n = names.len();
++
++    let (bytes, dtype) = match method {
++        "rf" => {
++            let matrix = snaps.pairwise_rf();
++            let mut bytes = Vec::with_capacity(matrix.len() * 4);
++            for v in matrix {
++                bytes.extend_from_slice(&(v as u32).to_le_bytes());
++            }
++            (bytes, "u32")
++        }
++        "wrf" => (f64_matrix_bytes(snaps.pairwise_wrf()), "f64"),
++        "kf" => (f64_matrix_bytes(snaps.pairwise_kf()), "f64"),
++        other => {
++            return Err(format!(
++                "Unknown method {other:?} (expected \"rf\", \"wrf\", or \"kf\")"
++            ));
++        }
++    };
++
++    Ok((names, bytes, dtype, n))
++}
++
++/// Serialise an `f64` distance matrix as little-endian bytes.
++fn f64_matrix_bytes(matrix: Vec<f64>) -> Vec<u8> {
++    let mut bytes = Vec::with_capacity(matrix.len() * 8);
++    for v in matrix {
++        bytes.extend_from_slice(&v.to_le_bytes());
++    }
++    bytes
++}
++
++// The `#[wasm_bindgen]` items below are collected by wasm-bindgen from this
++// compiled module directly; no crate-root re-export is needed.
++#[cfg(feature = "wasm")]
++mod bindings {
++    use super::compute_distances_core;
++    use wasm_bindgen::prelude::*;
++
++    /// Install a readable panic hook so Rust panics surface in the browser
++    /// console instead of an opaque `unreachable` trap. Marked as the module
++    /// start function, so it runs automatically on instantiation.
++    #[wasm_bindgen(start)]
++    pub fn start() {
++        console_error_panic_hook::set_once();
++    }
++
++    /// Result of [`compute_distances`]: tree names plus the matrix as a flat
++    /// little-endian byte buffer.
++    #[wasm_bindgen]
++    pub struct DistanceResult {
++        names: Vec<String>,
++        matrix: Vec<u8>,
++        dtype: String,
++        n: usize,
++    }
++
++    #[wasm_bindgen]
++    impl DistanceResult {
++        /// Tree names, in matrix row/column order.
++        #[wasm_bindgen(getter)]
++        pub fn names(&self) -> Vec<String> {
++            self.names.clone()
++        }
++
++        /// Element type of the matrix bytes: `"u32"` (RF) or `"f64"` (WRF/KF).
++        #[wasm_bindgen(getter)]
++        pub fn dtype(&self) -> String {
++            self.dtype.clone()
++        }
++
++        /// Matrix dimension (number of trees); the matrix is `n × n`.
++        #[wasm_bindgen(getter)]
++        pub fn n(&self) -> usize {
++            self.n
++        }
++
++        /// Move the matrix bytes out to JS as a `Uint8Array`, leaving this
++        /// result empty. Moving (rather than cloning) avoids a second multi-GB
++        /// copy inside wasm linear memory. Call exactly once.
++        #[wasm_bindgen]
++        pub fn take_matrix(&mut self) -> Vec<u8> {
++            std::mem::take(&mut self.matrix)
++        }
++    }
++
++    /// Compute the pairwise distance matrix for an uploaded BEAST `.trees` file.
++    ///
++    /// `method` is `"rf"`, `"wrf"`, or `"kf"`. See
++    /// [`compute_distances_core`](super::compute_distances_core) for semantics.
++    ///
++    /// # Errors
++    /// Surfaces parse/validation errors as a `JsError` (thrown in JS).
++    #[wasm_bindgen]
++    pub fn compute_distances(
++        content: &str,
++        method: &str,
++        rooted: bool,
++        burnin_trees: usize,
++        burnin_states: usize,
++        use_real_taxa: bool,
++    ) -> Result<DistanceResult, JsError> {
++        let (names, matrix, dtype, n) = compute_distances_core(
++            content,
++            method,
++            rooted,
++            burnin_trees,
++            burnin_states,
++            use_real_taxa,
++        )
++        .map_err(|e| JsError::new(&e))?;
++
++        Ok(DistanceResult {
++            names,
++            matrix,
++            dtype: dtype.to_string(),
++            n,
++        })
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::compute_distances_core;
++
++    /// A tiny BEAST block: translate map + three trees with known RF distances.
++    const BEAST: &str = "#NEXUS\n\
++        Begin trees;\n\
++        \tTranslate\n\
++        \t\t1 A,\n\
++        \t\t2 B,\n\
++        \t\t3 C,\n\
++        \t\t4 D\n\
++        \t;\n\
++        tree STATE_0 = ((1:1,2:1):1,(3:1,4:1):1);\n\
++        tree STATE_1 = ((1:1,3:1):1,(2:1,4:1):1);\n\
++        tree STATE_2 = ((1:1,2:1):1,(3:1,4:1):1);\n\
++        End;\n";
++
++    #[test]
++    fn rf_matrix_has_expected_shape_and_values() {
++        let (names, bytes, dtype, n) =
++            compute_distances_core(BEAST, "rf", false, 0, 0, true).unwrap();
++        assert_eq!(n, 3);
++        assert_eq!(names.len(), 3);
++        assert_eq!(dtype, "u32");
++        assert_eq!(bytes.len(), 3 * 3 * 4);
++
++        let mat: Vec<u32> = bytes
++            .chunks_exact(4)
++            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
++            .collect();
++        let at = |i: usize, j: usize| mat[i * n + j];
++        // Trees 0 and 2 are identical (RF 0); both differ from tree 1 by the
++        // single non-trivial bipartition on each side → RF 2.
++        assert_eq!(at(0, 0), 0);
++        assert_eq!(at(0, 2), 0);
++        assert_eq!(at(0, 1), 2);
++        assert_eq!(at(1, 2), 2);
++        // Symmetry.
++        assert_eq!(at(1, 0), at(0, 1));
++    }
++
++    #[test]
++    fn wrf_is_f64_and_zero_between_identical_trees() {
++        let (_, bytes, dtype, n) = compute_distances_core(BEAST, "wrf", false, 0, 0, true).unwrap();
++        assert_eq!(dtype, "f64");
++        assert_eq!(bytes.len(), n * n * 8);
++        let mat: Vec<f64> = bytes
++            .chunks_exact(8)
++            .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
++            .collect();
++        let at = |i: usize, j: usize| mat[i * n + j];
++        assert_eq!(at(0, 2), 0.0);
++    }
++
++    #[test]
++    fn unknown_method_errors() {
++        assert!(compute_distances_core(BEAST, "bogus", false, 0, 0, true).is_err());
++    }
++
++    #[test]
++    fn empty_input_errors() {
++        assert!(compute_distances_core("#NEXUS\n", "rf", false, 0, 0, true).is_err());
++    }
++}
+diff --git a/www/index.html b/www/index.html
+new file mode 100644
+index 0000000..16f1fbc
+--- /dev/null
++++ b/www/index.html
+@@ -0,0 +1,84 @@
++<!DOCTYPE html>
++<html lang="en">
++  <head>
++    <meta charset="UTF-8" />
++    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
++    <title>rapidtrees — in-browser tree distances</title>
++    <link rel="stylesheet" href="./style.css" />
++  </head>
++  <body>
++    <main>
++      <h1>rapidtrees</h1>
++      <p class="lede">
++        Compute pairwise phylogenetic tree distances (Robinson–Foulds, Weighted
++        RF, Kuhner–Felsenstein) from a BEAST <code>.trees</code> file — entirely
++        in your browser via WebAssembly. Nothing is uploaded to a server. The
++        matrix is streamed straight to a file on disk.
++      </p>
++
++      <form id="form">
++        <fieldset>
++          <legend>Input</legend>
++          <label>
++            BEAST <code>.trees</code> file
++            <input type="file" id="file" accept=".trees,.txt,text/plain" required />
++          </label>
++        </fieldset>
++
++        <fieldset>
++          <legend>Method</legend>
++          <label>
++            Distance
++            <select id="method">
++              <option value="rf">Robinson–Foulds (RF)</option>
++              <option value="wrf">Weighted RF (WRF)</option>
++              <option value="kf">Kuhner–Felsenstein (KF)</option>
++            </select>
++          </label>
++          <label class="check">
++            <input type="checkbox" id="rooted" />
++            Treat trees as rooted (clade mode)
++          </label>
++        </fieldset>
++
++        <fieldset>
++          <legend>Burn-in &amp; taxa</legend>
++          <label>
++            Burn-in (number of trees)
++            <input type="number" id="burnin_trees" min="0" value="0" />
++          </label>
++          <label>
++            Burn-in (minimum state)
++            <input type="number" id="burnin_states" min="0" value="0" />
++          </label>
++          <label class="check">
++            <input type="checkbox" id="use_real_taxa" checked />
++            Use real taxon names from the translate block
++          </label>
++        </fieldset>
++
++        <fieldset>
++          <legend>Output</legend>
++          <label class="check">
++            <input type="checkbox" id="gzip" checked />
++            Gzip the CSV (recommended for large matrices)
++          </label>
++        </fieldset>
++
++        <button type="submit" id="run" disabled>Loading WebAssembly…</button>
++      </form>
++
++      <p id="status" class="status" role="status" aria-live="polite"></p>
++
++      <footer>
++        <p>
++          Save uses the File System Access API where available
++          (Chrome/Edge), with a download fallback for Firefox/Safari. Very large
++          matrices may exceed browser memory limits on the fallback path.
++        </p>
++      </footer>
++    </main>
++
++    <script type="module" src="./main.js"></script>
++  </body>
++</html>
+diff --git a/www/main.js b/www/main.js
+new file mode 100644
+index 0000000..d3d042e
+--- /dev/null
++++ b/www/main.js
+@@ -0,0 +1,188 @@
++// Vanilla driver for the rapidtrees WebAssembly module.
++//
++// Flow: read the uploaded BEAST `.trees` file as text → hand it to the wasm
++// `compute_distances` → receive the matrix as a flat little-endian byte buffer
++// → stream it to disk as CSV, one row at a time, so we never build a second
++// multi-gigabyte copy in JS.
++
++import init, { compute_distances } from "./pkg/rapidtrees.js";
++
++const $ = (id) => document.getElementById(id);
++const form = $("form");
++const runBtn = $("run");
++const statusEl = $("status");
++
++function setStatus(msg, kind = "") {
++  statusEl.textContent = msg;
++  statusEl.className = `status ${kind}`;
++}
++
++// Initialise the wasm module up front so the first compute isn't slow.
++init()
++  .then(() => {
++    runBtn.disabled = false;
++    runBtn.textContent = "Compute & Save";
++    setStatus("Ready.");
++  })
++  .catch((err) => {
++    setStatus(`Failed to load WebAssembly: ${err}`, "error");
++  });
++
++// Quote a CSV field only when it contains a comma, quote, or newline.
++function csvField(value) {
++  const s = String(value);
++  if (/[",\n\r]/.test(s)) {
++    return `"${s.replace(/"/g, '""')}"`;
++  }
++  return s;
++}
++
++// Read one matrix value at flat index `k` from the byte buffer.
++function valueReader(view, dtype) {
++  if (dtype === "u32") {
++    return (k) => view.getUint32(k * 4, true);
++  }
++  // f64
++  return (k) => view.getFloat64(k * 8, true);
++}
++
++// Yield CSV lines: a header row of tree names, then one row per tree.
++function* csvLines(names, view, dtype, n) {
++  const at = valueReader(view, dtype);
++  yield ["", ...names].map(csvField).join(",") + "\n";
++  for (let i = 0; i < n; i++) {
++    const cells = new Array(n + 1);
++    cells[0] = csvField(names[i]);
++    const base = i * n;
++    for (let j = 0; j < n; j++) {
++      cells[j + 1] = at(base + j);
++    }
++    yield cells.join(",") + "\n";
++  }
++}
++
++// Stream CSV directly to a file handle (Chrome/Edge), gzipping on the fly.
++async function streamToFileHandle(handle, lines, gzip) {
++  const writable = await handle.createWritable();
++  const encoder = new TextEncoder();
++
++  let writer;
++  let pipePromise;
++  if (gzip) {
++    const cs = new CompressionStream("gzip");
++    pipePromise = cs.readable.pipeTo(writable);
++    writer = cs.writable.getWriter();
++  } else {
++    writer = writable.getWriter();
++  }
++
++  try {
++    for (const line of lines) {
++      await writer.write(encoder.encode(line));
++    }
++    await writer.close();
++  } catch (err) {
++    await writer.abort?.(err);
++    throw err;
++  }
++  if (pipePromise) await pipePromise;
++}
++
++// Fallback for browsers without showSaveFilePicker: build a Blob and download.
++// This buffers the whole file in memory.
++async function downloadViaAnchor(filename, lines, gzip) {
++  const encoder = new TextEncoder();
++  const chunks = [];
++  for (const line of lines) chunks.push(encoder.encode(line));
++  let blob = new Blob(chunks, { type: "text/csv" });
++  if (gzip) {
++    const stream = blob.stream().pipeThrough(new CompressionStream("gzip"));
++    blob = await new Response(stream).blob();
++  }
++  const url = URL.createObjectURL(blob);
++  const a = document.createElement("a");
++  a.href = url;
++  a.download = filename;
++  document.body.appendChild(a);
++  a.click();
++  a.remove();
++  URL.revokeObjectURL(url);
++}
++
++form.addEventListener("submit", async (event) => {
++  event.preventDefault();
++
++  const file = $("file").files[0];
++  if (!file) {
++    setStatus("Please choose a .trees file first.", "error");
++    return;
++  }
++
++  const method = $("method").value;
++  const rooted = $("rooted").checked;
++  const burninTrees = parseInt($("burnin_trees").value, 10) || 0;
++  const burninStates = parseInt($("burnin_states").value, 10) || 0;
++  const useRealTaxa = $("use_real_taxa").checked;
++  const gzip = $("gzip").checked;
++  const suggestedName = `distances.csv${gzip ? ".gz" : ""}`;
++
++  // The save dialog MUST be opened synchronously inside the user gesture
++  // (this submit handler), before any `await`. If we computed first, the
++  // gesture would have expired and showSaveFilePicker would throw. So we
++  // acquire the file handle now; the file is only written to after the matrix
++  // is computed below. Browsers without the API fall back to a download.
++  let handle = null;
++  if (typeof window.showSaveFilePicker === "function") {
++    try {
++      handle = await window.showSaveFilePicker({ suggestedName });
++    } catch (err) {
++      if (err && err.name === "AbortError") {
++        setStatus("Save cancelled.");
++        return;
++      }
++      setStatus(`Error: ${err && err.message ? err.message : err}`, "error");
++      return;
++    }
++  }
++
++  runBtn.disabled = true;
++  try {
++    setStatus("Reading file…");
++    const content = await file.text();
++
++    setStatus("Computing distance matrix… (this can take a while)");
++    // Yield to the event loop so the status text paints before we block.
++    await new Promise((r) => setTimeout(r, 0));
++
++    const result = compute_distances(
++      content,
++      method,
++      rooted,
++      burninTrees,
++      burninStates,
++      useRealTaxa,
++    );
++
++    const names = result.names;
++    const n = result.n;
++    const dtype = result.dtype;
++    const matrix = result.take_matrix();
++    const view = new DataView(matrix.buffer, matrix.byteOffset, matrix.byteLength);
++
++    setStatus(`Computed ${n}×${n} matrix. Saving ${suggestedName}…`);
++
++    const lines = csvLines(names, view, dtype, n);
++
++    if (handle) {
++      await streamToFileHandle(handle, lines, gzip);
++    } else {
++      await downloadViaAnchor(suggestedName, lines, gzip);
++    }
++
++    setStatus(`Done — saved ${n}×${n} ${dtype} matrix to ${suggestedName}.`, "ok");
++  } catch (err) {
++    setStatus(`Error: ${err && err.message ? err.message : err}`, "error");
++  } finally {
++    runBtn.disabled = false;
++  }
++});
+diff --git a/www/style.css b/www/style.css
+new file mode 100644
+index 0000000..f8ff676
+--- /dev/null
++++ b/www/style.css
+@@ -0,0 +1,121 @@
++:root {
++  --fg: #1a1a1a;
++  --muted: #5c6670;
++  --accent: #2c6e49;
++  --border: #d7dce0;
++  --bg: #fafbfc;
++}
++
++* {
++  box-sizing: border-box;
++}
++
++body {
++  margin: 0;
++  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
++  color: var(--fg);
++  background: var(--bg);
++  line-height: 1.5;
++}
++
++main {
++  max-width: 640px;
++  margin: 0 auto;
++  padding: 2rem 1.25rem 4rem;
++}
++
++h1 {
++  margin: 0 0 0.25rem;
++  color: var(--accent);
++}
++
++.lede {
++  color: var(--muted);
++  margin-top: 0;
++}
++
++code {
++  background: #eef1f3;
++  padding: 0.1em 0.35em;
++  border-radius: 4px;
++  font-size: 0.9em;
++}
++
++fieldset {
++  border: 1px solid var(--border);
++  border-radius: 8px;
++  margin: 0 0 1rem;
++  padding: 0.75rem 1rem 1rem;
++  background: #fff;
++}
++
++legend {
++  font-weight: 600;
++  padding: 0 0.4rem;
++}
++
++label {
++  display: block;
++  margin: 0.6rem 0;
++  font-weight: 500;
++}
++
++label.check {
++  font-weight: 400;
++}
++
++input[type="file"],
++input[type="number"],
++select {
++  display: block;
++  margin-top: 0.25rem;
++  padding: 0.4rem 0.5rem;
++  border: 1px solid var(--border);
++  border-radius: 6px;
++  font: inherit;
++  width: 100%;
++  max-width: 360px;
++  background: #fff;
++}
++
++label.check input {
++  display: inline;
++  width: auto;
++  margin-right: 0.4rem;
++}
++
++button {
++  font: inherit;
++  font-weight: 600;
++  color: #fff;
++  background: var(--accent);
++  border: none;
++  border-radius: 6px;
++  padding: 0.6rem 1.2rem;
++  cursor: pointer;
++}
++
++button:disabled {
++  background: #9bb3a6;
++  cursor: progress;
++}
++
++.status {
++  min-height: 1.5em;
++  margin-top: 1rem;
++  font-weight: 500;
++}
++
++.status.ok {
++  color: var(--accent);
++}
++
++.status.error {
++  color: #b00020;
++}
++
++footer {
++  margin-top: 2rem;
++  color: var(--muted);
++  font-size: 0.85rem;
++}

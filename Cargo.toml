@@ -20,18 +20,26 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [dependencies]
-phylotree = "0.1.3"
+phylotree = { version = "0.1.3", optional = true }
 pyo3 = { version = "0.27.1", optional = true }
-rayon = "1"
+rayon = { version = "1", optional = true }
 clap = { version = "4.5", features = ["derive"], optional = true }
 flate2 = { version = "1", optional = true }
 rustc-hash = "2.1"
+thiserror = "2"
+wasm-bindgen = { version = "0.2", optional = true }
+console_error_panic_hook = { version = "0.1", optional = true }
 
 [features]
 default = ["cli"]
-cli = ["clap", "flate2"]
-python = ["pyo3"]
+cli = ["phylotree", "clap", "flate2", "rayon"]
+python = ["phylotree", "pyo3", "rayon"]
 extension-module = ["python", "pyo3/extension-module"]
+# Browser/WebAssembly build. Mutually exclusive with the phylotree-backed
+# features above: it swaps in the in-crate `phylotree-patch` Newick parser and
+# drops rayon (GitHub Pages can't set the COOP/COEP headers SharedArrayBuffer
+# needs). Build with: `--no-default-features --features wasm`.
+wasm = ["wasm-bindgen", "console_error_panic_hook"]
 
 [dev-dependencies]
 itertools = "0.14.0"
@@ -44,3 +52,9 @@ tempfile = "3"
 [[bench]]
 name = "memory_time_benchmark"
 harness = false
+
+# Disable wasm-opt so `wasm-pack build` is self-contained and does not need to
+# download the binaryen toolchain at build time. The bundle is slightly larger;
+# for an aggressively optimised build, install binaryen and flip this to `true`.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false

@@ -72,6 +72,8 @@ develop = { cmd = "maturin develop --uv", description = "Build and install in ed
 fmt = { cmd = "cargo fmt --check", description = "Check Rust formatting" }
 clippy = { cmd = "cargo clippy --all-targets --all-features -- -D warnings", description = "Run Clippy linter" }
 bench = { cmd = "cargo bench", description = "Run performance benchmarks" }
+build-wasm = { cmd = "wasm-pack build --no-default-features --features wasm --target web --out-dir www/pkg", description = "Build the browser WebAssembly bundle into www/pkg" }
+serve-wasm = { cmd = "python -m http.server --directory www", description = "Serve the static site locally (after build-wasm) at http://localhost:8000" }
 pre-commit = { cmd = "prek run --config .pre-commit-config.yaml --all-files" }
 run-treetracer = { cmd = "cd ../treetracer && uv sync --reinstall-package rapidtrees && uv run treetracer", description = "Rebuild rapidtrees (in treetracer's venv) and launch the desktop app against it" }
 run-treetracer-browser = { cmd = "cd ../treetracer && uv sync --reinstall-package rapidtrees && uv run treetracer --browser", description = "Rebuild rapidtrees (in treetracer's venv) and launch treetracer in a browser tab" }

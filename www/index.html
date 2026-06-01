@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>rapidtrees — in-browser tree distances</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main>
+      <h1>rapidtrees</h1>
+      <p class="lede">
+        Compute pairwise phylogenetic tree distances (Robinson–Foulds, Weighted
+        RF, Kuhner–Felsenstein) from a BEAST <code>.trees</code> file — entirely
+        in your browser via WebAssembly. Nothing is uploaded to a server. The
+        matrix is streamed straight to a file on disk.
+      </p>
+
+      <form id="form">
+        <fieldset>
+          <legend>Input</legend>
+          <label>
+            BEAST <code>.trees</code> file
+            <input type="file" id="file" accept=".trees,.txt,text/plain" required />
+          </label>
+        </fieldset>
+
+        <fieldset>
+          <legend>Method</legend>
+          <label>
+            Distance
+            <select id="method">
+              <option value="rf">Robinson–Foulds (RF)</option>
+              <option value="wrf">Weighted RF (WRF)</option>
+              <option value="kf">Kuhner–Felsenstein (KF)</option>
+            </select>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="rooted" />
+            Treat trees as rooted (clade mode)
+          </label>
+        </fieldset>
+
+        <fieldset>
+          <legend>Burn-in &amp; taxa</legend>
+          <label>
+            Burn-in (number of trees)
+            <input type="number" id="burnin_trees" min="0" value="0" />
+          </label>
+          <label>
+            Burn-in (minimum state)
+            <input type="number" id="burnin_states" min="0" value="0" />
+          </label>
+          <label class="check">
+            <input type="checkbox" id="use_real_taxa" checked />
+            Use real taxon names from the translate block
+          </label>
+        </fieldset>
+
+        <fieldset>
+          <legend>Output</legend>
+          <label class="check">
+            <input type="checkbox" id="gzip" checked />
+            Gzip the CSV (recommended for large matrices)
+          </label>
+        </fieldset>
+
+        <button type="submit" id="run" disabled>Loading WebAssembly…</button>
+      </form>
+
+      <p id="status" class="status" role="status" aria-live="polite"></p>
+
+      <footer>
+        <p>
+          Save uses the File System Access API where available
+          (Chrome/Edge), with a download fallback for Firefox/Safari. Very large
+          matrices may exceed browser memory limits on the fallback path.
+        </p>
+      </footer>
+    </main>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

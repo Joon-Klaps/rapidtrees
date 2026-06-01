@@ -11,3 +11,5 @@ treetracer/
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+# wasm-pack output (built by CI, not committed)
+www/pkg/

@@ -10,12 +10,26 @@
 pub mod bitset;
 pub mod distances;
 pub mod io;
+pub(crate) mod parallel;
 pub(crate) mod snapshot;
 
 #[cfg(feature = "python")]
 pub mod api;
 #[cfg(feature = "python")]
 pub(crate) mod progress;
+
+// In-crate Newick parser used in place of `phylotree` for the wasm build. Only
+// compiled when it is actually the active backend (wasm without phylotree), plus
+// under `test` so a native test can cross-check it against phylotree.
+#[cfg(any(all(feature = "wasm", not(feature = "phylotree")), test))]
+#[path = "phylotree-patch.rs"]
+pub(crate) mod phylotree_patch;
+
+// WebAssembly bindings. The `compute_distances_core` helper is also compiled
+// under `test` (native) so it can be unit-tested without a browser; only the
+// `#[wasm_bindgen]` wrapper inside requires the `wasm` feature.
+#[cfg(any(feature = "wasm", test))]
+mod wasm;
 
 pub use bitset::Bitset;
 #[cfg(feature = "cli")]
