@@ -29,10 +29,12 @@
 //! analysis typically fits in L2 cache instead of requiring DRAM.
 
 use crate::bitset::Bitset;
+use hashbrown::HashTable;
 use phylotree::tree::{Tree as PhyloTree, TreeError};
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasher;
 
 use std::cell::RefCell;
 
@@ -399,8 +401,6 @@ pub struct Snapshots {
     pub(crate) snapshots: Vec<InternSnap>,
     /// The bipartition at index `i` corresponds to split ID `i`.
     pub bipartitions: Vec<Bitset>,
-    /// Reverse map: bipartition bitset → split ID.
-    pub bipartition_index: FxHashMap<Bitset, u32>,
     pub words_per_bitset: usize,
     /// Alphabetically sorted taxon names shared by all trees in this set.
     pub leaf_names: Vec<String>,
@@ -420,6 +420,21 @@ impl Snapshots {
     pub fn from_newick_iter<'a>(
         entries: impl IntoIterator<Item = (&'a str, &'a HashMap<String, String>)>,
         rooted: bool,
+    ) -> Result<Self, String> {
+        Self::from_newick_iter_opts(entries, rooted, true)
+    }
+
+    /// Like [`Snapshots::from_newick_iter`], but lets internal callers opt out of
+    /// storing branch lengths.
+    ///
+    /// When `store_lengths` is `false`, each `InternSnap.lengths` is left empty —
+    /// saving `~n_bip × 8` bytes per tree on RF-only paths that never read lengths.
+    /// The public constructor always passes `true`, so the Rust/Python API is
+    /// unaffected.
+    pub(crate) fn from_newick_iter_opts<'a>(
+        entries: impl IntoIterator<Item = (&'a str, &'a HashMap<String, String>)>,
+        rooted: bool,
+        store_lengths: bool,
     ) -> Result<Self, String> {
         let entries: Vec<_> = entries.into_iter().collect();
         if entries.is_empty() {
@@ -483,7 +498,7 @@ impl Snapshots {
         snaps.push(first_snap);
         snaps.extend(rest);
 
-        Ok(Self::intern(snaps, sorted_leaf_names))
+        Ok(Self::intern(snaps, sorted_leaf_names, store_lengths))
     }
 
     /// Build a `Snapshots` collection from a slice of plain Newick strings.
@@ -691,9 +706,15 @@ impl Snapshots {
     }
 
     /// Build the interning table from a `Vec<Snapshot>` (internal helper).
-    fn intern(snaps: Vec<Snapshot>, leaf_names: Vec<String>) -> Self {
+    ///
+    /// Deduplicates bipartitions into split IDs using a `HashTable<u32>` that
+    /// stores only the integer IDs — each unique bitset is kept exactly once, in
+    /// `bipartitions`. When `store_lengths` is `false`, branch lengths are dropped
+    /// (RF-only paths never read them).
+    fn intern(snaps: Vec<Snapshot>, leaf_names: Vec<String>, store_lengths: bool) -> Self {
         let words = snaps.first().map(|s| s.words).unwrap_or(0);
-        let mut index: FxHashMap<Bitset, u32> = FxHashMap::default();
+        let hasher = FxBuildHasher;
+        let mut table: HashTable<u32> = HashTable::new();
         let mut bipartitions: Vec<Bitset> = Vec::new();
 
         let interned: Vec<InternSnap> = snaps
@@ -704,13 +725,17 @@ impl Snapshots {
                     .into_iter()
                     .zip(snap.lengths)
                     .map(|(b, length)| {
-                        let next_id = bipartitions.len() as u32;
-                        let id = if let Some(&id) = index.get(&b) {
-                            id
-                        } else {
-                            index.insert(b.clone(), next_id);
-                            bipartitions.push(b);
-                            next_id
+                        let hash = hasher.hash_one(&b);
+                        let id = match table.find(hash, |&id| bipartitions[id as usize] == b) {
+                            Some(&id) => id,
+                            None => {
+                                let new_id = bipartitions.len() as u32;
+                                bipartitions.push(b);
+                                table.insert_unique(hash, new_id, |&id| {
+                                    hasher.hash_one(&bipartitions[id as usize])
+                                });
+                                new_id
+                            }
                         };
                         (id, length)
                     })
@@ -718,6 +743,7 @@ impl Snapshots {
 
                 paired.sort_unstable_by_key(|&(id, _)| id);
                 let (split_ids, lengths): (Vec<u32>, Vec<f64>) = paired.into_iter().unzip();
+                let lengths = if store_lengths { lengths } else { Vec::new() };
                 InternSnap { split_ids, lengths }
             })
             .collect();
@@ -725,7 +751,6 @@ impl Snapshots {
         Self {
             snapshots: interned,
             bipartitions,
-            bipartition_index: index,
             words_per_bitset: words,
             leaf_names,
         }
@@ -735,7 +760,6 @@ impl Snapshots {
         Self {
             snapshots: Vec::new(),
             bipartitions: Vec::new(),
-            bipartition_index: FxHashMap::default(),
             words_per_bitset: 0,
             leaf_names: Vec::new(),
         }
@@ -1413,5 +1437,97 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Build `Snapshots` from plain newicks with an explicit `store_lengths` flag.
+    fn snaps_opts(newicks: &[&str], rooted: bool, store_lengths: bool) -> Snapshots {
+        let empty: HashMap<String, String> = HashMap::new();
+        Snapshots::from_newick_iter_opts(
+            newicks.iter().map(|&n| (n, &empty)),
+            rooted,
+            store_lengths,
+        )
+        .unwrap()
+    }
+
+    /// RF distances are identical whether or not branch lengths are stored, and the
+    /// no-lengths path leaves every `InternSnap.lengths` empty while keeping split IDs.
+    #[test]
+    fn test_rf_path_without_lengths_matches() {
+        let trees = [
+            "((A:1,B:2):5,(C:3,D:4):6);",
+            "((A:7,C:8):9,(B:10,D:11):12);",
+            "((A:13,D:1):2,(B:3,C:4):5);",
+        ];
+
+        let with_len = snaps_opts(&trees, false, true);
+        let no_len = snaps_opts(&trees, false, false);
+
+        // Identical interning: same bipartition count and per-tree split IDs.
+        assert_eq!(with_len.bipartitions.len(), no_len.bipartitions.len());
+        for (a, b) in with_len.snapshots.iter().zip(&no_len.snapshots) {
+            assert_eq!(a.split_ids, b.split_ids, "split IDs must match");
+        }
+
+        // No-lengths path drops the lengths vector; default path keeps one per split.
+        for snap in &no_len.snapshots {
+            assert!(snap.lengths.is_empty(), "RF path must not store lengths");
+        }
+        for snap in &with_len.snapshots {
+            assert_eq!(snap.lengths.len(), snap.split_ids.len());
+        }
+
+        assert_eq!(with_len.pairwise_rf(), no_len.pairwise_rf());
+    }
+
+    /// `intern` assigns strictly-ascending, deduplicated split IDs, and identical
+    /// topologies share the exact same interned IDs.
+    #[test]
+    fn test_intern_split_ids_sorted_and_deduped() {
+        let trees = [
+            "((A:1,B:1):1,(C:1,D:1):1);",
+            "((A:1,B:1):1,(C:1,D:1):1);",
+            "((A:1,C:1):1,(B:1,D:1):1);",
+        ];
+        let snaps = snaps_opts(&trees, false, true);
+
+        for snap in &snaps.snapshots {
+            assert!(
+                snap.split_ids.windows(2).all(|w| w[0] < w[1]),
+                "split IDs must be strictly ascending and unique: {:?}",
+                snap.split_ids
+            );
+            for &id in &snap.split_ids {
+                assert!((id as usize) < snaps.bipartitions.len());
+            }
+        }
+
+        assert_eq!(
+            snaps.snapshots[0].split_ids, snaps.snapshots[1].split_ids,
+            "identical topologies must intern to identical split IDs"
+        );
+    }
+
+    /// Presence matrix and bipartition-clade bytes are unaffected by `store_lengths`
+    /// (the RF-with-snapshots export path passes `false`).
+    #[test]
+    fn test_presence_export_independent_of_lengths() {
+        let trees = [
+            "((A:1,B:2):5,(C:3,D:4):6);",
+            "((A:7,C:8):9,(B:10,D:11):12);",
+            "((A:13,B:14):15,(C:16,D:17):18);",
+        ];
+
+        let with_len = snaps_opts(&trees, false, true);
+        let no_len = snaps_opts(&trees, false, false);
+
+        let (pres_a, cols_a) = with_len.build_presence_matrix();
+        let (pres_b, cols_b) = no_len.build_presence_matrix();
+        assert_eq!(pres_a, pres_b, "presence matrix must be identical");
+        assert_eq!(cols_a, cols_b, "column ordering must be identical");
+
+        let bip_a = with_len.build_bipartition_bytes(&cols_a);
+        let bip_b = no_len.build_bipartition_bytes(&cols_b);
+        assert_eq!(bip_a, bip_b, "bipartition clade bytes must be identical");
     }
 }

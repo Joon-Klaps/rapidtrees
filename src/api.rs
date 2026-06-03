@@ -29,11 +29,16 @@ type PyRfSnapshotResult = (
 );
 
 /// Collect tree snapshots from a lazy Python iterator of newick strings.
+///
+/// `store_lengths` controls whether branch lengths are retained: weighted metrics
+/// (WRF/KF) need them, RF-only paths pass `false` to skip the per-tree `lengths`
+/// allocation.
 fn collect_snapshots_from_iter(
     newick_iter: Bound<'_, PyIterator>,
     translate_maps: &[HashMap<String, String>],
     map_indices: &[usize],
     rooted: bool,
+    store_lengths: bool,
 ) -> PyResult<Snapshots> {
     let newicks: Vec<String> = newick_iter
         .map(|item| item?.extract::<String>())
@@ -49,7 +54,7 @@ fn collect_snapshots_from_iter(
         .iter()
         .zip(map_indices.iter())
         .map(|(n, &idx)| (n.as_str(), &translate_maps[idx]));
-    Snapshots::from_newick_iter(entries, rooted).map_err(PyValueError::new_err)
+    Snapshots::from_newick_iter_opts(entries, rooted, store_lengths).map_err(PyValueError::new_err)
 }
 
 /// Validate argument consistency for iterator-based functions.
@@ -121,7 +126,12 @@ fn pairwise_rf_from_newick_iter(
 ) -> PyResult<(Vec<String>, Py<PyAny>)> {
     validate_iter_args(&names, &map_indices, &translate_maps)?;
 
-    let snaps = collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted)?;
+    let mut snaps =
+        collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted, false)?;
+
+    // This path never exports snapshots, and `rf_distance_fast` reads only
+    // `split_ids` — release the bipartition bitsets before the O(n²) loop.
+    snaps.bipartitions = Vec::new();
 
     let n = snaps.snapshots.len();
     let rf_matrix = with_counter(py, progress, n_pairs(n), |counter| {
@@ -208,7 +218,8 @@ fn pairwise_rf_with_snapshots_from_newick_iter(
 ) -> PyResult<PyRfSnapshotResult> {
     validate_iter_args(&names, &map_indices, &translate_maps)?;
 
-    let snaps = collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted)?;
+    let snaps =
+        collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted, false)?;
 
     let n = snaps.snapshots.len();
     let rf_matrix = with_counter(py, progress, n_pairs(n), |counter| {
@@ -287,7 +298,8 @@ fn pairwise_wrf_with_snapshots_from_newick_iter(
 ) -> PyResult<PyRfSnapshotResult> {
     validate_iter_args(&names, &map_indices, &translate_maps)?;
 
-    let snaps = collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted)?;
+    let snaps =
+        collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted, true)?;
 
     let n = snaps.snapshots.len();
     let wrf_matrix = with_counter(py, progress, n_pairs(n), |counter| {
@@ -350,7 +362,8 @@ fn pairwise_kf_with_snapshots_from_newick_iter(
 ) -> PyResult<PyRfSnapshotResult> {
     validate_iter_args(&names, &map_indices, &translate_maps)?;
 
-    let snaps = collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted)?;
+    let snaps =
+        collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted, true)?;
 
     let n = snaps.snapshots.len();
     let kf_matrix = with_counter(py, progress, n_pairs(n), |counter| {
@@ -407,7 +420,8 @@ fn pairwise_wrf_from_newick_iter(
 ) -> PyResult<(Vec<String>, Vec<f64>)> {
     validate_iter_args(&names, &map_indices, &translate_maps)?;
 
-    let snaps = collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted)?;
+    let snaps =
+        collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted, true)?;
 
     let n = snaps.snapshots.len();
     let matrix = with_counter(py, progress, n_pairs(n), |counter| {
@@ -447,7 +461,8 @@ fn pairwise_kf_from_newick_iter(
 ) -> PyResult<(Vec<String>, Vec<f64>)> {
     validate_iter_args(&names, &map_indices, &translate_maps)?;
 
-    let snaps = collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted)?;
+    let snaps =
+        collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted, true)?;
 
     let n = snaps.snapshots.len();
     let matrix = with_counter(py, progress, n_pairs(n), |counter| {

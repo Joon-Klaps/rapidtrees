@@ -133,11 +133,6 @@ fn estimate_size(snaps: &Snapshots) -> usize {
     let bip_vec_size =
         snaps.bipartitions.capacity() * (mem::size_of::<Bitset>() + words * mem::size_of::<u64>());
 
-    // bipartition_index: FxHashMap — each entry stores a cloned Bitset key + u32 value
-    // Add ~32 bytes per entry for HashMap bucket/metadata overhead
-    let index_size = n_bip
-        * (mem::size_of::<Bitset>() + words * mem::size_of::<u64>() + mem::size_of::<u32>() + 32);
-
     // snapshots (Vec<InternSnap>): per tree = split_ids Vec<u32> + lengths Vec<f64>
     // Vec header (24 bytes) + actual data for each
     let snap_size =
@@ -150,7 +145,7 @@ fn estimate_size(snaps: &Snapshots) -> usize {
         .map(|n| mem::size_of::<String>() + n.len())
         .sum::<usize>();
 
-    struct_size + bip_vec_size + index_size + snap_size + names_size
+    struct_size + bip_vec_size + snap_size + names_size
 }
 
 fn from_newicks_or_skip(newicks: &[String], rooted: bool, label: &str) -> Option<Snapshots> {
@@ -191,8 +186,8 @@ fn main() {
         "|----------|-----------|--------------|-------------|---------------|-----------|----------|"
     );
 
-    let taxa_counts = [10, 100, 500, 1000, 2000, 5000];
-    let tree_counts = [100, 1000, 10_000, 100_000];
+    let taxa_counts = [10, 100, 500, 1000, 2000, 5000, 10_000, 20_000];
+    let tree_counts = [100, 1000, 10_000];
     const MEMORY_LIMIT: usize = 30 * 1024 * 1024 * 1024; // 30 GB
     const TIME_LIMIT: Duration = Duration::from_secs(60 * 60); // 1 hour
     const BAR_WIDTH: usize = 10;
