@@ -8,10 +8,12 @@ This project uses release names based on random words from [codenamegenerator.co
     - PREFIX: Microsoft Corperation
     - DICTIONARY: Snakes
 
-
 ## [Unreleased]
+- **Memory:** Reduced the RAM footprint of `Snapshots`, targeting the large-tip regime (≤5000 trees, 10,000+ tips). Two changes: (1) removed the never-read `bipartition_index` field, which stored a second full copy of every unique bipartition bitset (~`U × ceil(tips/64) × 8` bytes; GB-scale at high tip counts) — interning now dedups via a `hashbrown::HashTable<u32>` that keeps exactly one copy of each bitset; (2) RF-only paths no longer store per-tree branch lengths, and the non-export RF path also releases the bipartition table before the pairwise loop. No Python API change. ([#13](https://github.com/Joon-Klaps/rapidtrees/pull/13))
 
-- Added `rapidtrees.ProgressCounter` — a lock-free, Python-facing handle for observing live progress of a pairwise distance call. Instantiate one, pass it as `progress=` to any of the six `pairwise_*_from_newick_iter` functions, and read `.value()` / `.total()` / `.fraction()` from another Python thread while the call blocks. The GIL is released for the duration of the rayon loop only when a counter is supplied; passing `None` (the default) preserves the original zero-overhead, GIL-held behaviour. Reading is a single atomic load (~1 ns) — no callback, no GIL acquisition from Rust, no monitor thread.
+## [0.6.0] - Powershell Cobra (2026-05-28)
+
+- Added `rapidtrees.ProgressCounter` — a lock-free, Python-facing handle for observing live progress of a pairwise distance call. Instantiate one, pass it as `progress=` to any of the six `pairwise_*_from_newick_iter` functions, and read `.value()` / `.total()` / `.fraction()` from another Python thread while the call blocks. The GIL is released for the duration of the rayon loop only when a counter is supplied; passing `None` (the default) preserves the original zero-overhead, GIL-held behaviour. Reading is a single atomic load (~1 ns) — no callback, no GIL acquisition from Rust, no monitor thread. ([#12](https://github.com/Joon-Klaps/rapidtrees/pull/12))
 - CLI: when stderr is a TTY and `--quiet` is not set, the `rapidtrees` binary now renders a live progress bar to stderr during pairwise distance computation (e.g. `[█████████░░░░░] 64.2% (3211/5000 pairs, ETA 4.1s)`). Piped/redirected runs are unaffected — the bar auto-suppresses when stderr is not a terminal.
 
 ## [0.5.1] - 0.5.1 - Azure Mamba (2026-05-12)

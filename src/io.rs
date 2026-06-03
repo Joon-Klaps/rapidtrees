@@ -12,8 +12,6 @@ use crate::snapshot::InternSnap;
 #[cfg(feature = "cli")]
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 #[cfg(feature = "cli")]
-use rustc_hash::FxHashMap;
-#[cfg(feature = "cli")]
 use std::fs::File;
 #[cfg(feature = "cli")]
 use std::io;
@@ -290,12 +288,6 @@ pub fn load_snapshots<P: AsRef<Path>>(path: P) -> io::Result<(Vec<String>, Snaps
     let mut presence = vec![0u8; n_trees * n_bip];
     r.read_exact(&mut presence)?;
 
-    let bipartition_index: FxHashMap<Bitset, u32> = all_bips
-        .iter()
-        .enumerate()
-        .map(|(i, bip)| (bip.clone(), i as u32))
-        .collect();
-
     let interned_snaps: Vec<InternSnap> = presence
         .chunks_exact(n_bip)
         .take(n_trees)
@@ -312,7 +304,6 @@ pub fn load_snapshots<P: AsRef<Path>>(path: P) -> io::Result<(Vec<String>, Snaps
     let snaps = Snapshots {
         snapshots: interned_snaps,
         bipartitions: all_bips,
-        bipartition_index,
         words_per_bitset: words,
         leaf_names: taxa_names,
     };

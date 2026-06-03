@@ -319,7 +319,6 @@ The `Snapshots` container holds:
 Snapshots
 ├── snapshots:          Vec<InternSnap>        ← one per tree
 ├── bipartitions:       Vec<Bitset>            ← the global ID→Bitset table
-├── bipartition_index:  HashMap<Bitset, u32>   ← reverse: Bitset→ID (for lookups)
 └── leaf_names:         Vec<String>            ← ["A","B","C","D","E","F","G"]
 ```
 
