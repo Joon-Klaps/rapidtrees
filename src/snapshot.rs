@@ -726,11 +726,13 @@ impl Snapshots {
                     .zip(snap.lengths)
                     .map(|(b, length)| {
                         let hash = hasher.hash_one(&b);
+                        // Check if this bipartition already has an assigned ID.
                         let id = match table.find(hash, |&id| bipartitions[id as usize] == b) {
                             Some(&id) => id,
                             None => {
                                 let new_id = bipartitions.len() as u32;
                                 bipartitions.push(b);
+                                // register the new ID in the hash table
                                 table.insert_unique(hash, new_id, |&id| {
                                     hasher.hash_one(&bipartitions[id as usize])
                                 });

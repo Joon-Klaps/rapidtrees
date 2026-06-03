@@ -45,3 +45,7 @@ tempfile = "3"
 [[bench]]
 name = "memory_time_benchmark"
 harness = false
+
+[[bench]]
+name = "memory_quick"
+harness = false
