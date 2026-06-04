@@ -40,10 +40,10 @@ jobs:
                   bins: cargo-codspeed
 
             - name: Build benchmarks
-              run: cargo codspeed build codspeed -m ${{ matrix.mode }}
+              run: cargo codspeed build --bench codspeed -m ${{ matrix.mode }}
 
             - name: Run benchmarks
               uses: CodSpeedHQ/action@v4
               with:
-                  run: cargo codspeed run codspeed -m ${{ matrix.mode }}
+                  run: cargo codspeed run --bench codspeed -m ${{ matrix.mode }}
                   mode: ${{ matrix.mode }}
