@@ -39,6 +39,8 @@ platforms = ["linux-64", "osx-arm64"]
 
 [tool.pixi.dependencies]
 python = ">=3.10,<3.13"
+r-phangorn = "*"
+r-ape = "*"
 maturin = ">=1.0,<2.0"
 pip = "*"
 pytest = "*"
@@ -48,13 +50,6 @@ prek = "*"
 
 [tool.pixi.pypi-dependencies]
 rapidtrees = { path = ".", editable = true }
-
-# R packages are only needed for the phangorn cross-validation tests.
-# They add ~200 MB (r-base + gfortran + libllvm) and are skipped in envs
-# that don't have this feature.
-[tool.pixi.feature.r-test.dependencies]
-r-phangorn = "*"
-r-ape = "*"
 
 [tool.pixi.feature.py310.dependencies]
 python = "3.10.*"
@@ -66,8 +61,7 @@ python = "3.11.*"
 python = "3.12.*"
 
 [tool.pixi.environments]
-default = { features = ["r-test"] }   # local dev keeps R for the full suite
-py310 = ["py310"]                      # CI: no R — those tests self-skip
+py310 = ["py310"]
 py311 = ["py311"]
 py312 = ["py312"]
 
