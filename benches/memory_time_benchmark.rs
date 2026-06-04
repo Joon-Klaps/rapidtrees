@@ -332,7 +332,7 @@ fn main() {
         .into_iter()
         .filter(|&n| n <= args.max_taxa)
         .collect::<Vec<_>>();
-    let tree_counts = [100, 1000, 10_000]
+    let tree_counts = [100, 1000, 5000]
         .into_iter()
         .filter(|&t| t <= args.max_trees)
         .collect::<Vec<_>>();
