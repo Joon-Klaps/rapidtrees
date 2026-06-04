@@ -15,6 +15,7 @@ struct BenchArgs {
     metric: Metric,
     max_taxa: usize,
     max_trees: usize,
+    iters: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -50,11 +51,19 @@ impl BenchArgs {
             .and_then(|s| s.parse().ok())
             .unwrap_or(10_000);
 
+        // Number of timed repetitions per cell. The median is reported and a
+        // relative spread (stddev/mean) is shown so noisy cells are visible.
+        let iters = get("--iters")
+            .and_then(|s| s.parse().ok())
+            .filter(|&i| i > 0)
+            .unwrap_or(5);
+
         BenchArgs {
             use_gpu,
             metric,
             max_taxa,
             max_trees,
+            iters,
         }
     }
 }
@@ -205,6 +214,79 @@ fn run_metric(snaps: &Snapshots, metric: Metric, use_gpu: bool) {
     }
 }
 
+/// Median of a set of samples. Sorts `samples` in place.
+fn median(samples: &mut [Duration]) -> Duration {
+    samples.sort_unstable();
+    let mid = samples.len() / 2;
+    if samples.len() % 2 == 1 {
+        samples[mid]
+    } else {
+        (samples[mid - 1] + samples[mid]) / 2
+    }
+}
+
+/// Relative spread (coefficient of variation: stddev / mean) as a percentage.
+/// A high value flags an unreliable cell (contention, thermal throttling, …).
+fn rel_spread_pct(samples: &[Duration]) -> f64 {
+    let n = samples.len() as f64;
+    if n < 2.0 {
+        return 0.0;
+    }
+    let mean = samples.iter().map(Duration::as_secs_f64).sum::<f64>() / n;
+    if mean <= 0.0 {
+        return 0.0;
+    }
+    let var = samples
+        .iter()
+        .map(|d| {
+            let x = d.as_secs_f64() - mean;
+            x * x
+        })
+        .sum::<f64>()
+        / n;
+    var.sqrt() / mean * 100.0
+}
+
+/// Run `body`, sampling whole-process RSS in a background thread, and return
+/// `(body_result, peak_rss_delta_over_baseline)`.
+///
+/// More reliable than a before/after RSS delta: the OS may reclaim or lazily
+/// account pages, so a single after-reading can understate the true high-water
+/// mark. We poll every millisecond and also take a final reading once `body`
+/// returns so even sub-millisecond operations record their steady-state delta.
+fn with_peak_rss<R>(body: impl FnOnce() -> R) -> (R, usize) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let baseline = memory_stats().map(|m| m.physical_mem).unwrap_or(0);
+    let stop = Arc::new(AtomicBool::new(false));
+    let peak = Arc::new(AtomicUsize::new(baseline));
+
+    let sampler = {
+        let stop = Arc::clone(&stop);
+        let peak = Arc::clone(&peak);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                if let Some(m) = memory_stats() {
+                    peak.fetch_max(m.physical_mem, Ordering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        })
+    };
+
+    let result = body();
+
+    if let Some(m) = memory_stats() {
+        peak.fetch_max(m.physical_mem, Ordering::Relaxed);
+    }
+    stop.store(true, Ordering::Relaxed);
+    let _ = sampler.join();
+
+    let peak_delta = peak.load(Ordering::Relaxed).saturating_sub(baseline);
+    (result, peak_delta)
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -219,10 +301,17 @@ fn main() {
     };
     let mode_name = if args.use_gpu { "GPU" } else { "CPU" };
 
-    println!("Mode: {mode_name} | Metric: {metric_name}");
+    println!(
+        "Mode: {mode_name} | Metric: {metric_name} | Iters: {}",
+        args.iters
+    );
     println!(
         "Max taxa: {} | Max trees: {}",
         args.max_taxa, args.max_trees
+    );
+    println!(
+        "Wall/CPU columns report the median over {} runs (±relative spread).",
+        args.iters
     );
     if args.use_gpu {
         println!("Note: GPU falls back to CPU if no adapter found or n < 64.");
@@ -230,9 +319,9 @@ fn main() {
     println!();
 
     let header = if args.use_gpu {
-        "| Taxa (N) | Trees (T) | Combinations | Est. RAM | VRAM est / Host RSS       | Wall Time | CPU Time |"
+        "| Taxa (N) | Trees (T) | Combinations | Est. RAM | VRAM est / Host peak      | Wall Time | CPU Time |"
     } else {
-        "| Taxa (N) | Trees (T) | Combinations | Est. RAM | Actual RAM                | Wall Time | CPU Time |"
+        "| Taxa (N) | Trees (T) | Combinations | Est. RAM | Peak RAM (Δ)              | Wall Time | CPU Time |"
     };
     let sep = "|----------|-----------|--------------|----------|---------------------------|-----------|----------|";
 
@@ -297,20 +386,18 @@ fn main() {
                 continue;
             }
 
-            // --- build full snapshot and measure RSS delta ---
+            // --- build full snapshot, sampling peak RSS during the build ---
             let full_newicks: Vec<String> = (0..t).map(|_| newick.clone()).collect();
 
-            let rss_before = memory_stats().map(|m| m.physical_mem).unwrap_or(0);
-            let Some(full_snaps) = from_newicks_or_skip(&full_newicks, false, "full-parse") else {
+            let (full_snaps_opt, actual_ram) =
+                with_peak_rss(|| from_newicks_or_skip(&full_newicks, false, "full-parse"));
+            let Some(full_snaps) = full_snaps_opt else {
                 println!(
                     "| {:<8} | {:<9} | {:<12} | {:<8} | {:<25} | {:<9} | {:<8} |",
                     n, t, combs_str, est_ram_str, "Parse error", "-", "-"
                 );
                 continue;
             };
-            let rss_after = memory_stats().map(|m| m.physical_mem).unwrap_or(0);
-            // RSS can temporarily dip due to GC/reclaim; saturating_sub gives 0 instead of panic.
-            let actual_ram = rss_after.saturating_sub(rss_before);
 
             if !args.use_gpu && actual_ram > RAM_LIMIT {
                 println!(
@@ -334,27 +421,35 @@ fn main() {
             let bench_snaps =
                 from_newicks_or_skip(&bench_newicks, false, "bench").expect("bench parse failed");
 
-            // Warmup (important for GPU: first call initialises the wgpu device)
-            if args.use_gpu {
-                run_metric(&bench_snaps, args.metric, true);
-            }
-
-            let rss_dispatch_before = memory_stats().map(|m| m.physical_mem).unwrap_or(0);
-            let start_wall = Instant::now();
-            let start_cpu = ProcessTime::now();
+            // Warmup: discarded. The first call initialises the wgpu device on
+            // GPU, and warms caches / branch predictors on CPU.
             run_metric(&bench_snaps, args.metric, args.use_gpu);
-            let wall_duration = start_wall.elapsed();
-            let cpu_duration = start_cpu.elapsed();
-            let rss_dispatch_after = memory_stats().map(|m| m.physical_mem).unwrap_or(0);
-            let dispatch_host_rss = rss_dispatch_after.saturating_sub(rss_dispatch_before);
+
+            // Time `iters` repetitions, sampling peak host RSS across all of them.
+            let mut wall_samples: Vec<Duration> = Vec::with_capacity(args.iters);
+            let mut cpu_samples: Vec<Duration> = Vec::with_capacity(args.iters);
+            let (_, dispatch_host_rss) = with_peak_rss(|| {
+                for _ in 0..args.iters {
+                    let start_wall = Instant::now();
+                    let start_cpu = ProcessTime::now();
+                    run_metric(&bench_snaps, args.metric, args.use_gpu);
+                    wall_samples.push(start_wall.elapsed());
+                    cpu_samples.push(start_cpu.elapsed());
+                }
+            });
+
+            let wall_duration = median(&mut wall_samples);
+            let cpu_duration = median(&mut cpu_samples);
+            let wall_spread = rel_spread_pct(&wall_samples);
+            let cpu_spread = rel_spread_pct(&cpu_samples);
 
             let run_comparisons = (bench_size as f64) * (bench_size as f64);
             let ratio = (total_comparisons as f64) / run_comparisons;
 
-            // Second column: VRAM estimate + host RSS delta (GPU) or actual RAM (CPU)
+            // Second column: VRAM estimate + host peak RSS (GPU) or peak RAM (CPU)
             let col2 = if args.use_gpu {
                 let vram = estimate_vram(&full_snaps, args.metric);
-                // Host RSS reflects actual staging-buffer cost for the capped bench subset.
+                // Host peak reflects actual staging-buffer cost for the capped bench subset.
                 format!("{} / {}", format_size(vram), format_size(dispatch_host_rss))
             } else {
                 let ram_bar = mem_bar(actual_ram, BAR_WIDTH, RAM_LIMIT);
@@ -364,17 +459,21 @@ fn main() {
             let est_wall = wall_duration.mul_f64(ratio);
             let wall_bar = time_bar(est_wall, BAR_WIDTH, TIME_LIMIT);
             let est_cpu = cpu_duration.mul_f64(ratio);
+            let est_tag = if ratio > 1.01 { " (est)" } else { "" };
 
-            let wall_str = if ratio > 1.01 {
-                format!("{} {} (est)", wall_bar, format_duration(est_wall))
-            } else {
-                format!("{} {}", wall_bar, format_duration(est_wall))
-            };
-            let cpu_str = if ratio > 1.01 {
-                format!("{} (est)", format_duration(est_cpu))
-            } else {
-                format_duration(est_cpu)
-            };
+            let wall_str = format!(
+                "{} {} ±{:.0}%{}",
+                wall_bar,
+                format_duration(est_wall),
+                wall_spread,
+                est_tag
+            );
+            let cpu_str = format!(
+                "{} ±{:.0}%{}",
+                format_duration(est_cpu),
+                cpu_spread,
+                est_tag
+            );
 
             println!(
                 "| {:<8} | {:<9} | {:<12} | {:<8} | {:<25} | {:<9} | {:<8} |",
