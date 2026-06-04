@@ -8,7 +8,7 @@ This project uses release names based on random words from [codenamegenerator.co
     - PREFIX: Microsoft Corperation
     - DICTIONARY: Snakes
 
-## [Unreleased]
+## [0.7.0] - Unreleased
 - **Speed (RF/WRF/KF):** All three pairwise metrics now run on a dense, contiguous-row backend instead of the per-pair sorted-merge, sharing one parallel upper-triangle driver.
   - **RF** is reformulated as `RF(i,j) = aᵢ + aⱼ − 2·G[i][j]`, where the shared-split count `G` is `popcount(Pᵢ & Pⱼ)` over packed `u64` bit-rows. Splits present in every tree (the "universal" columns, which always include the pendant edges) cancel exactly in RF and are dropped before packing, shrinking the rows. Results are byte-identical to the old merge. On posterior-like samples (many near-identical trees) this is ~15× faster.
   - **KF** uses the same shape with branch lengths: `KF(i,j) = sqrt(‖wᵢ‖² + ‖wⱼ‖² − 2·⟨wᵢ,wⱼ⟩)`, where the shared term is the dot product of two length rows — the weighted echo of RF's shared-split popcount. A near-zero clamp guards the square root; results match the old merge within floating-point tolerance (verified to <1e-12 on real 162-taxon trees).
