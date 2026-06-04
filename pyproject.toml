@@ -40,8 +40,6 @@ platforms = ["linux-64", "osx-arm64"]
 [tool.pixi.dependencies]
 python = ">=3.10,<3.13"
 maturin = ">=1.0,<2.0"
-r-phangorn = "*"
-r-ape = "*"
 pytest = "*"
 numpy = ">=2.2"
 pytest-cov = "*"
@@ -49,6 +47,13 @@ prek = "*"
 
 [tool.pixi.pypi-dependencies]
 rapidtrees = { path = ".", editable = true }
+
+# R packages are only needed for the phangorn cross-validation tests.
+# They add ~200 MB (r-base + gfortran + libllvm) and are skipped in envs
+# that don't have this feature.
+[tool.pixi.feature.r-test.dependencies]
+r-phangorn = "*"
+r-ape = "*"
 
 [tool.pixi.feature.py310.dependencies]
 python = "3.10.*"
@@ -60,7 +65,8 @@ python = "3.11.*"
 python = "3.12.*"
 
 [tool.pixi.environments]
-py310 = ["py310"]
+default = { features = ["r-test"] }   # local dev keeps R for the full suite
+py310 = ["py310"]                      # CI: no R — those tests self-skip
 py311 = ["py311"]
 py312 = ["py312"]
 
@@ -72,7 +78,7 @@ test-python            = { cmd = "pytest tests/test_python_api.py -v", descripti
 test-python-cov        = { cmd = "pytest tests/test_python_api.py -v --cov=rapidtrees --cov-report=xml:python-coverage.xml", description = "Run Python tests with coverage" }
 bench                  = { cmd = "cargo bench --bench codspeed", description = "Run codspeed benchmarks" }
 big-bench              = { cmd = "cargo bench --bench memory_time_benchmark", description = "Run codspeed benchmarks" }
-develop                = { cmd = "maturin develop --uv", description = "Build and install in editable mode" }
+develop                = { cmd = "maturin develop", description = "Build and install in editable mode" }
 fmt                    = { cmd = "cargo fmt --check", description = "Check Rust formatting" }
 clippy                 = { cmd = "cargo clippy --all-targets --all-features -- -D warnings", description = "Run Clippy linter" }
 pre-commit             = { cmd = "prek run --config .pre-commit-config.yaml --all-files" }

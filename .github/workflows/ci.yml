@@ -102,3 +102,37 @@ jobs:
 
             - name: Run Python API tests
               run: .pixi/envs/${{ matrix.environment }}/bin/python -m pytest tests/test_python_api.py -v
+
+    r-cross-validate:
+        name: R/phangorn cross-validation (ubuntu, py312)
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  lfs: true
+
+            - name: Setup Rust
+              uses: dtolnay/rust-toolchain@stable
+
+            - name: Cache cargo build
+              uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cargo/registry
+                      ~/.cargo/git
+                      target
+                  key: ubuntu-r-cross-validate-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+            - name: Setup pixi (default env — includes R)
+              uses: prefix-dev/setup-pixi@v0
+              with:
+                  pixi-version: v0.67.2
+                  locked: true
+                  cache: true
+
+            - name: Build extension
+              run: pixi run develop
+
+            - name: Run R cross-validation tests
+              run: .pixi/envs/default/bin/python -m pytest tests/test_python_api.py::TestRPhangornCrossValidation -v

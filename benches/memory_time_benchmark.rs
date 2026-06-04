@@ -1,61 +1,63 @@
 use cpu_time::ProcessTime;
+use memory_stats::memory_stats;
+use rapidtrees::distances::{dispatch_kf, dispatch_rf, dispatch_wrf};
 use rapidtrees::{Bitset, Snapshots};
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::mem;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
-// Tracking allocator
+// CLI argument parsing (no clap — must work without the `cli` feature)
 // ---------------------------------------------------------------------------
 
-static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+#[derive(Debug)]
+struct BenchArgs {
+    use_gpu: bool,
+    metric: Metric,
+    max_taxa: usize,
+    max_trees: usize,
+}
 
-struct TrackingAllocator;
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Metric {
+    Rf,
+    Wrf,
+    Kf,
+}
 
-unsafe impl GlobalAlloc for TrackingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        unsafe {
-            let ptr = System.alloc(layout);
-            if !ptr.is_null() {
-                ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed);
-            }
-            ptr
-        }
-    }
+impl BenchArgs {
+    fn parse() -> Self {
+        let argv: Vec<String> = std::env::args().collect();
+        let get = |flag: &str| {
+            argv.iter()
+                .position(|a| a == flag)
+                .and_then(|i| argv.get(i + 1))
+                .cloned()
+        };
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe {
-            System.dealloc(ptr, layout);
-            ALLOCATED.fetch_sub(layout.size(), Ordering::Relaxed);
-        }
-    }
+        let use_gpu = argv.contains(&"--gpu".to_string());
 
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        unsafe {
-            let ptr = System.alloc_zeroed(layout);
-            if !ptr.is_null() {
-                ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed);
-            }
-            ptr
-        }
-    }
+        let metric = match get("--metric").as_deref() {
+            Some("wrf") | Some("weighted") => Metric::Wrf,
+            Some("kf") => Metric::Kf,
+            _ => Metric::Rf,
+        };
 
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        unsafe {
-            let new_ptr = System.realloc(ptr, layout, new_size);
-            if !new_ptr.is_null() {
-                // Subtract old size, add new size
-                ALLOCATED.fetch_sub(layout.size(), Ordering::Relaxed);
-                ALLOCATED.fetch_add(new_size, Ordering::Relaxed);
-            }
-            new_ptr
+        let max_taxa = get("--max-taxa")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20_000);
+
+        let max_trees = get("--max-trees")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10_000);
+
+        BenchArgs {
+            use_gpu,
+            metric,
+            max_taxa,
+            max_trees,
         }
     }
 }
-
-#[global_allocator]
-static GLOBAL: TrackingAllocator = TrackingAllocator;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -71,7 +73,15 @@ fn generate_balanced_newick(start_index: usize, num_leaves: usize) -> String {
     let left = generate_balanced_newick(start_index, left_count);
     let right = generate_balanced_newick(start_index + left_count, right_count);
 
-    format!("({}:0.1,{}:0.1)", left, right)
+    // Use varied branch lengths so WRF/KF benchmarks are representative.
+    let idx = start_index % 97;
+    format!(
+        "({}:{:.4},{}:{:.4})",
+        left,
+        0.1 + idx as f64 * 0.05,
+        right,
+        0.1 + idx as f64 * 0.03
+    )
 }
 
 fn format_duration(d: Duration) -> String {
@@ -115,30 +125,17 @@ fn format_count(count: u64) -> String {
     }
 }
 
-/// Estimate heap memory used by a `Snapshots` collection.
-///
-/// Since the internal `Vec<InternSnap>` is not public, the per-tree split storage
-/// is approximated: for each tree we assume `n_bip` split IDs (u32) and `n_bip`
-/// branch lengths (f64). This is exact when all trees share the same topology
-/// (as in this benchmark).
-fn estimate_size(snaps: &Snapshots) -> usize {
+/// Estimate host RAM used by a `Snapshots` collection.
+fn estimate_ram(snaps: &Snapshots) -> usize {
     let n_bip = snaps.bipartitions.len();
     let n_trees = snaps.len();
     let words = snaps.words_per_bitset;
 
-    // Struct overhead (Vec headers, usize fields)
     let struct_size = mem::size_of::<Snapshots>();
-
-    // bipartitions: Vec<Bitset>, each Bitset has a Vec<u64> on the heap
     let bip_vec_size =
         snaps.bipartitions.capacity() * (mem::size_of::<Bitset>() + words * mem::size_of::<u64>());
-
-    // snapshots (Vec<InternSnap>): per tree = split_ids Vec<u32> + lengths Vec<f64>
-    // Vec header (24 bytes) + actual data for each
     let snap_size =
         n_trees * (24 + n_bip * mem::size_of::<u32>() + 24 + n_bip * mem::size_of::<f64>());
-
-    // leaf_names: Vec<String>
     let names_size = snaps
         .leaf_names
         .iter()
@@ -146,6 +143,41 @@ fn estimate_size(snaps: &Snapshots) -> usize {
         .sum::<usize>();
 
     struct_size + bip_vec_size + snap_size + names_size
+}
+
+/// Estimate GPU VRAM for the pairwise kernel input + output buffers.
+///
+/// RF:      packed u32 rows  (n × ceil(n_bip/32) × 4 B)  + u32 kept (n × 4 B)
+///          + output u32 matrix (n × n × 4 B)
+/// WRF/KF:  f32 length rows  (n × n_bip × 4 B)
+///          + output f32 matrix (n × n × 4 B)
+fn estimate_vram(snaps: &Snapshots, metric: Metric) -> usize {
+    let n = snaps.len();
+    let n_bip = snaps.bipartitions.len();
+    let words = snaps.words_per_bitset; // ceil(n_bip / 64) in u64, but GPU uses u32 words
+    let gpu_words = words * 2; // u64 → two u32 words on GPU
+    let output = n * n * 4;
+    match metric {
+        Metric::Rf => n * gpu_words * 4 + n * 4 + output,
+        Metric::Wrf | Metric::Kf => n * n_bip * 4 + output,
+    }
+}
+
+fn bar_log(value: f64, max: f64, width: usize) -> String {
+    if value <= 0.0 {
+        return "░".repeat(width);
+    }
+    let ratio = (value.ln() / max.ln()).clamp(0.0, 1.0);
+    let filled = (ratio * width as f64).round() as usize;
+    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+}
+
+fn mem_bar(bytes: usize, width: usize, max: usize) -> String {
+    bar_log(bytes as f64, max as f64, width)
+}
+
+fn time_bar(d: Duration, width: usize, max: Duration) -> String {
+    bar_log(d.as_secs_f64(), max.as_secs_f64(), width)
 }
 
 fn from_newicks_or_skip(newicks: &[String], rooted: bool, label: &str) -> Option<Snapshots> {
@@ -159,37 +191,70 @@ fn from_newicks_or_skip(newicks: &[String], rooted: bool, label: &str) -> Option
     }
 }
 
-fn bar_log(value: f64, max: f64, width: usize) -> String {
-    if value <= 0.0 {
-        return "░".repeat(width);
+fn run_metric(snaps: &Snapshots, metric: Metric, use_gpu: bool) {
+    match metric {
+        Metric::Rf => {
+            let _ = dispatch_rf(snaps, None, use_gpu);
+        }
+        Metric::Wrf => {
+            let _ = dispatch_wrf(snaps, None, use_gpu);
+        }
+        Metric::Kf => {
+            let _ = dispatch_kf(snaps, None, use_gpu);
+        }
     }
-
-    let ratio = (value.ln() / max.ln()).clamp(0.0, 1.0);
-    let filled = (ratio * width as f64).round() as usize;
-
-    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
 }
 
-fn mem_bar(bytes: usize, width: usize, max: usize) -> String {
-    bar_log(bytes as f64, max as f64, width)
-}
-
-fn time_bar(d: Duration, width: usize, max: Duration) -> String {
-    bar_log(d.as_secs_f64(), max.as_secs_f64(), width)
-}
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
 fn main() {
-    println!(
-        "| Taxa (N) | Trees (T) | Combinations | Est. Memory | Actual Memory | Wall Time | CPU Time |"
-    );
-    println!(
-        "|----------|-----------|--------------|-------------|---------------|-----------|----------|"
-    );
+    let args = BenchArgs::parse();
 
-    let taxa_counts = [10, 100, 500, 1000, 2000, 5000, 10_000, 20_000];
-    let tree_counts = [100, 1000, 10_000];
-    const MEMORY_LIMIT: usize = 30 * 1024 * 1024 * 1024; // 30 GB
-    const TIME_LIMIT: Duration = Duration::from_secs(60 * 60); // 1 hour
+    let metric_name = match args.metric {
+        Metric::Rf => "RF",
+        Metric::Wrf => "Weighted RF",
+        Metric::Kf => "KF",
+    };
+    let mode_name = if args.use_gpu { "GPU" } else { "CPU" };
+
+    println!("Mode: {mode_name} | Metric: {metric_name}");
+    println!(
+        "Max taxa: {} | Max trees: {}",
+        args.max_taxa, args.max_trees
+    );
+    if args.use_gpu {
+        println!("Note: GPU falls back to CPU if no adapter found or n < 64.");
+    }
+    println!();
+
+    let header = if args.use_gpu {
+        "| Taxa (N) | Trees (T) | Combinations | Est. RAM | VRAM (input+out) | Wall Time | CPU Time |"
+    } else {
+        "| Taxa (N) | Trees (T) | Combinations | Est. RAM | Actual RAM       | Wall Time | CPU Time |"
+    };
+    let sep = if args.use_gpu {
+        "|----------|-----------|--------------|----------|------------------|-----------|----------|"
+    } else {
+        "|----------|-----------|--------------|----------|------------------|-----------|----------|"
+    };
+
+    println!("{header}");
+    println!("{sep}");
+
+    let taxa_counts = [10, 100, 500, 1000, 2000, 5000, 10_000, 20_000]
+        .into_iter()
+        .filter(|&n| n <= args.max_taxa)
+        .collect::<Vec<_>>();
+    let tree_counts = [100, 1000, 10_000]
+        .into_iter()
+        .filter(|&t| t <= args.max_trees)
+        .collect::<Vec<_>>();
+
+    const RAM_LIMIT: usize = 30 * 1024 * 1024 * 1024;
+    const VRAM_LIMIT: usize = 16 * 1024 * 1024 * 1024; // 16 GB (conservative for P100/A100)
+    const TIME_LIMIT: Duration = Duration::from_secs(60 * 60);
     const BAR_WIDTH: usize = 10;
     const MAX_COMPARISONS: u64 = 200_000_000_000;
 
@@ -197,71 +262,103 @@ fn main() {
         let newick = format!("{};", generate_balanced_newick(0, n));
 
         for &t in &tree_counts {
+            let total_comparisons = (t as u64) * (t as u64) / 2;
+            let combs_str = format_count(total_comparisons);
+
             // --- size estimate from a small sample ---
             let subset_size = t.min(100);
             let subset_newicks: Vec<String> = (0..subset_size).map(|_| newick.clone()).collect();
-
-            let Some(interned) = from_newicks_or_skip(&subset_newicks, false, "size-sample") else {
+            let Some(sample) = from_newicks_or_skip(&subset_newicks, false, "size-sample") else {
                 continue;
             };
 
-            let size_per_tree = estimate_size(&interned) / subset_size.max(1);
-            let total_est_size = size_per_tree * t;
-            let total_comparisons = (t as u64) * (t as u64) / 2;
-            let combs_str = format_count(total_comparisons);
-            let est_mem_str = format_size(total_est_size);
+            let size_per_tree = estimate_ram(&sample) / subset_size.max(1);
+            let total_est_ram = size_per_tree * t;
+            let est_ram_str = format_size(total_est_ram);
 
-            if total_est_size > MEMORY_LIMIT {
+            // GPU: check VRAM; CPU: check RAM
+            if args.use_gpu {
+                let est_vram =
+                    estimate_vram(&sample, args.metric) / subset_size.max(1) * t + t * t * 4; // output matrix
+                if est_vram > VRAM_LIMIT {
+                    println!(
+                        "| {:<8} | {:<9} | {:<12} | {:<8} | {:<16} | {:<9} | {:<8} |",
+                        n,
+                        t,
+                        combs_str,
+                        est_ram_str,
+                        format!(">{}", format_size(VRAM_LIMIT)),
+                        "Skipped",
+                        "-"
+                    );
+                    continue;
+                }
+            } else if total_est_ram > RAM_LIMIT {
                 println!(
-                    "| {:<8} | {:<9} | {:<12} | {:<11} | {:<13} | {:<9} | {:<8} |",
-                    n, t, combs_str, est_mem_str, "Skipped (>30GB)", "-", "-"
+                    "| {:<8} | {:<9} | {:<12} | {:<8} | {:<16} | {:<9} | {:<8} |",
+                    n, t, combs_str, est_ram_str, "Skipped (>30 GB)", "-", "-"
                 );
                 continue;
             }
 
-            // --- measure actual allocation with tracking allocator ---
+            // --- build full snapshot and measure RSS delta ---
             let full_newicks: Vec<String> = (0..t).map(|_| newick.clone()).collect();
 
-            let before = ALLOCATED.load(Ordering::Relaxed);
-            let Some(full_interned) = from_newicks_or_skip(&full_newicks, false, "full-parse")
-            else {
+            let rss_before = memory_stats().map(|m| m.physical_mem).unwrap_or(0);
+            let Some(full_snaps) = from_newicks_or_skip(&full_newicks, false, "full-parse") else {
                 println!(
-                    "| {:<8} | {:<9} | {:<12} | {:<11} | {:<13} | {:<9} | {:<8} |",
-                    n, t, combs_str, est_mem_str, "Parse error", "-", "-"
+                    "| {:<8} | {:<9} | {:<12} | {:<8} | {:<16} | {:<9} | {:<8} |",
+                    n, t, combs_str, est_ram_str, "Parse error", "-", "-"
                 );
                 continue;
             };
-            let after = ALLOCATED.load(Ordering::Relaxed);
-            // after >= before guaranteed: we only just allocated, nothing freed yet
-            let actual_mem = after.saturating_sub(before);
-            let actual_mem_bar = mem_bar(actual_mem, BAR_WIDTH, MEMORY_LIMIT);
-            let actual_mem_str = format!("{} {}", actual_mem_bar, format_size(actual_mem));
+            let rss_after = memory_stats().map(|m| m.physical_mem).unwrap_or(0);
+            // RSS can temporarily dip due to GC/reclaim; saturating_sub gives 0 instead of panic.
+            let actual_ram = rss_after.saturating_sub(rss_before);
 
-            if actual_mem > MEMORY_LIMIT {
+            if !args.use_gpu && actual_ram > RAM_LIMIT {
                 println!(
-                    "| {:<8} | {:<9} | {:<12} | {:<11} | {:<13} | {:<9} | {:<8} |",
+                    "| {:<8} | {:<9} | {:<12} | {:<8} | {:<16} | {:<9} | {:<8} |",
                     n,
                     t,
                     combs_str,
-                    est_mem_str,
-                    format!("> {}", format_size(MEMORY_LIMIT)),
+                    est_ram_str,
+                    format!(">{}", format_size(RAM_LIMIT)),
                     "Skipped",
                     "-"
                 );
-                drop(full_interned);
+                drop(full_snaps);
                 continue;
             }
 
-            // --- benchmark pairwise distances on a capped subset ---
+            // Second column: VRAM estimate (GPU) or actual RAM (CPU)
+            let col2 = if args.use_gpu {
+                let vram = estimate_vram(&full_snaps, args.metric);
+                format!(
+                    "{} {}",
+                    mem_bar(vram, BAR_WIDTH, VRAM_LIMIT),
+                    format_size(vram)
+                )
+            } else {
+                let ram_bar = mem_bar(actual_ram, BAR_WIDTH, RAM_LIMIT);
+                format!("{} {}", ram_bar, format_size(actual_ram))
+            };
+
+            // --- benchmark on a capped subset ---
             let max_subset = (MAX_COMPARISONS as f64).sqrt() as usize;
             let bench_size = t.min(max_subset);
             let bench_newicks: Vec<String> = (0..bench_size).map(|_| newick.clone()).collect();
             let bench_snaps =
                 from_newicks_or_skip(&bench_newicks, false, "bench").expect("bench parse failed");
 
+            // Warmup (important for GPU: first call initialises the wgpu device)
+            if args.use_gpu {
+                run_metric(&bench_snaps, args.metric, true);
+            }
+
             let start_wall = Instant::now();
             let start_cpu = ProcessTime::now();
-            let _mat = bench_snaps.pairwise_rf(None);
+            run_metric(&bench_snaps, args.metric, args.use_gpu);
             let wall_duration = start_wall.elapsed();
             let cpu_duration = start_cpu.elapsed();
 
@@ -284,11 +381,11 @@ fn main() {
             };
 
             println!(
-                "| {:<8} | {:<9} | {:<12} | {:<11} | {:<13} | {:<9} | {:<8} |",
-                n, t, combs_str, est_mem_str, actual_mem_str, wall_str, cpu_str
+                "| {:<8} | {:<9} | {:<12} | {:<8} | {:<16} | {:<9} | {:<8} |",
+                n, t, combs_str, est_ram_str, col2, wall_str, cpu_str
             );
 
-            drop(full_interned);
+            drop(full_snaps);
         }
     }
 }
