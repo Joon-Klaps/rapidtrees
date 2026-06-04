@@ -202,7 +202,7 @@ fn row_slice<T>(flat: &[T], i: usize, stride: usize) -> &[T] {
 ///
 /// and get the shared count by AND-ing the two trees' presence bitmasks and
 /// counting the set bits (`popcount`). That's much faster than walking two
-/// sorted lists, and it's the same shape as the GPU kernel we want to add later.
+/// sorted lists.
 ///
 /// One extra simplification: a split that shows up in *every* tree (always the
 /// pendant/leaf edges, plus anything the whole set happens to agree on) adds the
@@ -344,10 +344,9 @@ pub(crate) fn pairwise_wrf_dense(snaps: &Snapshots, progress: Option<&AtomicUsiz
 ///
 /// The first two pieces are each tree's own "self length" (`norm_sq`), which we
 /// work out once up front. The last piece is the dot product of the two length
-/// rows — the weighted echo of RF's shared-split popcount, and exactly what the
-/// planned GPU matrix multiply computes. Tiny rounding error can nudge the
-/// bracket a hair below zero for near-identical trees, so we clamp at zero
-/// before taking the square root.
+/// rows — the weighted echo of RF's shared-split popcount. Tiny rounding error
+/// can nudge the bracket a hair below zero for near-identical trees, so we clamp
+/// at zero before taking the square root.
 pub(crate) fn pairwise_kf_dense(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> Vec<f64> {
     let n = snaps.snapshots.len();
     if n == 0 {

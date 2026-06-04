@@ -1,0 +1,49 @@
+name: CodSpeed
+
+on:
+    push:
+        branches: [master, main]
+        paths-ignore:
+          - '**.md'
+    pull_request:
+        branches: [master, main]
+        paths-ignore:
+          - '**.md'
+    workflow_dispatch:
+
+env:
+    CARGO_TERM_COLOR: always
+
+jobs:
+    benchmarks:
+        # One bench binary (benches/codspeed.rs), measured under two instruments:
+        #   - simulation: deterministic instruction counts (CPU-speed gate)
+        #   - memory:     heap allocations per bench (memory gate)
+        name: Benchmarks (${{ matrix.mode }})
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+            id-token: write
+        strategy:
+            fail-fast: false
+            matrix:
+                mode: [simulation, memory]
+
+        steps:
+            - uses: actions/checkout@v5
+
+            - name: Setup Rust + cargo-codspeed
+              uses: moonrepo/setup-rust@v1
+              with:
+                  channel: stable
+                  cache-target: release
+                  bins: cargo-codspeed
+
+            - name: Build benchmarks
+              run: cargo codspeed build codspeed -m ${{ matrix.mode }}
+
+            - name: Run benchmarks
+              uses: CodSpeedHQ/action@v4
+              with:
+                  run: cargo codspeed run codspeed -m ${{ matrix.mode }}
+                  mode: ${{ matrix.mode }}
