@@ -663,46 +663,26 @@ impl Snapshots {
     }
 
     /// Compute all pairwise Robinson–Foulds distances as a symmetric n×n matrix.
-    pub fn pairwise_rf(&self) -> Vec<usize> {
-        crate::distances::pairwise_symmetric(self, crate::distances::rf_distance_fast)
+    ///
+    /// Pass `Some(counter)` to track progress: after each row `i` finishes, the
+    /// counter is bumped by `n - i - 1`, reaching `n*(n-1)/2` when done. Pass
+    /// `None` to skip the (negligible) counter work entirely.
+    pub fn pairwise_rf(&self, progress: Option<&std::sync::atomic::AtomicUsize>) -> Vec<usize> {
+        crate::distances::pairwise_rf_packed(self, progress)
     }
 
     /// Compute all pairwise Weighted Robinson–Foulds distances as a symmetric n×n matrix.
-    pub fn pairwise_wrf(&self) -> Vec<f64> {
-        crate::distances::pairwise_symmetric(self, crate::distances::wrf_distance_fast)
+    ///
+    /// See [`Self::pairwise_rf`] for the `progress` argument.
+    pub fn pairwise_wrf(&self, progress: Option<&std::sync::atomic::AtomicUsize>) -> Vec<f64> {
+        crate::distances::pairwise_wrf_dense(self, progress)
     }
 
     /// Compute all pairwise Kuhner–Felsenstein distances as a symmetric n×n matrix.
-    pub fn pairwise_kf(&self) -> Vec<f64> {
-        crate::distances::pairwise_symmetric(self, crate::distances::kf_distance_fast)
-    }
-
-    /// Same as [`Self::pairwise_rf`], but increments `progress` by `n - i - 1`
-    /// after each row `i` finishes (so the counter reaches `n*(n-1)/2`).
-    pub fn pairwise_rf_counted(&self, progress: &std::sync::atomic::AtomicUsize) -> Vec<usize> {
-        crate::distances::pairwise_symmetric_counted(
-            self,
-            crate::distances::rf_distance_fast,
-            Some(progress),
-        )
-    }
-
-    /// Same as [`Self::pairwise_wrf`] but reports progress via `progress`.
-    pub fn pairwise_wrf_counted(&self, progress: &std::sync::atomic::AtomicUsize) -> Vec<f64> {
-        crate::distances::pairwise_symmetric_counted(
-            self,
-            crate::distances::wrf_distance_fast,
-            Some(progress),
-        )
-    }
-
-    /// Same as [`Self::pairwise_kf`] but reports progress via `progress`.
-    pub fn pairwise_kf_counted(&self, progress: &std::sync::atomic::AtomicUsize) -> Vec<f64> {
-        crate::distances::pairwise_symmetric_counted(
-            self,
-            crate::distances::kf_distance_fast,
-            Some(progress),
-        )
+    ///
+    /// See [`Self::pairwise_rf`] for the `progress` argument.
+    pub fn pairwise_kf(&self, progress: Option<&std::sync::atomic::AtomicUsize>) -> Vec<f64> {
+        crate::distances::pairwise_kf_dense(self, progress)
     }
 
     /// Build the interning table from a `Vec<Snapshot>` (internal helper).
@@ -1308,7 +1288,7 @@ mod tests {
 
         // L1 identity: sum(|bl[0] - bl[1]|) == wrf(T0, T1)
         let l1: f64 = row0.iter().zip(row1).map(|(a, b)| (a - b).abs()).sum();
-        let wrf_matrix = snaps.pairwise_wrf();
+        let wrf_matrix = snaps.pairwise_wrf(None);
         // wrf_matrix is flat row-major (2×2); wrf[0,1] is at index 1
         let wrf_01 = wrf_matrix[1];
         assert!(
@@ -1426,7 +1406,7 @@ mod tests {
         }
 
         // L1 identity must hold for every pair.
-        let wrf = snaps.pairwise_wrf();
+        let wrf = snaps.pairwise_wrf(None);
         for i in 0..3 {
             for j in 0..3 {
                 let l1: f64 = (0..n_bip)
@@ -1479,7 +1459,7 @@ mod tests {
             assert_eq!(snap.lengths.len(), snap.split_ids.len());
         }
 
-        assert_eq!(with_len.pairwise_rf(), no_len.pairwise_rf());
+        assert_eq!(with_len.pairwise_rf(None), no_len.pairwise_rf(None));
     }
 
     /// `intern` assigns strictly-ascending, deduplicated split IDs, and identical

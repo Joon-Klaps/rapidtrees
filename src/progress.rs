@@ -162,12 +162,11 @@ mod tests {
     //! its end-to-end behaviour is exercised by the Python test suite
     //! (`tests/test_python_api.py::TestProgressCallback`). These tests cover
     //! the GIL-free pieces — the fraction calculation and the row-level
-    //! counter increments used by `pairwise_symmetric_counted` — which are
+    //! counter increments the dense `pairwise_*` paths perform — which are
     //! the only places the progress code can silently go wrong without
     //! Python ever noticing.
 
     use super::frac_done;
-    use crate::distances::pairwise_symmetric_counted;
     use crate::snapshot::Snapshots;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -223,44 +222,41 @@ mod tests {
         // Six trees → 15 upper-triangle pairs. The counter must equal that
         // exact value once the parallel loop returns, otherwise a progress
         // callback would never see frac == 1.0 before the final manual fire.
+        // Exercised on the KF path, whose dense sweep shares the same
+        // row-level counter increment as RF and WRF.
         let snaps = small_snapshot_set();
         let n = 6;
         let expected = n * (n - 1) / 2;
         let counter = AtomicUsize::new(0);
-        let _ =
-            pairwise_symmetric_counted(&snaps, crate::distances::rf_distance_fast, Some(&counter));
+        let _ = snaps.pairwise_kf(Some(&counter));
         assert_eq!(counter.load(Ordering::Relaxed), expected);
     }
 
     #[test]
     fn counter_none_matches_default_path() {
-        // Regression guard: passing `None` for the counter must produce the
-        // same matrix as the original (uncounted) `pairwise_symmetric`. If
-        // someone "optimises" the counted variant by skipping a row when the
-        // counter is absent, this catches it.
+        // Regression guard: passing a counter must not change the matrix the
+        // uncounted path produces. If someone "optimises" the counted variant
+        // by skipping a row when the counter is absent, this catches it.
         let snaps = small_snapshot_set();
-        let with_none: Vec<usize> =
-            pairwise_symmetric_counted(&snaps, crate::distances::rf_distance_fast, None);
-        let with_counter: Vec<usize> = {
-            let counter = AtomicUsize::new(0);
-            pairwise_symmetric_counted(&snaps, crate::distances::rf_distance_fast, Some(&counter))
-        };
-        assert_eq!(with_none, with_counter);
+        let counter = AtomicUsize::new(0);
+        let with_counter = snaps.pairwise_kf(Some(&counter));
+        let without = snaps.pairwise_kf(None);
+        assert_eq!(with_counter, without);
     }
 
     #[test]
     fn pairwise_rf_counted_matches_uncounted_and_increments() {
-        // Exercises `Snapshots::pairwise_rf_counted` end-to-end: the matrix
-        // must be identical to the uncounted `pairwise_rf`, and the counter
-        // must land on exactly n*(n-1)/2.
+        // Exercises `pairwise_rf(Some(counter))` end-to-end: the matrix must be
+        // identical to the uncounted `pairwise_rf(None)`, and the counter must
+        // land on exactly n*(n-1)/2.
         let snaps = small_snapshot_set();
         let n = 6;
         let counter = AtomicUsize::new(0);
-        let counted = snaps.pairwise_rf_counted(&counter);
-        let uncounted = snaps.pairwise_rf();
+        let counted = snaps.pairwise_rf(Some(&counter));
+        let uncounted = snaps.pairwise_rf(None);
         assert_eq!(
             counted, uncounted,
-            "pairwise_rf_counted must produce the same matrix as pairwise_rf"
+            "pairwise_rf(Some(..)) must match pairwise_rf(None)"
         );
         assert_eq!(counter.load(Ordering::Relaxed), n * (n - 1) / 2);
     }
@@ -268,12 +264,12 @@ mod tests {
     #[test]
     fn pairwise_wrf_counted_matches_uncounted_and_increments() {
         // Same contract for WRF — confirms the f64 metric path also hits the
-        // `counter.fetch_add` line in `pairwise_symmetric_counted`.
+        // `counter.fetch_add` line in the dense `fill_symmetric` sweep.
         let snaps = small_snapshot_set();
         let n = 6;
         let counter = AtomicUsize::new(0);
-        let counted = snaps.pairwise_wrf_counted(&counter);
-        let uncounted = snaps.pairwise_wrf();
+        let counted = snaps.pairwise_wrf(Some(&counter));
+        let uncounted = snaps.pairwise_wrf(None);
         assert_eq!(counted, uncounted);
         assert_eq!(counter.load(Ordering::Relaxed), n * (n - 1) / 2);
     }
@@ -284,8 +280,8 @@ mod tests {
         let snaps = small_snapshot_set();
         let n = 6;
         let counter = AtomicUsize::new(0);
-        let counted = snaps.pairwise_kf_counted(&counter);
-        let uncounted = snaps.pairwise_kf();
+        let counted = snaps.pairwise_kf(Some(&counter));
+        let uncounted = snaps.pairwise_kf(None);
         assert_eq!(counted, uncounted);
         assert_eq!(counter.load(Ordering::Relaxed), n * (n - 1) / 2);
     }

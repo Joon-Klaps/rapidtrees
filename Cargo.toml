@@ -41,11 +41,12 @@ criterion = "0.8.2"
 cpu-time = "1.0.0"
 memory-stats = "1.0.0"
 tempfile = "3"
+divan = { package = "codspeed-divan-compat", version = "4" }
 
 [[bench]]
 name = "memory_time_benchmark"
 harness = false
 
 [[bench]]
-name = "memory_quick"
+name = "codspeed"
 harness = false

@@ -129,13 +129,13 @@ fn pairwise_rf_from_newick_iter(
     let mut snaps =
         collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted, false)?;
 
-    // This path never exports snapshots, and `rf_distance_fast` reads only
-    // `split_ids` — release the bipartition bitsets before the O(n²) loop.
+    // This path never exports snapshots, and the dense RF computation reads
+    // only `split_ids` — release the bipartition bitsets before the O(n²) loop.
     snaps.bipartitions = Vec::new();
 
     let n = snaps.snapshots.len();
     let rf_matrix = with_counter(py, progress, n_pairs(n), |counter| {
-        snaps.pairwise_rf_counted(counter)
+        snaps.pairwise_rf(Some(counter))
     })?;
     let rf_bytes: Vec<u8> = rf_matrix
         .chunks(n)
@@ -223,7 +223,7 @@ fn pairwise_rf_with_snapshots_from_newick_iter(
 
     let n = snaps.snapshots.len();
     let rf_matrix = with_counter(py, progress, n_pairs(n), |counter| {
-        snaps.pairwise_rf_counted(counter)
+        snaps.pairwise_rf(Some(counter))
     })?;
     let rf_bytes: Vec<u8> = rf_matrix
         .chunks(n)
@@ -303,7 +303,7 @@ fn pairwise_wrf_with_snapshots_from_newick_iter(
 
     let n = snaps.snapshots.len();
     let wrf_matrix = with_counter(py, progress, n_pairs(n), |counter| {
-        snaps.pairwise_wrf_counted(counter)
+        snaps.pairwise_wrf(Some(counter))
     })?;
     let wrf_bytes: Vec<u8> = wrf_matrix.iter().flat_map(|&v| v.to_ne_bytes()).collect();
 
@@ -367,7 +367,7 @@ fn pairwise_kf_with_snapshots_from_newick_iter(
 
     let n = snaps.snapshots.len();
     let kf_matrix = with_counter(py, progress, n_pairs(n), |counter| {
-        snaps.pairwise_kf_counted(counter)
+        snaps.pairwise_kf(Some(counter))
     })?;
     let kf_bytes: Vec<u8> = kf_matrix.iter().flat_map(|&v| v.to_ne_bytes()).collect();
 
@@ -420,12 +420,16 @@ fn pairwise_wrf_from_newick_iter(
 ) -> PyResult<(Vec<String>, Vec<f64>)> {
     validate_iter_args(&names, &map_indices, &translate_maps)?;
 
-    let snaps =
+    let mut snaps =
         collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted, true)?;
+
+    // This path never exports snapshots, and the dense WRF computation reads
+    // only `split_ids` + `lengths` — release the bipartition bitsets first.
+    snaps.bipartitions = Vec::new();
 
     let n = snaps.snapshots.len();
     let matrix = with_counter(py, progress, n_pairs(n), |counter| {
-        snaps.pairwise_wrf_counted(counter)
+        snaps.pairwise_wrf(Some(counter))
     })?;
     Ok((names, matrix))
 }
@@ -461,12 +465,16 @@ fn pairwise_kf_from_newick_iter(
 ) -> PyResult<(Vec<String>, Vec<f64>)> {
     validate_iter_args(&names, &map_indices, &translate_maps)?;
 
-    let snaps =
+    let mut snaps =
         collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted, true)?;
+
+    // This path never exports snapshots, and the dense KF computation reads
+    // only `split_ids` + `lengths` — release the bipartition bitsets first.
+    snaps.bipartitions = Vec::new();
 
     let n = snaps.snapshots.len();
     let matrix = with_counter(py, progress, n_pairs(n), |counter| {
-        snaps.pairwise_kf_counted(counter)
+        snaps.pairwise_kf(Some(counter))
     })?;
     Ok((names, matrix))
 }

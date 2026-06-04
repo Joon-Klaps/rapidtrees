@@ -142,16 +142,16 @@ fn main() {
     let mat: Vec<f64> = match args.metric {
         MetricArg::Rf => run_with_progress(n_pairs, show_progress, |counter| {
             interned
-                .pairwise_rf_counted(counter)
+                .pairwise_rf(Some(counter))
                 .into_iter()
                 .map(|dist| dist as f64)
                 .collect()
         }),
         MetricArg::Weighted => run_with_progress(n_pairs, show_progress, |counter| {
-            interned.pairwise_wrf_counted(counter)
+            interned.pairwise_wrf(Some(counter))
         }),
         MetricArg::Kf => run_with_progress(n_pairs, show_progress, |counter| {
-            interned.pairwise_kf_counted(counter)
+            interned.pairwise_kf(Some(counter))
         }),
     };
     log_if(
