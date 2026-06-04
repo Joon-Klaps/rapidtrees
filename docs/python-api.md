@@ -99,14 +99,6 @@ tree_names, rf_bytes = rtd.pairwise_rf_from_newick_iter(
 )
 ```
 
-**Environment variables:**
-
-| Variable | Effect |
-| --- | --- |
-| `RAPIDTREES_GPU=0` | Force CPU path even when `use_gpu=True` |
-| `RAPIDTREES_GPU=1` | Print a warning to stderr if no GPU adapter is found (instead of silently falling back) |
-| `RAPIDTREES_GPU_ALLOW_SOFTWARE=1` | Allow CPU-emulated Vulkan adapters (e.g. Mesa lavapipe); useful for testing |
-
 **Notes:**
 - `use_gpu=False` (the default) is identical to all pre-0.8.0 behaviour.
 - GPU requires the `gpu` Cargo feature, which is included in the published wheel.

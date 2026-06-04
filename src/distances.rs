@@ -191,6 +191,38 @@ fn row_slice<T>(flat: &[T], i: usize, stride: usize) -> &[T] {
 
 // ─── pub(crate): dense bit-packed popcount RF (the hot path) ────────────────
 
+/// Work out the packed bit slot for every split, shared by the CPU (u64) and GPU
+/// (u32) RF packers so both agree on which splits are dropped and where each lands.
+///
+/// We count how many trees each split appears in; a split present in all `n` trees
+/// is an "everywhere" split that cancels out of RF, so it gets no slot. Every kept
+/// split is handed a fresh, packed-together bit slot. Returns `(bit_slot, kept,
+/// everywhere)` where `bit_slot[id]` is the slot index (or `u32::MAX` if dropped),
+/// `kept` is the number of slots, and `everywhere` is the number dropped.
+pub(crate) fn split_bit_layout(snaps: &Snapshots) -> (Vec<u32>, usize, usize) {
+    let n = snaps.snapshots.len();
+    let n_splits = n_distinct_splits(snaps);
+
+    let mut tree_count = vec![0u32; n_splits];
+    for snap in &snaps.snapshots {
+        for &id in &snap.split_ids {
+            tree_count[id as usize] += 1;
+        }
+    }
+
+    let mut bit_slot = vec![u32::MAX; n_splits];
+    let mut kept = 0u32;
+    for (id, &count) in tree_count.iter().enumerate() {
+        if count < n as u32 {
+            bit_slot[id] = kept;
+            kept += 1;
+        }
+    }
+    let kept = kept as usize;
+    let everywhere = n_splits - kept;
+    (bit_slot, kept, everywhere)
+}
+
 /// Compute every pairwise Robinson–Foulds distance with bit-packed popcounts.
 ///
 /// The trick: the RF distance between two trees is just "how many splits each
@@ -215,28 +247,7 @@ pub(crate) fn pairwise_rf_packed(snaps: &Snapshots, progress: Option<&AtomicUsiz
         return Vec::new();
     }
 
-    let n_splits = n_distinct_splits(snaps);
-
-    // Count how many trees each split appears in. A split in all `n` trees is an
-    // "everywhere" split, which we drop below.
-    let mut tree_count = vec![0u32; n_splits];
-    for snap in &snaps.snapshots {
-        for &id in &snap.split_ids {
-            tree_count[id as usize] += 1;
-        }
-    }
-
-    // Give each kept (non-everywhere) split a fresh, packed-together bit slot.
-    let mut bit_slot = vec![u32::MAX; n_splits];
-    let mut kept = 0u32;
-    for (id, &count) in tree_count.iter().enumerate() {
-        if count < n as u32 {
-            bit_slot[id] = kept;
-            kept += 1;
-        }
-    }
-    let kept = kept as usize;
-    let everywhere = n_splits - kept;
+    let (bit_slot, kept, everywhere) = split_bit_layout(snaps);
     let words = kept.div_ceil(64);
 
     // Build one bitmask row per tree: a set bit means "this tree has that split."
@@ -375,57 +386,36 @@ pub(crate) fn pairwise_kf_dense(snaps: &Snapshots, progress: Option<&AtomicUsize
 // (CLI). When the `gpu` feature is not compiled in, or no adapter is available,
 // or n < GPU_THRESHOLD, they fall through to the CPU path silently.
 
-/// Dispatch RF to GPU when `use_gpu` is true and conditions are met, else CPU.
-///
-/// When the `gpu` feature is not compiled in, or no adapter is found, or
-/// `n < 64`, falls back silently to the CPU path. Results are bit-identical
-/// regardless of which path is taken.
-pub fn dispatch_rf(
-    snaps: &Snapshots,
-    progress: Option<&std::sync::atomic::AtomicUsize>,
-    use_gpu: bool,
-) -> Vec<usize> {
-    #[cfg(feature = "gpu")]
-    if use_gpu && let Some(result) = crate::gpu::try_pairwise_rf(snaps) {
-        return result;
-    }
-    let _ = use_gpu;
-    pairwise_rf_packed(snaps, progress)
+/// Generate a `dispatch_*` entry point that tries the GPU when `use_gpu` is true
+/// and the `gpu` feature is compiled in, falling back to the CPU path otherwise.
+macro_rules! gpu_dispatch {
+    ($(#[$meta:meta])* $name:ident -> $ret:ty, gpu = $gpu:path, cpu = $cpu:path) => {
+        $(#[$meta])*
+        pub fn $name(
+            snaps: &Snapshots,
+            progress: Option<&std::sync::atomic::AtomicUsize>,
+            use_gpu: bool,
+        ) -> $ret {
+            #[cfg(feature = "gpu")]
+            if use_gpu && let Some(result) = $gpu(snaps) {
+                return result;
+            }
+            let _ = use_gpu;
+            $cpu(snaps, progress)
+        }
+    };
 }
 
-/// Dispatch WRF to GPU when `use_gpu` is true and conditions are met, else CPU.
-///
-/// GPU path uses f32 arithmetic (~1e-5 relative error); CPU path uses f64.
-/// Falls back silently when no GPU adapter is available.
-pub fn dispatch_wrf(
-    snaps: &Snapshots,
-    progress: Option<&std::sync::atomic::AtomicUsize>,
-    use_gpu: bool,
-) -> Vec<f64> {
-    #[cfg(feature = "gpu")]
-    if use_gpu && let Some(result) = crate::gpu::try_pairwise_wrf(snaps) {
-        return result;
-    }
-    let _ = use_gpu;
-    pairwise_wrf_dense(snaps, progress)
+gpu_dispatch! {
+    dispatch_rf -> Vec<usize>, gpu = crate::gpu::try_pairwise_rf, cpu = pairwise_rf_packed
 }
 
-/// Dispatch KF to GPU when `use_gpu` is true and conditions are met, else CPU.
-///
-/// GPU path uses direct f32 `Σ(a−b)²` (not the Gram form, which catastrophically
-/// cancels for near-identical trees in f32). Falls back silently when no adapter
-/// is available.
-pub fn dispatch_kf(
-    snaps: &Snapshots,
-    progress: Option<&std::sync::atomic::AtomicUsize>,
-    use_gpu: bool,
-) -> Vec<f64> {
-    #[cfg(feature = "gpu")]
-    if use_gpu && let Some(result) = crate::gpu::try_pairwise_kf(snaps) {
-        return result;
-    }
-    let _ = use_gpu;
-    pairwise_kf_dense(snaps, progress)
+gpu_dispatch! {
+    dispatch_wrf -> Vec<f64>, gpu = crate::gpu::try_pairwise_wrf, cpu = pairwise_wrf_dense
+}
+
+gpu_dispatch! {
+    dispatch_kf -> Vec<f64>, gpu = crate::gpu::try_pairwise_kf, cpu = pairwise_kf_dense
 }
 
 /// Twelve 10-taxon trees from the PHYLIP treedist reference suite.

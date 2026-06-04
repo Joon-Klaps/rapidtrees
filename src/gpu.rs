@@ -6,22 +6,21 @@
 //! CPU path transparently.
 //!
 //! The GPU context ([`GpuContext`]) is created lazily on the first call and reused
-//! for the lifetime of the process.
-//!
-//! # Environment variables
-//! - `RAPIDTREES_GPU=0` — disable GPU even when an adapter is present.
-//! - `RAPIDTREES_GPU=1` — require GPU; log a warning to stderr if none is found.
-//! - `RAPIDTREES_GPU_ALLOW_SOFTWARE=1` — allow software/CPU adapters (lavapipe,
-//!   SwiftShader). Useful for CI testing without real GPU hardware.
+//! for the lifetime of the process. Whether to use it at all is decided by the
+//! caller via the `use_gpu` argument on the public API — there are no environment
+//! overrides.
 
 use std::sync::OnceLock;
 use wgpu::util::DeviceExt;
 
-use crate::distances::{dense_length_rows, n_distinct_splits};
+use crate::distances::{dense_length_rows, split_bit_layout};
 use crate::snapshot::Snapshots;
 
 /// Minimum number of trees to justify the GPU transfer overhead.
 pub(crate) const GPU_THRESHOLD: usize = 64;
+
+/// Upper bound on total GPU buffer allocation (1 GiB); above this we fall back to CPU.
+const MAX_GPU_BYTES: u64 = 1 << 30;
 
 // ── Global lazy device ────────────────────────────────────────────────────────
 
@@ -43,19 +42,6 @@ pub(crate) struct GpuContext {
 
 impl GpuContext {
     fn try_new() -> Option<Self> {
-        match std::env::var("RAPIDTREES_GPU").as_deref() {
-            Ok("0") => return None,
-            Ok("1") => {
-                let ctx = pollster::block_on(Self::init_async());
-                if ctx.is_none() {
-                    eprintln!(
-                        "rapidtrees: RAPIDTREES_GPU=1 but no GPU adapter found; falling back to CPU"
-                    );
-                }
-                return ctx;
-            }
-            _ => {}
-        }
         pollster::block_on(Self::init_async())
     }
 
@@ -73,11 +59,8 @@ impl GpuContext {
             })
             .await?;
 
-        // Reject software/CPU adapters unless the caller explicitly opts in.
-        let info = adapter.get_info();
-        if info.device_type == wgpu::DeviceType::Cpu
-            && std::env::var("RAPIDTREES_GPU_ALLOW_SOFTWARE").is_err()
-        {
+        // Reject software/CPU adapters — they're slower than the native CPU path.
+        if adapter.get_info().device_type == wgpu::DeviceType::Cpu {
             return None;
         }
 
@@ -137,29 +120,11 @@ pub(crate) fn try_pairwise_rf(snaps: &Snapshots) -> Option<Vec<usize>> {
 
     let ctx = get_gpu()?;
 
-    // Re-pack into u32 words for WGSL (CPU uses u64; reinterpret each u64 as 2 u32s).
-    let n_splits = n_distinct_splits(snaps);
-    if n_splits == 0 {
+    // Re-pack into u32 words for WGSL (the CPU path uses u64 words instead).
+    let (bit_slot, kept_count, everywhere) = split_bit_layout(snaps);
+    if kept_count + everywhere == 0 {
         return Some(vec![0usize; n * n]);
     }
-
-    let mut tree_count = vec![0u32; n_splits];
-    for snap in &snaps.snapshots {
-        for &id in &snap.split_ids {
-            tree_count[id as usize] += 1;
-        }
-    }
-
-    let mut bit_slot = vec![u32::MAX; n_splits];
-    let mut kept_count = 0u32;
-    for (id, &count) in tree_count.iter().enumerate() {
-        if count < n as u32 {
-            bit_slot[id] = kept_count;
-            kept_count += 1;
-        }
-    }
-    let kept_count = kept_count as usize;
-    let everywhere = n_splits - kept_count;
     let words_u32 = kept_count.div_ceil(32);
 
     let mut packed = vec![0u32; n * words_u32];
@@ -181,42 +146,32 @@ pub(crate) fn try_pairwise_rf(snaps: &Snapshots) -> Option<Vec<usize>> {
         .map(|snap| (snap.split_ids.len() - everywhere) as u32)
         .collect();
 
-    // Estimate buffer sizes and bail if they exceed a safe limit (1 GB total).
+    // Estimate buffer sizes and bail if they exceed a safe limit.
     let packed_bytes = (n * words_u32 * 4) as u64;
     let output_bytes = (n * n * 4) as u64;
-    if packed_bytes + output_bytes > 1_073_741_824 {
+    if packed_bytes + output_bytes > MAX_GPU_BYTES {
         return None;
     }
 
-    ctx.run_rf(&packed, &kept_per_tree, n, words_u32).ok()
+    ctx.run_rf(&packed, &kept_per_tree, n, words_u32)
 }
 
 /// Try to compute all pairwise WRF distances on the GPU.
 pub(crate) fn try_pairwise_wrf(snaps: &Snapshots) -> Option<Vec<f64>> {
-    let n = snaps.snapshots.len();
-    if n < GPU_THRESHOLD {
-        return None;
-    }
-
-    let ctx = get_gpu()?;
-    let (rows_f64, n_splits) = dense_length_rows(snaps);
-    if n_splits == 0 {
-        return Some(vec![0.0f64; n * n]);
-    }
-
-    let total_bytes = (n * n_splits * 4 + n * n * 4) as u64;
-    if total_bytes > 1_073_741_824 {
-        return None;
-    }
-
-    let rows_f32: Vec<f32> = rows_f64.iter().map(|&v| v as f32).collect();
-    ctx.run_length_metric(&ctx.wrf_pipeline, &rows_f32, n, n_splits)
-        .ok()
-        .map(|v| v.into_iter().map(|x| x as f64).collect())
+    try_pairwise_length_metric(snaps, |ctx| &ctx.wrf_pipeline)
 }
 
 /// Try to compute all pairwise KF distances on the GPU.
 pub(crate) fn try_pairwise_kf(snaps: &Snapshots) -> Option<Vec<f64>> {
+    try_pairwise_length_metric(snaps, |ctx| &ctx.kf_pipeline)
+}
+
+/// Shared dense-length GPU path for WRF and KF; `select` picks which compute
+/// pipeline to run (the two metrics differ only in the per-split accumulator).
+fn try_pairwise_length_metric(
+    snaps: &Snapshots,
+    select: impl FnOnce(&GpuContext) -> &wgpu::ComputePipeline,
+) -> Option<Vec<f64>> {
     let n = snaps.snapshots.len();
     if n < GPU_THRESHOLD {
         return None;
@@ -229,26 +184,19 @@ pub(crate) fn try_pairwise_kf(snaps: &Snapshots) -> Option<Vec<f64>> {
     }
 
     let total_bytes = (n * n_splits * 4 + n * n * 4) as u64;
-    if total_bytes > 1_073_741_824 {
+    if total_bytes > MAX_GPU_BYTES {
         return None;
     }
 
     let rows_f32: Vec<f32> = rows_f64.iter().map(|&v| v as f32).collect();
-    ctx.run_length_metric(&ctx.kf_pipeline, &rows_f32, n, n_splits)
-        .ok()
+    ctx.run_length_metric(select(ctx), &rows_f32, n, n_splits)
         .map(|v| v.into_iter().map(|x| x as f64).collect())
 }
 
 // ── GpuContext compute helpers ────────────────────────────────────────────────
 
 impl GpuContext {
-    fn run_rf(
-        &self,
-        packed: &[u32],
-        kept: &[u32],
-        n: usize,
-        words: usize,
-    ) -> Result<Vec<usize>, ()> {
+    fn run_rf(&self, packed: &[u32], kept: &[u32], n: usize, words: usize) -> Option<Vec<usize>> {
         let params: [u32; 4] = [n as u32, words as u32, 0, 0];
 
         let packed_buf = self
@@ -326,8 +274,13 @@ impl GpuContext {
         encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, output_size);
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        let result_u32 = readback_u32(&self.device, &staging_buf, n * n)?;
-        Ok(result_u32.into_iter().map(|v| v as usize).collect())
+        let bytes = readback_bytes(&self.device, &staging_buf, n * n * 4)?;
+        Some(
+            bytes
+                .chunks_exact(4)
+                .map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]) as usize)
+                .collect(),
+        )
     }
 
     fn run_length_metric(
@@ -336,7 +289,7 @@ impl GpuContext {
         rows: &[f32],
         n: usize,
         n_splits: usize,
-    ) -> Result<Vec<f32>, ()> {
+    ) -> Option<Vec<f32>> {
         let params: [u32; 4] = [n as u32, n_splits as u32, 0, 0];
 
         let rows_buf = self
@@ -403,54 +356,34 @@ impl GpuContext {
         encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, output_size);
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        readback_f32(&self.device, &staging_buf, n * n)
+        let bytes = readback_bytes(&self.device, &staging_buf, n * n * 4)?;
+        Some(
+            bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+                .collect(),
+        )
     }
 }
 
 // ── Readback helpers ──────────────────────────────────────────────────────────
 
-fn readback_u32(device: &wgpu::Device, buf: &wgpu::Buffer, count: usize) -> Result<Vec<u32>, ()> {
+/// Map `buf`, wait for the GPU, and copy out exactly `byte_len` bytes. Returns
+/// `None` if the map fails or the readback length doesn't match, letting the
+/// caller fall back to the CPU path. Callers reinterpret the bytes themselves.
+fn readback_bytes(device: &wgpu::Device, buf: &wgpu::Buffer, byte_len: usize) -> Option<Vec<u8>> {
     let slice = buf.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |r| {
         let _ = tx.send(r);
     });
     device.poll(wgpu::Maintain::Wait);
-    rx.recv().ok().and_then(|r| r.ok()).ok_or(())?;
+    rx.recv().ok()?.ok()?;
     let data = slice.get_mapped_range();
-    let result: Vec<u32> = data
-        .chunks_exact(4)
-        .map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
-        .collect();
+    let bytes = data.to_vec();
     drop(data);
     buf.unmap();
-    if result.len() == count {
-        Ok(result)
-    } else {
-        Err(())
-    }
-}
-
-fn readback_f32(device: &wgpu::Device, buf: &wgpu::Buffer, count: usize) -> Result<Vec<f32>, ()> {
-    let slice = buf.slice(..);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |r| {
-        let _ = tx.send(r);
-    });
-    device.poll(wgpu::Maintain::Wait);
-    rx.recv().ok().and_then(|r| r.ok()).ok_or(())?;
-    let data = slice.get_mapped_range();
-    let result: Vec<f32> = data
-        .chunks_exact(4)
-        .map(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
-        .collect();
-    drop(data);
-    buf.unmap();
-    if result.len() == count {
-        Ok(result)
-    } else {
-        Err(())
-    }
+    (bytes.len() == byte_len).then_some(bytes)
 }
 
 // ── Byte casting ──────────────────────────────────────────────────────────────
