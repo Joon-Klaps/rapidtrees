@@ -1,6 +1,6 @@
 [package]
 name = "rapidtrees"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 description = "Fast pairwise tree distance calculations (Robinson-Foulds, Weighted RF, Kuhner-Felsenstein) for phylogenetic trees"
 license = "MIT"
@@ -27,12 +27,15 @@ clap = { version = "4.5", features = ["derive"], optional = true }
 flate2 = { version = "1", optional = true }
 rustc-hash = "2.1"
 hashbrown = "0.17.1"
+wgpu = { version = "22", optional = true }
+pollster = { version = "0.3", optional = true }
 
 [features]
 default = ["cli"]
 cli = ["clap", "flate2"]
 python = ["pyo3"]
-extension-module = ["python", "pyo3/extension-module"]
+extension-module = ["python", "pyo3/extension-module", "gpu"]
+gpu = ["dep:wgpu", "dep:pollster"]
 
 [dev-dependencies]
 itertools = "0.14.0"

@@ -44,17 +44,15 @@ jobs:
             - name: Setup pixi
               uses: prefix-dev/setup-pixi@v0
               with:
-                  pixi-version: latest
+                  pixi-version: v0.41.4
                   locked: true
+                  cache: true
 
             - name: Check formatting
               run: cargo fmt --all -- --check
 
             - name: Run clippy
               run: cargo clippy --all-targets --all-features -- -D warnings
-
-            - name: Build
-              run: cargo build --verbose
 
             - name: Run tests
               # --features python compiles src/api.rs + src/progress.rs and
@@ -64,9 +62,6 @@ jobs:
                   LD_LIBRARY_PATH: ${{ github.workspace }}/.pixi/envs/default/lib
                   DYLD_LIBRARY_PATH: ${{ github.workspace }}/.pixi/envs/default/lib
               run: cargo test --verbose --lib --features python
-
-            - name: Build release
-              run: cargo build --release --verbose
 
     python-test:
         name: Python API Tests (${{ matrix.os }}, ${{ matrix.environment }})
@@ -97,9 +92,13 @@ jobs:
             - name: Setup pixi
               uses: prefix-dev/setup-pixi@v0
               with:
-                  pixi-version: latest
+                  pixi-version: v0.41.4
                   locked: true
                   environments: ${{ matrix.environment }}
+                  cache: true
+
+            - name: Build extension
+              run: pixi run -e ${{ matrix.environment }} develop
 
             - name: Run Python API tests
-              run: pixi run -e ${{ matrix.environment }} test-python
+              run: .pixi/envs/${{ matrix.environment }}/bin/python -m pytest tests/test_python_api.py -v

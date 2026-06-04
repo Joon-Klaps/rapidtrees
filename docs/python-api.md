@@ -28,6 +28,7 @@ func(
     map_indices,      # list[int]            — which translate map applies to each tree
     rooted=False,     # bool                 — compare clades (True) or bipartitions (False)
     progress=None,    # ProgressCounter | None — see "Progress reporting" below
+    use_gpu=False,    # bool                 — see "GPU acceleration" below
 )
 ```
 
@@ -82,6 +83,34 @@ Notes:
   back into Python.
 - The counter ends at exactly `value == total` (`fraction() == 1.0`) after
   the function returns.
+
+### GPU acceleration
+
+Pass `use_gpu=True` to dispatch the pairwise computation to a GPU via wgpu
+(Vulkan, Metal, DX12, or OpenGL — whichever the runtime finds first). If no
+suitable adapter is available at runtime, or if the tree count is below the
+threshold (64), the call silently falls back to the CPU path. Results are
+numerically equivalent to the CPU path (RF is bit-identical; WRF/KF differ by
+at most ~1e-4 due to f32 GPU arithmetic vs f64 CPU).
+
+```python
+tree_names, rf_bytes = rtd.pairwise_rf_from_newick_iter(
+    names, iter(trees), [{}], [0] * n, use_gpu=True
+)
+```
+
+**Environment variables:**
+
+| Variable | Effect |
+| --- | --- |
+| `RAPIDTREES_GPU=0` | Force CPU path even when `use_gpu=True` |
+| `RAPIDTREES_GPU=1` | Print a warning to stderr if no GPU adapter is found (instead of silently falling back) |
+| `RAPIDTREES_GPU_ALLOW_SOFTWARE=1` | Allow CPU-emulated Vulkan adapters (e.g. Mesa lavapipe); useful for testing |
+
+**Notes:**
+- `use_gpu=False` (the default) is identical to all pre-0.8.0 behaviour.
+- GPU requires the `gpu` Cargo feature, which is included in the published wheel.
+- WRF and KF use `f32` arithmetic on the GPU; RF is exact (`u32` popcount).
 
 ### Return types
 
