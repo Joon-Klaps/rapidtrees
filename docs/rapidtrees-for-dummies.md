@@ -15,9 +15,10 @@
 7. [Step 5 — Computing RF distance via two-pointer merge](#step-5--computing-rf-distance-via-two-pointer-merge)
 8. [Step 6 — The scaling problem at large taxa counts](#step-6--the-scaling-problem-at-large-taxa-counts)
 9. [Step 7 — InternSnap: replacing bitsets with integer IDs](#step-7--internsnap-replacing-bitsets-with-integer-ids)
-10. [Step 8 — RF with interned IDs](#step-8--rf-with-interned-ids)
-11. [The full pipeline at a glance](#the-full-pipeline-at-a-glance)
-12. [Cheat sheet: all representations](#cheat-sheet-all-representations)
+10. [Step 8 — Single-pair distances via the sorted merge](#step-8--single-pair-distances-via-the-sorted-merge)
+11. [Step 9 — Bulk pairwise: the dense backend (RF, WRF, KF)](#step-9--bulk-pairwise-the-dense-backend-rf-wrf-kf)
+12. [The full pipeline at a glance](#the-full-pipeline-at-a-glance)
+13. [Cheat sheet: all representations](#cheat-sheet-all-representations)
 
 ---
 
@@ -333,9 +334,11 @@ The Bitsets still exist in the global table — but there's only **one copy of e
 
 ---
 
-## Step 8 — RF with interned IDs
+## Step 8 — Single-pair distances via the sorted merge
 
-Exactly the same two-pointer merge, but now each comparison is **one integer vs one integer**:
+> This section describes the single-pair functions `rf_distance`, `wrf_distance`, and `kf_distance`. For computing all pairwise distances at once (`pairwise_rf` / `pairwise_wrf` / `pairwise_kf`), see Step 9.
+
+Exactly the same two-pointer merge as Step 5, but now each comparison is **one integer vs one integer**:
 
 ```
 Tree 1 IDs: [ 0,  1,  2,  3 ]
@@ -353,11 +356,64 @@ RF = 4 + 4 - 2×2 = 4   ← identical answer
 
 The comparison `1 vs 1` is a **single CPU instruction** instead of comparing 32 × 64-bit words. With 5 000 trees × ~600 splits × millions of pairs, this compounds into a huge speedup because the entire working set now fits in L3 cache.
 
+For WRF and KF, the same merge runs but accumulates branch-length differences (`|lenᵢ − lenⱼ|` for WRF) or squared differences (`(lenᵢ − lenⱼ)²` for KF) instead of counting shared IDs. The branch lengths live in the parallel `lengths` vector of each `InternSnap`.
+
+---
+
+## Step 9 — Bulk pairwise: the dense backend (RF, WRF, KF)
+
+For a single pair the merge in Step 8 is fast. For *all* pairs — 5 000 trees gives ~12.5 million comparisons — a smarter layout pays off. `rapidtrees` reformulates each metric as an operation over contiguous memory rows, all powered by the same parallel upper-triangle sweep.
+
+### RF — bit-packed presence matrix
+
+Build a **presence matrix** with one row per tree. Each row is a bitset of width *U* (the number of unique splits across all trees), packed into `u64` words:
+
+```text
+Split IDs:      0   1   2   3   4   5
+                │   │   │   │   │   │
+Tree 1 row:  [  1   1   1   1   0   0  ]  packed → 0b001111
+Tree 2 row:  [  0   1   0   1   1   1  ]  packed → 0b111010
+
+RF(1, 2) = a₁  +  a₂  −  2 · popcount( row₁  AND  row₂ )
+         =  4  +   4  −  2 · popcount( 0b001010 )
+         =  4  +   4  −  2 · 2
+         =  4
+```
+
+One extra win: splits present in *every* tree ("universal" splits — always at least the pendant/leaf edges) contribute equally to both `a` values and to the shared count, so they cancel out of RF exactly. They are dropped *before* packing, shrinking the rows. For MCMC-like sets where trees are nearly identical, most splits are universal and the bit-rows become very short — this is why RF is **~15× faster** on posterior samples.
+
+### WRF — dense length rows
+
+Build a **length matrix** with one row per tree. Column *u* of tree *t*'s row holds the branch length of split *u* (0.0 if absent):
+
+```text
+Split IDs:       0      1      2      3      4      5
+                 │      │      │      │      │      │
+Tree 1 row:  [ 0.20   0.30   0.40   0.10   0.00   0.00 ]
+Tree 2 row:  [ 0.00   0.30   0.00   0.10   0.15   0.25 ]
+
+WRF(1, 2) = |0.20−0.00| + |0.30−0.30| + |0.40−0.00| + |0.10−0.10| + |0.00−0.15| + |0.00−0.25|
+           =   0.20     +    0.00     +    0.40     +    0.00     +    0.15     +    0.25
+           = 1.00
+```
+
+There is no "shared term" shortcut for an absolute difference, so this is a per-element sweep — but walking two contiguous `f64` arrays is cache-friendly and vectorises well.
+
+### KF — dot-product (Gram) form
+
+Using the same length matrix, KF is the Euclidean distance between two length rows. Expanding the squared Euclidean distance:
+
+```text
+KF(i, j) = sqrt( ‖Wᵢ‖² + ‖Wⱼ‖² − 2 · ⟨Wᵢ, Wⱼ⟩ )
+```
+
+The **self-norms** `‖Wᵢ‖²` are computed once up front for all trees. Each pair then costs only one dot product `⟨Wᵢ, Wⱼ⟩` — analogous to RF's `popcount(AND)`. A clamp to zero before `sqrt` guards against floating-point rounding making the bracket slightly negative for near-identical trees.
+
 ---
 
 ## The full pipeline at a glance
 
-```
+```text
 BEAST/Newick file
        │
        │  io::load_beast_trees / io::parse_trees
@@ -381,19 +437,28 @@ BEAST/Newick file
        ▼
  Snapshots  ← the only public representation
        │
-       ├─  rf_distance / wrf_distance / kf_distance       (one pair)
-       └─  pairwise_rf_matrix / pairwise_wrf_matrix / pairwise_kf_matrix  (all pairs)
+       ├─  rf_distance / wrf_distance / kf_distance    (one pair — sorted merge)
+       └─  pairwise_rf / pairwise_wrf / pairwise_kf   (all pairs — dense backend)
 ```
 
 ---
 
 ## Cheat sheet: all representations
 
+### Persistent structures (live in `Snapshots`)
+
 | Name | File | What it stores | Size per bipartition | When used |
 |---|---|---|---|---|
 | `Bitset` | `src/bitset.rs` | Raw packed bits, 1 bit per taxon | `ceil(n_taxa/64) × 8` bytes | Building blocks for everything |
 | `TreeSnapshot` | `src/snapshot.rs` | `Vec<Bitset>` (sorted) + parallel `Vec<f64>` lengths | 256 bytes @ 2000 taxa | **Internal only** — built during loading, discarded after interning |
-| `InternSnap` | `src/snapshot.rs` | `Vec<u32>` IDs (sorted) + parallel `Vec<f64>` lengths | 4 bytes | **Internal** — held inside `Snapshots`, all distance calculations |
-| `Snapshots` | `src/snapshot.rs` | The global ID↔Bitset dictionary + all `InternSnap`s | One Bitset per *unique* split, shared | **The public API** — returned by all loading functions |
+| `InternSnap` | `src/snapshot.rs` | `Vec<u32>` IDs (sorted); parallel `Vec<f64>` lengths (omitted on RF-only paths) | 4 bytes | **Internal** — held inside `Snapshots`, used by all distance functions |
+| `Snapshots` | `src/snapshot.rs` | Global ID↔Bitset table + all `InternSnap`s + leaf names | One `Bitset` per *unique* split, shared across trees | **The public API** — returned by all loading functions |
 
-> **tl;dr:** `TreeSnapshot` is a private stepping stone used during parsing. `Snapshots` is what everything else touches — RF, WRF, KF, pairwise matrices, snap file I/O, and Python bindings all take or return `Snapshots`.
+### Transient compute structures (built and freed per pairwise call)
+
+| Name | Metric | What it stores | Size |
+|---|---|---|---|
+| Packed presence matrix | `pairwise_rf` | One bit-row per tree over non-universal splits, packed into `u64` words | `n_trees × ceil(U_nonuniversal/64) × 8` bytes |
+| Dense length matrix | `pairwise_wrf`, `pairwise_kf` | One `f64` row per tree over all unique splits (0.0 if absent) | `n_trees × U × 8` bytes |
+
+> **tl;dr:** `TreeSnapshot` is a private stepping stone used during parsing. `Snapshots` is what everything else touches. The packed/dense matrices are built on the fly for each bulk pairwise call and freed immediately after.

@@ -261,7 +261,7 @@ fn main() {
 
             let start_wall = Instant::now();
             let start_cpu = ProcessTime::now();
-            let _mat = bench_snaps.pairwise_rf();
+            let _mat = bench_snaps.pairwise_rf(None);
             let wall_duration = start_wall.elapsed();
             let cpu_duration = start_cpu.elapsed();
 

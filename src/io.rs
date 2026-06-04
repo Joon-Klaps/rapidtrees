@@ -620,7 +620,7 @@ mod tests {
     #[test]
     fn test_snap_roundtrip_preserves_rf_distances() {
         let (tree_names, snaps) = make_snapshots();
-        let rf_before = snaps.pairwise_rf();
+        let rf_before = snaps.pairwise_rf(None);
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
         write_snap(tmp.path(), &tree_names, &snaps).unwrap();
@@ -633,7 +633,7 @@ mod tests {
         );
         assert_eq!(loaded_snaps.snapshots.len(), snaps.snapshots.len());
 
-        let rf_after = loaded_snaps.pairwise_rf();
+        let rf_after = loaded_snaps.pairwise_rf(None);
         assert_eq!(
             rf_before, rf_after,
             "RF distances must be identical after snap roundtrip"

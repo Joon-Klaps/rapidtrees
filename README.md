@@ -189,9 +189,11 @@ rapidtrees \
 | Function | Returns |
 | --- | --- |
 | `pairwise_rf_from_newick_iter` | `(names, bytes)` — RF matrix as flat `uint32` bytes, row-major |
-| `pairwise_rf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, list[list[int]])` — RF + presence matrix + bipartition leaf indices |
+| `pairwise_rf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, bytes)` — RF matrix + presence matrix + clade bitmasks |
 | `pairwise_wrf_from_newick_iter` | `(names, list[float])` — Weighted RF, flat row-major |
+| `pairwise_wrf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, bytes)` — wRF matrix + branch-length matrix + clade bitmasks |
 | `pairwise_kf_from_newick_iter` | `(names, list[float])` — Kuhner-Felsenstein, flat row-major |
+| `pairwise_kf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, bytes)` — KF matrix + branch-length matrix + clade bitmasks |
 
 ```python
 import rapidtrees as rtd
@@ -266,7 +268,7 @@ The presence matrix is sufficient for all major convergence diagnostics:
 | **Pseudo ESS**          | `presence.mean(axis=0)` per chain |
 | **ASDSF**               | Per-chain split frequencies       |
 | **Fréchet ESS**         | RF distances via XOR of rows      |
-| **WRF / KF distances**  | Branch lengths *(future section)* |
+| **WRF / KF distances**  | Branch lengths — use `pairwise_wrf_with_snapshots_from_newick_iter` or `pairwise_kf_with_snapshots_from_newick_iter` |
 
 Note: `sum(presence[i] XOR presence[j]) == RF(tree_i, tree_j)` exactly.
 
@@ -280,7 +282,9 @@ matrix in memory without writing a file — see the [Python API section](#-pytho
 import rapidtrees as rtd
 import numpy as np
 
-tree_names, rf_bytes, leaf_names, n_bip, pres_bytes, bip_leaf_indices = (
+import math
+
+tree_names, rf_bytes, leaf_names, n_bip, pres_bytes, bip_clade_bytes = (
     rtd.pairwise_rf_with_snapshots_from_newick_iter(
         names, iter(newicks), translate_maps, map_indices
     )
@@ -294,8 +298,11 @@ global_freq = presence.mean(axis=0)
 # RF distance between any two trees — no recomputation needed
 rf_01 = int((presence[0].astype(int) ^ presence[1].astype(int)).sum())
 
-# Named presence matrix — each column labelled with its bipartition's leaf set
-col_labels = ["|".join(leaf_names[i] for i in indices) for indices in bip_leaf_indices]
+# Named presence matrix — decode clade bitmasks for column labels
+bytes_per_bip = math.ceil(len(leaf_names) / 8)
+bip_arr  = np.frombuffer(bip_clade_bytes, dtype=np.uint8).reshape(n_bip, bytes_per_bip)
+bip_bool = np.unpackbits(bip_arr, axis=1, bitorder="little")[:, :len(leaf_names)]
+col_labels = ["|".join(leaf_names[i] for i in np.where(bip_bool[j])[0]) for j in range(n_bip)]
 import pandas as pd
 df = pd.DataFrame(presence, index=tree_names, columns=col_labels)
 ```
