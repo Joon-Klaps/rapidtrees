@@ -369,15 +369,18 @@ pub(crate) fn pairwise_kf_dense(snaps: &Snapshots, progress: Option<&AtomicUsize
     })
 }
 
-// ─── pub(crate): GPU-aware dispatch ──────────────────────────────────────────
+// ─── pub: GPU-aware dispatch ──────────────────────────────────────────────────
 //
-// These are the call sites used by api.rs when `use_gpu=True` is passed from
-// Python. When the `gpu` feature is not compiled in, or when no adapter is
-// available, or when n < GPU_THRESHOLD, they fall through to the CPU path.
+// These are the GPU-or-CPU entry points used by api.rs (Python) and main.rs
+// (CLI). When the `gpu` feature is not compiled in, or no adapter is available,
+// or n < GPU_THRESHOLD, they fall through to the CPU path silently.
 
 /// Dispatch RF to GPU when `use_gpu` is true and conditions are met, else CPU.
-#[cfg(feature = "python")]
-pub(crate) fn dispatch_rf(
+///
+/// When the `gpu` feature is not compiled in, or no adapter is found, or
+/// `n < 64`, falls back silently to the CPU path. Results are bit-identical
+/// regardless of which path is taken.
+pub fn dispatch_rf(
     snaps: &Snapshots,
     progress: Option<&std::sync::atomic::AtomicUsize>,
     use_gpu: bool,
@@ -391,8 +394,10 @@ pub(crate) fn dispatch_rf(
 }
 
 /// Dispatch WRF to GPU when `use_gpu` is true and conditions are met, else CPU.
-#[cfg(feature = "python")]
-pub(crate) fn dispatch_wrf(
+///
+/// GPU path uses f32 arithmetic (~1e-5 relative error); CPU path uses f64.
+/// Falls back silently when no GPU adapter is available.
+pub fn dispatch_wrf(
     snaps: &Snapshots,
     progress: Option<&std::sync::atomic::AtomicUsize>,
     use_gpu: bool,
@@ -406,8 +411,11 @@ pub(crate) fn dispatch_wrf(
 }
 
 /// Dispatch KF to GPU when `use_gpu` is true and conditions are met, else CPU.
-#[cfg(feature = "python")]
-pub(crate) fn dispatch_kf(
+///
+/// GPU path uses direct f32 `Σ(a−b)²` (not the Gram form, which catastrophically
+/// cancels for near-identical trees in f32). Falls back silently when no adapter
+/// is available.
+pub fn dispatch_kf(
     snaps: &Snapshots,
     progress: Option<&std::sync::atomic::AtomicUsize>,
     use_gpu: bool,

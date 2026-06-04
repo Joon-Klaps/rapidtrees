@@ -1682,13 +1682,27 @@ class TestProgressCounter:
         assert "ProgressCounter" in r and "value=0" in r and "total=0" in r
 
 
+def _load_hiv1_inputs(burnin_trees=1):
+    """Load hiv1.trees and return (names, newicks, translate_maps, map_indices).
+
+    Uses a burn-in of 1 tree (consistent with other hiv1 tests). These trees
+    have real floating-point branch lengths (~1–20 units) that stress f32 vs
+    f64 precision differences, unlike synthetic 0.1-branch trees.
+    """
+    tmap, pairs = _load_beast_raw_py(str(TEST_DATA / "hiv1.trees"), burnin_trees=burnin_trees)
+    names = [p[0] for p in pairs]
+    newicks = [p[1] for p in pairs]
+    return names, newicks, [tmap], [0] * len(names)
+
+
 @pytest.mark.skipif(not RUST_MODULE_AVAILABLE, reason="rapidtrees not installed")
 class TestUseGpu:
     """Tests for the use_gpu keyword argument on all six pairwise functions.
 
     These tests always run: use_gpu=True will auto-detect a GPU and fall back
-    to CPU if none is available. Results must be numerically equivalent in
-    both cases (RF: exact; WRF/KF: within f32 tolerance ~1e-4).
+    to CPU if none is available. RF results must be bit-identical; WRF/KF
+    tolerance tests use hiv1.trees with real branch lengths (~1–20 units)
+    where f32/f64 differences are non-trivial and the 1e-4 bound is meaningful.
     """
 
     FUNCS_RF = [
@@ -1704,40 +1718,12 @@ class TestUseGpu:
         rtd.pairwise_kf_with_snapshots_from_newick_iter,
     ]
 
-    def _call(self, func, use_gpu):
+    def _call_fixture(self, func, use_gpu):
         return func(
             FIXTURE_NAMES, iter(FIXTURE_TREES),
             FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES,
             use_gpu=use_gpu,
         )
-
-    def test_use_gpu_false_identical_to_default(self):
-        """Explicit use_gpu=False must be byte-identical to the default."""
-        all_funcs = self.FUNCS_RF + self.FUNCS_WRF + self.FUNCS_KF
-        for func in all_funcs:
-            default_result = func(
-                FIXTURE_NAMES, iter(FIXTURE_TREES),
-                FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES,
-            )
-            gpu_false_result = self._call(func, use_gpu=False)
-            # Compare the distance matrix (first or second element depending on function)
-            idx = 1  # distance matrix is always at index 1
-            assert default_result[idx] == gpu_false_result[idx], (
-                f"{func.__name__}: use_gpu=False diverged from default"
-            )
-
-    def test_use_gpu_true_rf_exact(self):
-        """RF with use_gpu=True must produce exact same integers as use_gpu=False.
-
-        RF is computed with u32 popcount on GPU — bit-identical to CPU regardless
-        of whether GPU or CPU fallback is used.
-        """
-        for func in self.FUNCS_RF:
-            cpu = self._call(func, use_gpu=False)
-            gpu = self._call(func, use_gpu=True)
-            assert cpu[1] == gpu[1], (
-                f"{func.__name__}: RF use_gpu=True differs from CPU"
-            )
 
     @staticmethod
     def _to_f64_mat(result_1, n):
@@ -1750,48 +1736,75 @@ class TestUseGpu:
             return np.frombuffer(result_1, dtype=np.float64).reshape(n, n)
         return np.array(result_1, dtype=np.float64).reshape(n, n)
 
-    def test_use_gpu_true_wrf_within_tolerance(self):
-        """WRF with use_gpu=True must be within 1e-4 of CPU values.
-
-        GPU uses f32; CPU uses f64. For the small fixture trees the relative
-        error is well below 1e-4 in practice. 1e-4 is the conservative bound.
-        If the GPU is unavailable and the call falls back to CPU, results are
-        exact — the assertion still holds.
-        """
-        n = len(FIXTURE_NAMES)
-        for func in self.FUNCS_WRF:
-            cpu = self._call(func, use_gpu=False)
-            gpu = self._call(func, use_gpu=True)
-            cpu_mat = self._to_f64_mat(cpu[1], n)
-            gpu_mat = self._to_f64_mat(gpu[1], n)
-            np.testing.assert_allclose(
-                gpu_mat, cpu_mat, atol=1e-4,
-                err_msg=f"{func.__name__}: WRF use_gpu=True exceeded tolerance",
+    def test_use_gpu_false_identical_to_default(self):
+        """Explicit use_gpu=False must be byte-identical to the default."""
+        all_funcs = self.FUNCS_RF + self.FUNCS_WRF + self.FUNCS_KF
+        for func in all_funcs:
+            default_result = func(
+                FIXTURE_NAMES, iter(FIXTURE_TREES),
+                FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES,
+            )
+            gpu_false_result = self._call_fixture(func, use_gpu=False)
+            assert default_result[1] == gpu_false_result[1], (
+                f"{func.__name__}: use_gpu=False diverged from default"
             )
 
-    def test_use_gpu_true_kf_within_tolerance(self):
-        """KF with use_gpu=True must be within 1e-4 of CPU values.
+    def test_use_gpu_true_rf_exact(self):
+        """RF with use_gpu=True must produce exact same integers as use_gpu=False.
 
-        GPU uses direct f32 Σ(a-b)²; CPU uses f64. Same tolerance argument as WRF.
+        RF is computed with u32 popcount on GPU — bit-identical to CPU regardless
+        of whether GPU or CPU fallback is used.
         """
-        n = len(FIXTURE_NAMES)
-        for func in self.FUNCS_KF:
-            cpu = self._call(func, use_gpu=False)
-            gpu = self._call(func, use_gpu=True)
+        for func in self.FUNCS_RF:
+            cpu = self._call_fixture(func, use_gpu=False)
+            gpu = self._call_fixture(func, use_gpu=True)
+            assert cpu[1] == gpu[1], f"{func.__name__}: RF use_gpu=True differs from CPU"
+
+    def test_use_gpu_true_wrf_hiv1_within_tolerance(self):
+        """WRF GPU vs CPU on hiv1.trees must be within 1e-4 (absolute).
+
+        hiv1 branch lengths are ~1–20 units. f32 machine-epsilon is ~1e-7, so
+        per-entry rounding accumulates to ~1e-4 over a ~150-split row. 1e-4 is
+        the conservative bound. If the GPU falls back to CPU the assertion is
+        trivially exact.
+        """
+        names, newicks, translate_maps, map_indices = _load_hiv1_inputs()
+        n = len(names)
+        for func in self.FUNCS_WRF:
+            cpu = func(names, iter(newicks), translate_maps, map_indices, use_gpu=False)
+            gpu = func(names, iter(newicks), translate_maps, map_indices, use_gpu=True)
             cpu_mat = self._to_f64_mat(cpu[1], n)
             gpu_mat = self._to_f64_mat(gpu[1], n)
             np.testing.assert_allclose(
                 gpu_mat, cpu_mat, atol=1e-4,
-                err_msg=f"{func.__name__}: KF use_gpu=True exceeded tolerance",
+                err_msg=f"{func.__name__}: WRF use_gpu=True exceeded 1e-4 on hiv1",
+            )
+
+    def test_use_gpu_true_kf_hiv1_within_tolerance(self):
+        """KF GPU vs CPU on hiv1.trees must be within 1e-4 (absolute).
+
+        Direct f32 Σ(a-b)² accumulates rounding proportional to branch-length
+        magnitude. At hiv1 scale the per-entry error is ~1e-4; 1e-4 is safe.
+        If the GPU falls back to CPU the assertion is trivially exact.
+        """
+        names, newicks, translate_maps, map_indices = _load_hiv1_inputs()
+        n = len(names)
+        for func in self.FUNCS_KF:
+            cpu = func(names, iter(newicks), translate_maps, map_indices, use_gpu=False)
+            gpu = func(names, iter(newicks), translate_maps, map_indices, use_gpu=True)
+            cpu_mat = self._to_f64_mat(cpu[1], n)
+            gpu_mat = self._to_f64_mat(gpu[1], n)
+            np.testing.assert_allclose(
+                gpu_mat, cpu_mat, atol=1e-4,
+                err_msg=f"{func.__name__}: KF use_gpu=True exceeded 1e-4 on hiv1",
             )
 
     def test_all_six_accept_use_gpu_kwarg(self):
         """Smoke-test that all six functions accept use_gpu without TypeError."""
         all_funcs = self.FUNCS_RF + self.FUNCS_WRF + self.FUNCS_KF
         for func in all_funcs:
-            # Should not raise
-            self._call(func, use_gpu=False)
-            self._call(func, use_gpu=True)
+            self._call_fixture(func, use_gpu=False)
+            self._call_fixture(func, use_gpu=True)
 
 
 if __name__ == "__main__":

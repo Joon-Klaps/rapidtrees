@@ -39,6 +39,7 @@ platforms = ["linux-64", "osx-arm64"]
 
 [tool.pixi.dependencies]
 python = ">=3.10,<3.13"
+maturin = ">=1.0,<2.0"
 r-phangorn = "*"
 r-ape = "*"
 pytest = "*"
@@ -64,7 +65,7 @@ py311 = ["py311"]
 py312 = ["py312"]
 
 [tool.pixi.tasks]
-test                   = { cmd = "cargo test --lib --features python && pytest tests/test_python_api.py -v", description = "Run rust & python tests" }
+tests                  = { cmd = "cargo test --lib --features python && pytest tests/test_python_api.py -v", description = "Run rust & python tests" }
 test-rust              = { cmd = "cargo test --lib --features python", description = "Run Rust unit tests (with the python feature so progress.rs + embedded-Python integration tests are included)", env = { PYO3_PYTHON = "$CONDA_PREFIX/bin/python", LD_LIBRARY_PATH = "$CONDA_PREFIX/lib", DYLD_LIBRARY_PATH = "$CONDA_PREFIX/lib" } }
 test-rust-cov          = { cmd = "cargo llvm-cov --lib --features python --lcov --output-path rust-lcov.info", description = "Run Rust + embedded-Python tests under llvm-cov and write rust-lcov.info", env = { PYO3_PYTHON = "$CONDA_PREFIX/bin/python", LD_LIBRARY_PATH = "$CONDA_PREFIX/lib", DYLD_LIBRARY_PATH = "$CONDA_PREFIX/lib" } }
 test-python            = { cmd = "pytest tests/test_python_api.py -v", description = "Run Python API tests" }

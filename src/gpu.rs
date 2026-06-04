@@ -540,7 +540,7 @@ mod tests {
             for j in 0..n {
                 let diff = (gpu_result[i * n + j] - cpu_result[i * n + j]).abs();
                 assert!(
-                    diff < 1e-3,
+                    diff < 1e-4,
                     "GPU WRF[{i}][{j}] = {} vs CPU = {}; diff = {}",
                     gpu_result[i * n + j],
                     cpu_result[i * n + j],
@@ -569,7 +569,7 @@ mod tests {
             for j in 0..n {
                 let diff = (gpu_result[i * n + j] - cpu_result[i * n + j]).abs();
                 assert!(
-                    diff < 1e-3,
+                    diff < 1e-4,
                     "GPU KF[{i}][{j}] = {} vs CPU = {}; diff = {}",
                     gpu_result[i * n + j],
                     cpu_result[i * n + j],

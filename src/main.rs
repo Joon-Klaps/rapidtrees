@@ -1,4 +1,5 @@
 use clap::{Parser, ValueEnum};
+use rapidtrees::distances::{dispatch_kf, dispatch_rf, dispatch_wrf};
 use rapidtrees::io::{load_beast_trees, load_snapshots, write_matrix_tsv, write_snap};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -60,6 +61,11 @@ struct Args {
     /// Quiet mode: suppresses progress messages on stdout
     #[arg(short = 'q', long = "quiet", default_value_t = false)]
     quiet: bool,
+
+    /// Use GPU acceleration when available (requires the `gpu` feature; falls
+    /// back to CPU silently if no adapter is found or n < 64)
+    #[arg(long = "gpu", default_value_t = false)]
+    gpu: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, ValueEnum)]
@@ -139,19 +145,19 @@ fn main() {
 
     let t = Instant::now();
     let show_progress = !quiet && std::io::stderr().is_terminal();
+    let use_gpu = args.gpu;
     let mat: Vec<f64> = match args.metric {
         MetricArg::Rf => run_with_progress(n_pairs, show_progress, |counter| {
-            interned
-                .pairwise_rf(Some(counter))
+            dispatch_rf(&interned, Some(counter), use_gpu)
                 .into_iter()
                 .map(|dist| dist as f64)
                 .collect()
         }),
         MetricArg::Weighted => run_with_progress(n_pairs, show_progress, |counter| {
-            interned.pairwise_wrf(Some(counter))
+            dispatch_wrf(&interned, Some(counter), use_gpu)
         }),
         MetricArg::Kf => run_with_progress(n_pairs, show_progress, |counter| {
-            interned.pairwise_kf(Some(counter))
+            dispatch_kf(&interned, Some(counter), use_gpu)
         }),
     };
     log_if(
