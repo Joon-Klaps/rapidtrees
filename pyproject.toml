@@ -40,6 +40,7 @@ platforms = ["linux-64", "osx-arm64"]
 [tool.pixi.dependencies]
 python = ">=3.10,<3.13"
 maturin = ">=1.0,<2.0"
+pip = "*"
 pytest = "*"
 numpy = ">=2.2"
 pytest-cov = "*"

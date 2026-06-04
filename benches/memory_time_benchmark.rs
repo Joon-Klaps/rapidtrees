@@ -230,15 +230,11 @@ fn main() {
     println!();
 
     let header = if args.use_gpu {
-        "| Taxa (N) | Trees (T) | Combinations | Est. RAM | VRAM (input+out) | Wall Time | CPU Time |"
+        "| Taxa (N) | Trees (T) | Combinations | Est. RAM | VRAM est / Host RSS       | Wall Time | CPU Time |"
     } else {
-        "| Taxa (N) | Trees (T) | Combinations | Est. RAM | Actual RAM       | Wall Time | CPU Time |"
+        "| Taxa (N) | Trees (T) | Combinations | Est. RAM | Actual RAM                | Wall Time | CPU Time |"
     };
-    let sep = if args.use_gpu {
-        "|----------|-----------|--------------|----------|------------------|-----------|----------|"
-    } else {
-        "|----------|-----------|--------------|----------|------------------|-----------|----------|"
-    };
+    let sep = "|----------|-----------|--------------|----------|---------------------------|-----------|----------|";
 
     println!("{header}");
     println!("{sep}");
@@ -282,7 +278,7 @@ fn main() {
                     estimate_vram(&sample, args.metric) / subset_size.max(1) * t + t * t * 4; // output matrix
                 if est_vram > VRAM_LIMIT {
                     println!(
-                        "| {:<8} | {:<9} | {:<12} | {:<8} | {:<16} | {:<9} | {:<8} |",
+                        "| {:<8} | {:<9} | {:<12} | {:<8} | {:<25} | {:<9} | {:<8} |",
                         n,
                         t,
                         combs_str,
@@ -295,7 +291,7 @@ fn main() {
                 }
             } else if total_est_ram > RAM_LIMIT {
                 println!(
-                    "| {:<8} | {:<9} | {:<12} | {:<8} | {:<16} | {:<9} | {:<8} |",
+                    "| {:<8} | {:<9} | {:<12} | {:<8} | {:<25} | {:<9} | {:<8} |",
                     n, t, combs_str, est_ram_str, "Skipped (>30 GB)", "-", "-"
                 );
                 continue;
@@ -307,7 +303,7 @@ fn main() {
             let rss_before = memory_stats().map(|m| m.physical_mem).unwrap_or(0);
             let Some(full_snaps) = from_newicks_or_skip(&full_newicks, false, "full-parse") else {
                 println!(
-                    "| {:<8} | {:<9} | {:<12} | {:<8} | {:<16} | {:<9} | {:<8} |",
+                    "| {:<8} | {:<9} | {:<12} | {:<8} | {:<25} | {:<9} | {:<8} |",
                     n, t, combs_str, est_ram_str, "Parse error", "-", "-"
                 );
                 continue;
@@ -318,7 +314,7 @@ fn main() {
 
             if !args.use_gpu && actual_ram > RAM_LIMIT {
                 println!(
-                    "| {:<8} | {:<9} | {:<12} | {:<8} | {:<16} | {:<9} | {:<8} |",
+                    "| {:<8} | {:<9} | {:<12} | {:<8} | {:<25} | {:<9} | {:<8} |",
                     n,
                     t,
                     combs_str,
@@ -330,19 +326,6 @@ fn main() {
                 drop(full_snaps);
                 continue;
             }
-
-            // Second column: VRAM estimate (GPU) or actual RAM (CPU)
-            let col2 = if args.use_gpu {
-                let vram = estimate_vram(&full_snaps, args.metric);
-                format!(
-                    "{} {}",
-                    mem_bar(vram, BAR_WIDTH, VRAM_LIMIT),
-                    format_size(vram)
-                )
-            } else {
-                let ram_bar = mem_bar(actual_ram, BAR_WIDTH, RAM_LIMIT);
-                format!("{} {}", ram_bar, format_size(actual_ram))
-            };
 
             // --- benchmark on a capped subset ---
             let max_subset = (MAX_COMPARISONS as f64).sqrt() as usize;
@@ -356,14 +339,27 @@ fn main() {
                 run_metric(&bench_snaps, args.metric, true);
             }
 
+            let rss_dispatch_before = memory_stats().map(|m| m.physical_mem).unwrap_or(0);
             let start_wall = Instant::now();
             let start_cpu = ProcessTime::now();
             run_metric(&bench_snaps, args.metric, args.use_gpu);
             let wall_duration = start_wall.elapsed();
             let cpu_duration = start_cpu.elapsed();
+            let rss_dispatch_after = memory_stats().map(|m| m.physical_mem).unwrap_or(0);
+            let dispatch_host_rss = rss_dispatch_after.saturating_sub(rss_dispatch_before);
 
             let run_comparisons = (bench_size as f64) * (bench_size as f64);
             let ratio = (total_comparisons as f64) / run_comparisons;
+
+            // Second column: VRAM estimate + host RSS delta (GPU) or actual RAM (CPU)
+            let col2 = if args.use_gpu {
+                let vram = estimate_vram(&full_snaps, args.metric);
+                // Host RSS reflects actual staging-buffer cost for the capped bench subset.
+                format!("{} / {}", format_size(vram), format_size(dispatch_host_rss))
+            } else {
+                let ram_bar = mem_bar(actual_ram, BAR_WIDTH, RAM_LIMIT);
+                format!("{} {}", ram_bar, format_size(actual_ram))
+            };
 
             let est_wall = wall_duration.mul_f64(ratio);
             let wall_bar = time_bar(est_wall, BAR_WIDTH, TIME_LIMIT);
@@ -381,7 +377,7 @@ fn main() {
             };
 
             println!(
-                "| {:<8} | {:<9} | {:<12} | {:<8} | {:<16} | {:<9} | {:<8} |",
+                "| {:<8} | {:<9} | {:<12} | {:<8} | {:<25} | {:<9} | {:<8} |",
                 n, t, combs_str, est_ram_str, col2, wall_str, cpu_str
             );
 
