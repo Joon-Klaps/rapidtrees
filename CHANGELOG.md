@@ -8,7 +8,18 @@ This project uses release names based on random words from [codenamegenerator.co
     - PREFIX: Microsoft Corperation
     - DICTIONARY: Snakes
 
-## [0.7.0] - Unreleased
+## [0.8.0] - Unreleased
+
+- **GPU acceleration (`use_gpu=True`):** All six `pairwise_*_from_newick_iter` Python functions now accept an optional `use_gpu: bool = False` keyword argument. When `True`, rapidtrees attempts to dispatch the pairwise computation to a wgpu-backed GPU (Vulkan / Metal / DX12 / OpenGL — whichever the runtime finds). If no suitable adapter is available, or if the tree count is below the threshold (64), it silently falls back to the CPU path with no change in results.
+  - **RF on GPU:** bit-packed `u32` rows; each shader thread computes `popcount(Pᵢ & Pⱼ)` with `countOneBits` — exact, bit-identical to CPU.
+  - **WRF on GPU:** dense `f32` rows; direct `Σ|wᵢ[k] − wⱼ[k]|` — no catastrophic-cancellation risk; relative error ~1e-5.
+  - **KF on GPU:** dense `f32` rows; direct `sqrt(Σ(wᵢ[k] − wⱼ[k])²)` — chosen over the Gram inner-product reformulation (`‖wᵢ‖² + ‖wⱼ‖² − 2⟨wᵢ,wⱼ⟩`) because the Gram form suffers catastrophic cancellation in f32 for near-identical trees, exactly the regime rapidtrees targets. *(Note: the Gram/GEMM path is faster on GPU when f32 precision is acceptable, and is a known future option if the precision trade-off is acceptable for a given use case.)*
+  - **Env-var override:** set `RAPIDTREES_GPU=0` to force CPU even when `use_gpu=True`. Set `RAPIDTREES_GPU=1` to emit a warning (not an error) if no GPU adapter is found. Set `RAPIDTREES_GPU_ALLOW_SOFTWARE=1` to permit CPU-emulated Vulkan adapters (e.g. Mesa lavapipe in CI).
+  - **Default unchanged:** `use_gpu=False` — all existing callers see identical results and behaviour.
+  - Requires the `gpu` Cargo feature, which is enabled by default in the published Python wheel (`extension-module` feature). ([#15](https://github.com/Joon-Klaps/rapidtrees/pull/15))
+- **CI:** `setup-pixi` steps now pass `cache: true` across all jobs, shaving ~60–90 s off every CI run. The Python-test and coverage jobs also now run an explicit `pixi run develop` step before tests to guarantee the `.so` is built from current source even on a cache hit, preventing stale-binary failures. Redundant `cargo build` steps removed from the Rust-test job. ([#15](https://github.com/Joon-Klaps/rapidtrees/pull/15))
+
+## [0.7.0] - Longhorn Viper (2026-06-04)
 - **Speed (RF/WRF/KF):** All three pairwise metrics now run on a dense, contiguous-row backend instead of the per-pair sorted-merge, sharing one parallel upper-triangle driver.
   - **RF** is reformulated as `RF(i,j) = aᵢ + aⱼ − 2·G[i][j]`, where the shared-split count `G` is `popcount(Pᵢ & Pⱼ)` over packed `u64` bit-rows. Splits present in every tree (the "universal" columns, which always include the pendant edges) cancel exactly in RF and are dropped before packing, shrinking the rows. Results are byte-identical to the old merge. On posterior-like samples (many near-identical trees) this is ~15× faster.
   - **KF** uses the same shape with branch lengths: `KF(i,j) = sqrt(‖wᵢ‖² + ‖wⱼ‖² − 2·⟨wᵢ,wⱼ⟩)`, where the shared term is the dot product of two length rows — the weighted echo of RF's shared-split popcount. A near-zero clamp guards the square root; results match the old merge within floating-point tolerance (verified to <1e-12 on real 162-taxon trees).

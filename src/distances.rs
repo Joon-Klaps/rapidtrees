@@ -173,7 +173,7 @@ where
 /// the biggest ID anywhere is the largest last element; +1 turns that into a
 /// count. We read it from `split_ids` (never the bitset table), so it still
 /// works on the paths that free the bitsets to save memory.
-fn n_distinct_splits(snaps: &Snapshots) -> usize {
+pub(crate) fn n_distinct_splits(snaps: &Snapshots) -> usize {
     snaps
         .snapshots
         .iter()
@@ -288,7 +288,7 @@ pub(crate) fn pairwise_rf_packed(snaps: &Snapshots, progress: Option<&AtomicUsiz
 ///
 /// Unlike RF, we keep *every* split column: an "everywhere" split still has a
 /// different length in each tree, so it doesn't cancel out of a weighted score.
-fn dense_length_rows(snaps: &Snapshots) -> (Vec<f64>, usize) {
+pub(crate) fn dense_length_rows(snaps: &Snapshots) -> (Vec<f64>, usize) {
     let n = snaps.snapshots.len();
     let n_splits = n_distinct_splits(snaps);
 
@@ -367,6 +367,57 @@ pub(crate) fn pairwise_kf_dense(snaps: &Snapshots, progress: Option<&AtomicUsize
         let dot: f64 = row_i.iter().zip(row_j).map(|(&a, &b)| a * b).sum();
         (norm_sq[i] + norm_sq[j] - 2.0 * dot).max(0.0).sqrt()
     })
+}
+
+// ─── pub(crate): GPU-aware dispatch ──────────────────────────────────────────
+//
+// These are the call sites used by api.rs when `use_gpu=True` is passed from
+// Python. When the `gpu` feature is not compiled in, or when no adapter is
+// available, or when n < GPU_THRESHOLD, they fall through to the CPU path.
+
+/// Dispatch RF to GPU when `use_gpu` is true and conditions are met, else CPU.
+#[cfg(feature = "python")]
+pub(crate) fn dispatch_rf(
+    snaps: &Snapshots,
+    progress: Option<&std::sync::atomic::AtomicUsize>,
+    use_gpu: bool,
+) -> Vec<usize> {
+    #[cfg(feature = "gpu")]
+    if use_gpu && let Some(result) = crate::gpu::try_pairwise_rf(snaps) {
+        return result;
+    }
+    let _ = use_gpu;
+    pairwise_rf_packed(snaps, progress)
+}
+
+/// Dispatch WRF to GPU when `use_gpu` is true and conditions are met, else CPU.
+#[cfg(feature = "python")]
+pub(crate) fn dispatch_wrf(
+    snaps: &Snapshots,
+    progress: Option<&std::sync::atomic::AtomicUsize>,
+    use_gpu: bool,
+) -> Vec<f64> {
+    #[cfg(feature = "gpu")]
+    if use_gpu && let Some(result) = crate::gpu::try_pairwise_wrf(snaps) {
+        return result;
+    }
+    let _ = use_gpu;
+    pairwise_wrf_dense(snaps, progress)
+}
+
+/// Dispatch KF to GPU when `use_gpu` is true and conditions are met, else CPU.
+#[cfg(feature = "python")]
+pub(crate) fn dispatch_kf(
+    snaps: &Snapshots,
+    progress: Option<&std::sync::atomic::AtomicUsize>,
+    use_gpu: bool,
+) -> Vec<f64> {
+    #[cfg(feature = "gpu")]
+    if use_gpu && let Some(result) = crate::gpu::try_pairwise_kf(snaps) {
+        return result;
+    }
+    let _ = use_gpu;
+    pairwise_kf_dense(snaps, progress)
 }
 
 /// Twelve 10-taxon trees from the PHYLIP treedist reference suite.

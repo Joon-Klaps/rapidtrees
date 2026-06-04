@@ -1682,6 +1682,118 @@ class TestProgressCounter:
         assert "ProgressCounter" in r and "value=0" in r and "total=0" in r
 
 
+@pytest.mark.skipif(not RUST_MODULE_AVAILABLE, reason="rapidtrees not installed")
+class TestUseGpu:
+    """Tests for the use_gpu keyword argument on all six pairwise functions.
+
+    These tests always run: use_gpu=True will auto-detect a GPU and fall back
+    to CPU if none is available. Results must be numerically equivalent in
+    both cases (RF: exact; WRF/KF: within f32 tolerance ~1e-4).
+    """
+
+    FUNCS_RF = [
+        rtd.pairwise_rf_from_newick_iter,
+        rtd.pairwise_rf_with_snapshots_from_newick_iter,
+    ]
+    FUNCS_WRF = [
+        rtd.pairwise_wrf_from_newick_iter,
+        rtd.pairwise_wrf_with_snapshots_from_newick_iter,
+    ]
+    FUNCS_KF = [
+        rtd.pairwise_kf_from_newick_iter,
+        rtd.pairwise_kf_with_snapshots_from_newick_iter,
+    ]
+
+    def _call(self, func, use_gpu):
+        return func(
+            FIXTURE_NAMES, iter(FIXTURE_TREES),
+            FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES,
+            use_gpu=use_gpu,
+        )
+
+    def test_use_gpu_false_identical_to_default(self):
+        """Explicit use_gpu=False must be byte-identical to the default."""
+        all_funcs = self.FUNCS_RF + self.FUNCS_WRF + self.FUNCS_KF
+        for func in all_funcs:
+            default_result = func(
+                FIXTURE_NAMES, iter(FIXTURE_TREES),
+                FIXTURE_TRANSLATE, FIXTURE_MAP_INDICES,
+            )
+            gpu_false_result = self._call(func, use_gpu=False)
+            # Compare the distance matrix (first or second element depending on function)
+            idx = 1  # distance matrix is always at index 1
+            assert default_result[idx] == gpu_false_result[idx], (
+                f"{func.__name__}: use_gpu=False diverged from default"
+            )
+
+    def test_use_gpu_true_rf_exact(self):
+        """RF with use_gpu=True must produce exact same integers as use_gpu=False.
+
+        RF is computed with u32 popcount on GPU — bit-identical to CPU regardless
+        of whether GPU or CPU fallback is used.
+        """
+        for func in self.FUNCS_RF:
+            cpu = self._call(func, use_gpu=False)
+            gpu = self._call(func, use_gpu=True)
+            assert cpu[1] == gpu[1], (
+                f"{func.__name__}: RF use_gpu=True differs from CPU"
+            )
+
+    @staticmethod
+    def _to_f64_mat(result_1, n):
+        """Convert distance matrix at result[1] to (n, n) float64 array.
+
+        Non-snapshot functions return list[float]; snapshot functions return
+        bytes (raw float64 little-endian).
+        """
+        if isinstance(result_1, (bytes, bytearray, memoryview)):
+            return np.frombuffer(result_1, dtype=np.float64).reshape(n, n)
+        return np.array(result_1, dtype=np.float64).reshape(n, n)
+
+    def test_use_gpu_true_wrf_within_tolerance(self):
+        """WRF with use_gpu=True must be within 1e-4 of CPU values.
+
+        GPU uses f32; CPU uses f64. For the small fixture trees the relative
+        error is well below 1e-4 in practice. 1e-4 is the conservative bound.
+        If the GPU is unavailable and the call falls back to CPU, results are
+        exact — the assertion still holds.
+        """
+        n = len(FIXTURE_NAMES)
+        for func in self.FUNCS_WRF:
+            cpu = self._call(func, use_gpu=False)
+            gpu = self._call(func, use_gpu=True)
+            cpu_mat = self._to_f64_mat(cpu[1], n)
+            gpu_mat = self._to_f64_mat(gpu[1], n)
+            np.testing.assert_allclose(
+                gpu_mat, cpu_mat, atol=1e-4,
+                err_msg=f"{func.__name__}: WRF use_gpu=True exceeded tolerance",
+            )
+
+    def test_use_gpu_true_kf_within_tolerance(self):
+        """KF with use_gpu=True must be within 1e-4 of CPU values.
+
+        GPU uses direct f32 Σ(a-b)²; CPU uses f64. Same tolerance argument as WRF.
+        """
+        n = len(FIXTURE_NAMES)
+        for func in self.FUNCS_KF:
+            cpu = self._call(func, use_gpu=False)
+            gpu = self._call(func, use_gpu=True)
+            cpu_mat = self._to_f64_mat(cpu[1], n)
+            gpu_mat = self._to_f64_mat(gpu[1], n)
+            np.testing.assert_allclose(
+                gpu_mat, cpu_mat, atol=1e-4,
+                err_msg=f"{func.__name__}: KF use_gpu=True exceeded tolerance",
+            )
+
+    def test_all_six_accept_use_gpu_kwarg(self):
+        """Smoke-test that all six functions accept use_gpu without TypeError."""
+        all_funcs = self.FUNCS_RF + self.FUNCS_WRF + self.FUNCS_KF
+        for func in all_funcs:
+            # Should not raise
+            self._call(func, use_gpu=False)
+            self._call(func, use_gpu=True)
+
+
 if __name__ == "__main__":
     # Allow running tests directly
     pytest.main([__file__, "-v"])

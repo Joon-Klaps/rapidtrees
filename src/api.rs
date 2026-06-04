@@ -106,7 +106,13 @@ fn validate_iter_args(
 ///         counter is in use the GIL is released for the duration of the
 ///         pairwise loop, so a polling thread runs unimpeded. When ``None``
 ///         (the default) the call has zero progress-related overhead and the
-///         GIL stays held throughout.
+///         GIL stays held throughout. Note: when ``use_gpu=True`` and a GPU is
+///         used, progress stays at 0 until the GPU finishes (no per-row updates).
+///     use_gpu: If ``True``, attempt to accelerate computation on a GPU
+///         (autodetect). RF is exact on GPU; WRF/KF run in f32 (~1e-5 relative
+///         precision). Falls back to CPU silently when no suitable GPU is found
+///         or the problem is below the minimum size threshold. Defaults to
+///         ``False`` (CPU, full f64 precision).
 ///
 /// Returns:
 ///     (tree_names, rf_matrix_bytes) — rf_matrix_bytes is flat u32 bytes (row-major n×n).
@@ -114,7 +120,8 @@ fn validate_iter_args(
 /// Raises:
 ///     ValueError: If fewer than 2 trees, leaf sets differ, or argument lengths mismatch.
 #[pyfunction]
-#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false, progress=None))]
+#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false, progress=None, use_gpu=false))]
 fn pairwise_rf_from_newick_iter(
     py: Python<'_>,
     names: Vec<String>,
@@ -123,6 +130,7 @@ fn pairwise_rf_from_newick_iter(
     map_indices: Vec<usize>,
     rooted: bool,
     progress: Option<Py<ProgressCounter>>,
+    use_gpu: bool,
 ) -> PyResult<(Vec<String>, Py<PyAny>)> {
     validate_iter_args(&names, &map_indices, &translate_maps)?;
 
@@ -135,7 +143,7 @@ fn pairwise_rf_from_newick_iter(
 
     let n = snaps.snapshots.len();
     let rf_matrix = with_counter(py, progress, n_pairs(n), |counter| {
-        snaps.pairwise_rf(Some(counter))
+        crate::distances::dispatch_rf(&snaps, Some(counter), use_gpu)
     })?;
     let rf_bytes: Vec<u8> = rf_matrix
         .chunks(n)
@@ -206,7 +214,8 @@ fn pairwise_rf_from_newick_iter(
 /// Raises:
 ///     ValueError: If fewer than 2 trees, leaf sets differ, or argument lengths mismatch.
 #[pyfunction]
-#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false, progress=None))]
+#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false, progress=None, use_gpu=false))]
 fn pairwise_rf_with_snapshots_from_newick_iter(
     py: Python<'_>,
     names: Vec<String>,
@@ -215,6 +224,7 @@ fn pairwise_rf_with_snapshots_from_newick_iter(
     map_indices: Vec<usize>,
     rooted: bool,
     progress: Option<Py<ProgressCounter>>,
+    use_gpu: bool,
 ) -> PyResult<PyRfSnapshotResult> {
     validate_iter_args(&names, &map_indices, &translate_maps)?;
 
@@ -223,7 +233,7 @@ fn pairwise_rf_with_snapshots_from_newick_iter(
 
     let n = snaps.snapshots.len();
     let rf_matrix = with_counter(py, progress, n_pairs(n), |counter| {
-        snaps.pairwise_rf(Some(counter))
+        crate::distances::dispatch_rf(&snaps, Some(counter), use_gpu)
     })?;
     let rf_bytes: Vec<u8> = rf_matrix
         .chunks(n)
@@ -286,7 +296,8 @@ fn pairwise_rf_with_snapshots_from_newick_iter(
 /// Raises:
 ///     ValueError: If fewer than 2 trees, leaf sets differ, or argument lengths mismatch.
 #[pyfunction]
-#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false, progress=None))]
+#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false, progress=None, use_gpu=false))]
 fn pairwise_wrf_with_snapshots_from_newick_iter(
     py: Python<'_>,
     names: Vec<String>,
@@ -295,6 +306,7 @@ fn pairwise_wrf_with_snapshots_from_newick_iter(
     map_indices: Vec<usize>,
     rooted: bool,
     progress: Option<Py<ProgressCounter>>,
+    use_gpu: bool,
 ) -> PyResult<PyRfSnapshotResult> {
     validate_iter_args(&names, &map_indices, &translate_maps)?;
 
@@ -303,7 +315,7 @@ fn pairwise_wrf_with_snapshots_from_newick_iter(
 
     let n = snaps.snapshots.len();
     let wrf_matrix = with_counter(py, progress, n_pairs(n), |counter| {
-        snaps.pairwise_wrf(Some(counter))
+        crate::distances::dispatch_wrf(&snaps, Some(counter), use_gpu)
     })?;
     let wrf_bytes: Vec<u8> = wrf_matrix.iter().flat_map(|&v| v.to_ne_bytes()).collect();
 
@@ -350,7 +362,8 @@ fn pairwise_wrf_with_snapshots_from_newick_iter(
 /// Raises:
 ///     ValueError: If fewer than 2 trees, leaf sets differ, or argument lengths mismatch.
 #[pyfunction]
-#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false, progress=None))]
+#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false, progress=None, use_gpu=false))]
 fn pairwise_kf_with_snapshots_from_newick_iter(
     py: Python<'_>,
     names: Vec<String>,
@@ -359,6 +372,7 @@ fn pairwise_kf_with_snapshots_from_newick_iter(
     map_indices: Vec<usize>,
     rooted: bool,
     progress: Option<Py<ProgressCounter>>,
+    use_gpu: bool,
 ) -> PyResult<PyRfSnapshotResult> {
     validate_iter_args(&names, &map_indices, &translate_maps)?;
 
@@ -367,7 +381,7 @@ fn pairwise_kf_with_snapshots_from_newick_iter(
 
     let n = snaps.snapshots.len();
     let kf_matrix = with_counter(py, progress, n_pairs(n), |counter| {
-        snaps.pairwise_kf(Some(counter))
+        crate::distances::dispatch_kf(&snaps, Some(counter), use_gpu)
     })?;
     let kf_bytes: Vec<u8> = kf_matrix.iter().flat_map(|&v| v.to_ne_bytes()).collect();
 
@@ -408,7 +422,8 @@ fn pairwise_kf_with_snapshots_from_newick_iter(
 /// Raises:
 ///     ValueError: If fewer than 2 trees, leaf sets differ, or argument lengths mismatch.
 #[pyfunction]
-#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false, progress=None))]
+#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false, progress=None, use_gpu=false))]
 fn pairwise_wrf_from_newick_iter(
     py: Python<'_>,
     names: Vec<String>,
@@ -417,6 +432,7 @@ fn pairwise_wrf_from_newick_iter(
     map_indices: Vec<usize>,
     rooted: bool,
     progress: Option<Py<ProgressCounter>>,
+    use_gpu: bool,
 ) -> PyResult<(Vec<String>, Vec<f64>)> {
     validate_iter_args(&names, &map_indices, &translate_maps)?;
 
@@ -429,7 +445,7 @@ fn pairwise_wrf_from_newick_iter(
 
     let n = snaps.snapshots.len();
     let matrix = with_counter(py, progress, n_pairs(n), |counter| {
-        snaps.pairwise_wrf(Some(counter))
+        crate::distances::dispatch_wrf(&snaps, Some(counter), use_gpu)
     })?;
     Ok((names, matrix))
 }
@@ -453,7 +469,8 @@ fn pairwise_wrf_from_newick_iter(
 /// Raises:
 ///     ValueError: If fewer than 2 trees, leaf sets differ, or argument lengths mismatch.
 #[pyfunction]
-#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false, progress=None))]
+#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false, progress=None, use_gpu=false))]
 fn pairwise_kf_from_newick_iter(
     py: Python<'_>,
     names: Vec<String>,
@@ -462,6 +479,7 @@ fn pairwise_kf_from_newick_iter(
     map_indices: Vec<usize>,
     rooted: bool,
     progress: Option<Py<ProgressCounter>>,
+    use_gpu: bool,
 ) -> PyResult<(Vec<String>, Vec<f64>)> {
     validate_iter_args(&names, &map_indices, &translate_maps)?;
 
@@ -474,7 +492,7 @@ fn pairwise_kf_from_newick_iter(
 
     let n = snaps.snapshots.len();
     let matrix = with_counter(py, progress, n_pairs(n), |counter| {
-        snaps.pairwise_kf(Some(counter))
+        crate::distances::dispatch_kf(&snaps, Some(counter), use_gpu)
     })?;
     Ok((names, matrix))
 }

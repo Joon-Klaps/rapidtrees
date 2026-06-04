@@ -12,6 +12,9 @@ pub mod distances;
 pub mod io;
 pub(crate) mod snapshot;
 
+#[cfg(any(all(feature = "gpu", feature = "python"), all(feature = "gpu", test)))]
+pub(crate) mod gpu;
+
 #[cfg(feature = "python")]
 pub mod api;
 #[cfg(feature = "python")]
