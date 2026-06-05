@@ -27,7 +27,21 @@ const MAX_GPU_BYTES: u64 = 1 << 30;
 static GPU: OnceLock<Option<GpuContext>> = OnceLock::new();
 
 fn get_gpu() -> Option<&'static GpuContext> {
-    GPU.get_or_init(GpuContext::try_new).as_ref()
+    // The OnceLock guarantees this runs at most once, so the fallback warning is
+    // emitted only on the first request and never repeats. Reached only when the
+    // caller actually requested the GPU and the problem cleared GPU_THRESHOLD.
+    GPU.get_or_init(|| {
+        let ctx = GpuContext::try_new();
+        if ctx.is_none() {
+            eprintln!(
+                "rapidtrees: GPU requested but no compatible GPU adapter was found; \
+                 falling back to the CPU. On Linux this usually means the Vulkan \
+                 loader/ICD is missing (wgpu has no CUDA backend)."
+            );
+        }
+        ctx
+    })
+    .as_ref()
 }
 
 // ── GpuContext ────────────────────────────────────────────────────────────────
