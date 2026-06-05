@@ -8,6 +8,11 @@ This project uses release names based on random words from [codenamegenerator.co
     - PREFIX: Microsoft Corperation
     - DICTIONARY: Snakes
 
+## [0.7.1] - Unreleased
+
+- **Memory (snapshot construction):** `Snapshots::from_newick_iter` now interns bipartitions incrementally, parsing trees in bounded parallel chunks (~256 MiB of raw bitsets at a time) and folding each chunk into the split-ID table before the next is parsed. Previously every tree's raw, un-deduplicated `Vec<Bitset>` was held in memory at once, so peak construction memory could be ~15× the deduplicated result (e.g. 4.4 GB peak for a 287 MB result at 2000 taxa × 5000 trees) and OOM-killed large runs. Split IDs are still assigned in tree-index order, so results are byte-identical. No Python API change.
+- **CI:** `setup-pixi` steps now pass `cache: true` across all jobs (~60–90 s saved per run) and pin the pixi version for reproducibility. The Python-test and coverage jobs run an explicit `pixi run develop` before tests and invoke pytest through the env interpreter directly, so the extension is always built from current source even on a cache hit (prevents stale-`.so` failures). Redundant `cargo build` steps removed from the Rust-test job.
+
 ## [0.7.0] - Unreleased
 - **Speed (RF/WRF/KF):** All three pairwise metrics now run on a dense, contiguous-row backend instead of the per-pair sorted-merge, sharing one parallel upper-triangle driver.
   - **RF** is reformulated as `RF(i,j) = aᵢ + aⱼ − 2·G[i][j]`, where the shared-split count `G` is `popcount(Pᵢ & Pⱼ)` over packed `u64` bit-rows. Splits present in every tree (the "universal" columns, which always include the pendant edges) cancel exactly in RF and are dropped before packing, shrinking the rows. Results are byte-identical to the old merge. On posterior-like samples (many near-identical trees) this is ~15× faster.

@@ -30,8 +30,9 @@ jobs:
             - name: Setup pixi (provides libpython for the embedded tests)
               uses: prefix-dev/setup-pixi@v0
               with:
-                  pixi-version: latest
+                  pixi-version: v0.67.2
                   locked: true
+                  cache: true
 
             - name: Generate Rust coverage
               env:
@@ -69,11 +70,15 @@ jobs:
             - name: Setup pixi
               uses: prefix-dev/setup-pixi@v0
               with:
-                  pixi-version: latest
+                  pixi-version: v0.67.2
                   locked: true
+                  cache: true
+
+            - name: Build extension
+              run: pixi run develop
 
             - name: Run Python tests with coverage
-              run: pixi run test-python-cov
+              run: .pixi/envs/default/bin/python -m pytest tests/test_python_api.py -v --cov=rapidtrees --cov-report=xml:python-coverage.xml
 
             - name: Upload Python coverage to Codecov
               uses: codecov/codecov-action@v5
