@@ -19,8 +19,18 @@ use crate::snapshot::Snapshots;
 /// Minimum number of trees to justify the GPU transfer overhead.
 pub(crate) const GPU_THRESHOLD: usize = 64;
 
-/// Upper bound on total GPU buffer allocation (1 GiB); above this we fall back to CPU.
-const MAX_GPU_BYTES: u64 = 1 << 30;
+/// Conservative upper bound on the work of a *single* pairwise dispatch, in
+/// `n² × inner` units (`inner` = packed words for RF, split count for WRF/KF).
+///
+/// The whole n×n matrix is computed in one `queue.submit`. On a headless compute
+/// GPU a single dispatch that runs too long trips the driver watchdog, which loses
+/// the device — and wgpu *panics* on submit to a lost device, so it can't be caught
+/// and recovered. Above this bound we fall back to the CPU (always correct, just
+/// slower). Empirical: RF at 5000²×378 ≈ 9.5e9 completes in ~2.9 s on a Tesla P100
+/// and is safe; the WRF dense path at 5000²×2400 ≈ 6e10 loses the device. The bound
+/// sits above the proven-safe point with margin. A future chunked/banded dispatch
+/// (bounded rows per submit) would remove this cap entirely.
+const MAX_GPU_DISPATCH_WORK: u64 = 1.5e10 as u64;
 
 // ── Global lazy device ────────────────────────────────────────────────────────
 
@@ -44,6 +54,17 @@ fn get_gpu() -> Option<&'static GpuContext> {
     .as_ref()
 }
 
+/// Human-readable label for the active GPU adapter (e.g. `Tesla P100-SXM2-16GB
+/// (Vulkan, DiscreteGpu)`), or `None` if no compatible GPU is available.
+///
+/// Forces the lazy GPU context to initialise, so the first call performs adapter
+/// selection (and emits the same one-time diagnostics as a real distance call).
+/// Used by callers that want to confirm up front whether the GPU will actually be
+/// used instead of inferring it from timings.
+pub(crate) fn adapter_label() -> Option<String> {
+    get_gpu().map(|ctx| ctx.label.clone())
+}
+
 // ── GpuContext ────────────────────────────────────────────────────────────────
 
 pub(crate) struct GpuContext {
@@ -52,6 +73,11 @@ pub(crate) struct GpuContext {
     rf_pipeline: wgpu::ComputePipeline,
     wrf_pipeline: wgpu::ComputePipeline,
     kf_pipeline: wgpu::ComputePipeline,
+    /// Human-readable adapter description, e.g. `Tesla P100-SXM2-16GB (Vulkan, DiscreteGpu)`.
+    label: String,
+    /// Device limits granted at creation — used to reject buffers that would
+    /// exceed `max_storage_buffer_binding_size` / `max_buffer_size` before dispatch.
+    limits: wgpu::Limits,
 }
 
 impl GpuContext {
@@ -99,12 +125,19 @@ impl GpuContext {
             return None;
         }
 
+        // `downlevel_defaults()` caps `max_storage_buffer_binding_size` at 128 MiB.
+        // Our packed-row and n×n output buffers blow past that on large inputs, which
+        // wgpu rejects with a validation error mid-dispatch — and the readback then
+        // hands back a garbage (all-zero) matrix that looks like a successful GPU run.
+        // Request the adapter's real limits instead so large buffers are allowed where
+        // the hardware supports them (NVIDIA Vulkan reports multi-GiB binding sizes);
+        // we still guard every buffer against these limits before dispatch below.
         let (device, queue) = match adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: None,
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::downlevel_defaults(),
+                    required_limits: adapter.limits(),
                     ..Default::default()
                 },
                 None,
@@ -138,12 +171,15 @@ impl GpuContext {
         let wrf_pipeline = make_pipeline(&device, include_str!("../shaders/wrf.wgsl"), "wrf");
         let kf_pipeline = make_pipeline(&device, include_str!("../shaders/kf.wgsl"), "kf");
 
+        let limits = device.limits();
         Some(Self {
             device,
             queue,
             rf_pipeline,
             wrf_pipeline,
             kf_pipeline,
+            label: format!("{} ({:?}, {:?})", info.name, info.backend, info.device_type),
+            limits,
         })
     }
 }
@@ -179,20 +215,22 @@ pub(crate) fn try_pairwise_rf(snaps: &Snapshots) -> Option<Vec<usize>> {
 
     // Re-pack into u32 words for WGSL (the CPU path uses u64 words instead).
     let (bit_slot, kept_count, everywhere) = split_bit_layout(snaps);
-    if kept_count + everywhere == 0 {
+    let words_u32 = kept_count.div_ceil(32);
+    if words_u32 == 0 {
+        // No non-universal splits remain — e.g. every tree is identical, so all
+        // splits are universal. Universal splits cancel in RF, so every pairwise
+        // distance is 0. Returning here also avoids handing wgpu a zero-length
+        // storage buffer, which it rejects as a validation error.
         return Some(vec![0usize; n * n]);
     }
-    let words_u32 = kept_count.div_ceil(32);
 
     let mut packed = vec![0u32; n * words_u32];
-    if words_u32 > 0 {
-        for (row, snap) in packed.chunks_mut(words_u32).zip(&snaps.snapshots) {
-            for &id in &snap.split_ids {
-                let slot = bit_slot[id as usize];
-                if slot != u32::MAX {
-                    let slot = slot as usize;
-                    row[slot >> 5] |= 1u32 << (slot & 31);
-                }
+    for (row, snap) in packed.chunks_mut(words_u32).zip(&snaps.snapshots) {
+        for &id in &snap.split_ids {
+            let slot = bit_slot[id as usize];
+            if slot != u32::MAX {
+                let slot = slot as usize;
+                row[slot >> 5] |= 1u32 << (slot & 31);
             }
         }
     }
@@ -203,10 +241,18 @@ pub(crate) fn try_pairwise_rf(snaps: &Snapshots) -> Option<Vec<usize>> {
         .map(|snap| (snap.split_ids.len() - everywhere) as u32)
         .collect();
 
-    // Estimate buffer sizes and bail if they exceed a safe limit.
+    // `packed` and the n×n output are each bound as a single storage buffer, so each
+    // must satisfy the device's per-binding limit; otherwise the dispatch fails
+    // validation and returns garbage. Fall back to the CPU when either won't fit.
     let packed_bytes = (n * words_u32 * 4) as u64;
     let output_bytes = (n * n * 4) as u64;
-    if packed_bytes + output_bytes > MAX_GPU_BYTES {
+    if !ctx.storage_binding_fits(packed_bytes) || !ctx.storage_binding_fits(output_bytes) {
+        return None;
+    }
+
+    // Guard against a single dispatch large enough to trip the GPU watchdog (which
+    // would lose the device and panic on submit). Fall back to the CPU instead.
+    if (n as u64) * (n as u64) * (words_u32 as u64) > MAX_GPU_DISPATCH_WORK {
         return None;
     }
 
@@ -240,8 +286,17 @@ fn try_pairwise_length_metric(
         return Some(vec![0.0f64; n * n]);
     }
 
-    let total_bytes = (n * n_splits * 4 + n * n * 4) as u64;
-    if total_bytes > MAX_GPU_BYTES {
+    // The dense length rows and the n×n output are each a single storage binding;
+    // each must fit the device limit or the dispatch fails. Fall back to CPU if not.
+    let rows_bytes = (n * n_splits * 4) as u64;
+    let output_bytes = (n * n * 4) as u64;
+    if !ctx.storage_binding_fits(rows_bytes) || !ctx.storage_binding_fits(output_bytes) {
+        return None;
+    }
+
+    // The dense path is O(n² × n_splits) in one dispatch — far heavier than RF — and
+    // is what loses the device on large cells. Fall back to the CPU above the guard.
+    if (n as u64) * (n as u64) * (n_splits as u64) > MAX_GPU_DISPATCH_WORK {
         return None;
     }
 
@@ -253,9 +308,24 @@ fn try_pairwise_length_metric(
 // ── GpuContext compute helpers ────────────────────────────────────────────────
 
 impl GpuContext {
+    /// Whether a single storage buffer of `bytes` can be bound on this device.
+    /// A buffer beyond `max_storage_buffer_binding_size` (or `max_buffer_size`)
+    /// fails validation at bind-group creation, so the caller falls back to the CPU.
+    fn storage_binding_fits(&self, bytes: u64) -> bool {
+        bytes <= self.limits.max_storage_buffer_binding_size as u64
+            && bytes <= self.limits.max_buffer_size
+    }
+
     fn run_rf(&self, packed: &[u32], kept: &[u32], n: usize, words: usize) -> Option<Vec<usize>> {
         let params: [u32; 4] = [n as u32, words as u32, 0, 0];
 
+        // Capture any validation error (bind-group/dispatch) raised below instead of
+        // only logging it via on_uncaptured_error. A captured error means the readback
+        // would be garbage, so we return None and let the caller fall back to the CPU.
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+
+        // `packed` is never empty here: try_pairwise_rf returns early when
+        // words_u32 == 0, so this buffer always has at least one u32.
         let packed_buf = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -331,6 +401,11 @@ impl GpuContext {
         encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, output_size);
         self.queue.submit(std::iter::once(encoder.finish()));
 
+        // If anything in the scope failed validation, the matrix is unreliable.
+        if pollster::block_on(self.device.pop_error_scope()).is_some() {
+            return None;
+        }
+
         let bytes = readback_bytes(&self.device, &staging_buf, n * n * 4)?;
         Some(
             bytes
@@ -349,6 +424,12 @@ impl GpuContext {
     ) -> Option<Vec<f32>> {
         let params: [u32; 4] = [n as u32, n_splits as u32, 0, 0];
 
+        // See run_rf: capture validation errors so a failed dispatch falls back to the
+        // CPU instead of returning a garbage matrix.
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+
+        // `rows` is never empty here: try_pairwise_length_metric returns early when
+        // n_splits == 0, so this buffer always holds n × n_splits f32 values.
         let rows_buf = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -412,6 +493,11 @@ impl GpuContext {
         }
         encoder.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, output_size);
         self.queue.submit(std::iter::once(encoder.finish()));
+
+        // If anything in the scope failed validation, the matrix is unreliable.
+        if pollster::block_on(self.device.pop_error_scope()).is_some() {
+            return None;
+        }
 
         let bytes = readback_bytes(&self.device, &staging_buf, n * n * 4)?;
         Some(

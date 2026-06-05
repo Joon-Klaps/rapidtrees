@@ -16,6 +16,7 @@ struct BenchArgs {
     max_taxa: usize,
     max_trees: usize,
     iters: usize,
+    swaps: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -58,12 +59,18 @@ impl BenchArgs {
             .filter(|&i| i > 0)
             .unwrap_or(5);
 
+        // Per-tree topology perturbations. 0 = every tree identical (degenerate:
+        // all splits universal, RF kernel does no work). A few swaps give a
+        // posterior-like set with real bipartition variation.
+        let swaps = get("--swaps").and_then(|s| s.parse().ok()).unwrap_or(3);
+
         BenchArgs {
             use_gpu,
             metric,
             max_taxa,
             max_trees,
             iters,
+            swaps,
         }
     }
 }
@@ -72,25 +79,63 @@ impl BenchArgs {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn generate_balanced_newick(start_index: usize, num_leaves: usize) -> String {
-    if num_leaves == 1 {
-        return format!("leaf_{}", start_index);
+/// Build a balanced Newick tree whose leaves carry the labels in `order`:
+/// position `i` of the balanced shape gets label `leaf_{order[i]}`.
+///
+/// All trees built from permutations of the same `order` share one leaf set
+/// (`leaf_0..leaf_{n-1}`) but differ topologically, so a collection of them has
+/// real bipartition variation — unlike `t` clones of a single tree, where every
+/// split is universal and the RF kernel does zero work.
+fn build_balanced_newick(order: &[usize]) -> String {
+    fn recurse(order: &[usize]) -> String {
+        if order.len() == 1 {
+            return format!("leaf_{}", order[0]);
+        }
+        let mid = order.len() / 2;
+        let left = recurse(&order[..mid]);
+        let right = recurse(&order[mid..]);
+        // Branch length keyed on the leading label so WRF/KF rows are non-trivial.
+        let idx = order[0] % 97;
+        format!(
+            "({}:{:.4},{}:{:.4})",
+            left,
+            0.1 + idx as f64 * 0.05,
+            right,
+            0.1 + idx as f64 * 0.03
+        )
     }
-    let left_count = num_leaves / 2;
-    let right_count = num_leaves - left_count;
+    format!("{};", recurse(order))
+}
 
-    let left = generate_balanced_newick(start_index, left_count);
-    let right = generate_balanced_newick(start_index + left_count, right_count);
-
-    // Use varied branch lengths so WRF/KF benchmarks are representative.
-    let idx = start_index % 97;
-    format!(
-        "({}:{:.4},{}:{:.4})",
-        left,
-        0.1 + idx as f64 * 0.05,
-        right,
-        0.1 + idx as f64 * 0.03
-    )
+/// Deterministic small perturbation of `base`: apply `n_swaps` random leaf-position
+/// swaps, seeded by `tree_idx` for reproducibility.
+///
+/// Each swap moves only the `O(log n)` bipartitions on the path between the two
+/// leaves, so a few swaps yield a posterior-like set — mostly shared splits with a
+/// handful unique per tree, the regime rapidtrees targets. `n_swaps == 0` reproduces
+/// the old behaviour (every tree identical). Uses a tiny inline LCG to stay
+/// dependency-free and reproducible.
+fn perturbed_order(base: &[usize], tree_idx: usize, n_swaps: usize) -> Vec<usize> {
+    let mut order = base.to_vec();
+    let n = order.len();
+    if n < 2 {
+        return order;
+    }
+    let mut state = (tree_idx as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(1);
+    let mut next = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) as usize
+    };
+    for _ in 0..n_swaps {
+        let a = next() % n;
+        let b = next() % n;
+        order.swap(a, b);
+    }
+    order
 }
 
 fn format_duration(d: Duration) -> String {
@@ -306,8 +351,8 @@ fn main() {
         args.iters
     );
     println!(
-        "Max taxa: {} | Max trees: {}",
-        args.max_taxa, args.max_trees
+        "Max taxa: {} | Max trees: {} | Swaps/tree: {}",
+        args.max_taxa, args.max_trees, args.swaps
     );
     println!(
         "Wall/CPU columns report the median over {} runs (±relative spread).",
@@ -315,6 +360,15 @@ fn main() {
     );
     if args.use_gpu {
         println!("Note: GPU falls back to CPU if no adapter found or n < 64.");
+        // Self-report whether the GPU actually engages, so the .out file is
+        // self-diagnosing instead of leaving us to infer it from timings.
+        #[cfg(feature = "gpu")]
+        match rapidtrees::gpu_adapter_label() {
+            Some(label) => println!("GPU CONFIRMED: {label}"),
+            None => println!("GPU NOT USED — no compatible adapter found; running on CPU"),
+        }
+        #[cfg(not(feature = "gpu"))]
+        println!("GPU NOT USED — binary built without the `gpu` feature; running on CPU");
     }
     println!();
 
@@ -339,12 +393,15 @@ fn main() {
 
     const RAM_LIMIT: usize = 30 * 1024 * 1024 * 1024;
     const VRAM_LIMIT: usize = 16 * 1024 * 1024 * 1024; // 16 GB (conservative for P100/A100)
-    const TIME_LIMIT: Duration = Duration::from_secs(60 * 60);
+    const TIME_LIMIT: Duration = Duration::from_secs(1); // 1 s
     const BAR_WIDTH: usize = 10;
     const MAX_COMPARISONS: u64 = 200_000_000_000;
 
     for &n in &taxa_counts {
-        let newick = format!("{};", generate_balanced_newick(0, n));
+        // Base leaf order shared by every tree of this taxa count; each tree is a
+        // perturbation of it, so the set has real (posterior-like) split variation.
+        let base_order: Vec<usize> = (0..n).collect();
+        let mk = |i: usize| build_balanced_newick(&perturbed_order(&base_order, i, args.swaps));
 
         for &t in &tree_counts {
             let total_comparisons = (t as u64) * (t as u64) / 2;
@@ -352,7 +409,7 @@ fn main() {
 
             // --- size estimate from a small sample ---
             let subset_size = t.min(100);
-            let subset_newicks: Vec<String> = (0..subset_size).map(|_| newick.clone()).collect();
+            let subset_newicks: Vec<String> = (0..subset_size).map(&mk).collect();
             let Some(sample) = from_newicks_or_skip(&subset_newicks, false, "size-sample") else {
                 continue;
             };
@@ -387,7 +444,7 @@ fn main() {
             }
 
             // --- build full snapshot, sampling peak RSS during the build ---
-            let full_newicks: Vec<String> = (0..t).map(|_| newick.clone()).collect();
+            let full_newicks: Vec<String> = (0..t).map(&mk).collect();
 
             let (full_snaps_opt, actual_ram) =
                 with_peak_rss(|| from_newicks_or_skip(&full_newicks, false, "full-parse"));
@@ -417,7 +474,7 @@ fn main() {
             // --- benchmark on a capped subset ---
             let max_subset = (MAX_COMPARISONS as f64).sqrt() as usize;
             let bench_size = t.min(max_subset);
-            let bench_newicks: Vec<String> = (0..bench_size).map(|_| newick.clone()).collect();
+            let bench_newicks: Vec<String> = (0..bench_size).map(&mk).collect();
             let bench_snaps =
                 from_newicks_or_skip(&bench_newicks, false, "bench").expect("bench parse failed");
 
