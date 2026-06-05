@@ -65,20 +65,41 @@ impl GpuContext {
             ..Default::default()
         });
 
-        let adapter = instance
+        let adapter = match instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 force_fallback_adapter: false,
                 compatible_surface: None,
             })
-            .await?;
+            .await
+        {
+            Some(adapter) => adapter,
+            None => {
+                // List what wgpu *did* enumerate so a failure here distinguishes
+                // "no Vulkan device at all" from "device present but not selectable".
+                for info in instance.enumerate_adapters(wgpu::Backends::all()) {
+                    let info = info.get_info();
+                    eprintln!(
+                        "rapidtrees: wgpu saw adapter {} ({:?} backend, {:?}) but none was selected",
+                        info.name, info.backend, info.device_type
+                    );
+                }
+                return None;
+            }
+        };
 
+        let info = adapter.get_info();
         // Reject software/CPU adapters — they're slower than the native CPU path.
-        if adapter.get_info().device_type == wgpu::DeviceType::Cpu {
+        if info.device_type == wgpu::DeviceType::Cpu {
+            eprintln!(
+                "rapidtrees: only a software adapter ({}, {:?} backend) was found; \
+                 using the CPU path instead",
+                info.name, info.backend
+            );
             return None;
         }
 
-        let (device, queue) = adapter
+        let (device, queue) = match adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: None,
@@ -89,7 +110,29 @@ impl GpuContext {
                 None,
             )
             .await
-            .ok()?;
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!(
+                    "rapidtrees: GPU adapter {} found but request_device failed: {e}",
+                    info.name
+                );
+                return None;
+            }
+        };
+
+        // wgpu routes device errors (validation, device-lost, out-of-memory) to this
+        // handler, which by default logs via the `log` crate. Callers that install no
+        // logger would never see them, so the compute/readback would fail silently and
+        // fall back to the CPU with no explanation. Print straight to stderr instead.
+        device.on_uncaptured_error(Box::new(|err| {
+            eprintln!("rapidtrees: wgpu device error: {err}");
+        }));
+
+        eprintln!(
+            "rapidtrees: GPU active — {} ({:?} backend, {:?})",
+            info.name, info.backend, info.device_type
+        );
 
         let rf_pipeline = make_pipeline(&device, include_str!("../shaders/rf.wgsl"), "rf");
         let wrf_pipeline = make_pipeline(&device, include_str!("../shaders/wrf.wgsl"), "wrf");
