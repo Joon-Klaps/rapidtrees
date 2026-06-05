@@ -30,8 +30,9 @@ jobs:
             - name: Setup pixi (provides libpython for the embedded tests)
               uses: prefix-dev/setup-pixi@v0
               with:
-                  pixi-version: latest
+                  pixi-version: v0.67.2
                   locked: true
+                  cache: true
 
             - name: Generate Rust coverage
               env:
@@ -69,8 +70,9 @@ jobs:
             - name: Setup pixi
               uses: prefix-dev/setup-pixi@v0
               with:
-                  pixi-version: latest
+                  pixi-version: v0.67.2
                   locked: true
+                  cache: true
 
             - name: Run Python tests with coverage
               run: pixi run test-python-cov

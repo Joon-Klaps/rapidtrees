@@ -443,10 +443,7 @@ impl Snapshots {
 
         // Parse the first tree to establish the reference leaf set.
         let (first_newick, first_translate) = entries[0];
-        let first_clean = crate::io::strip_beast_annotations(first_newick);
-        let mut first_tree = PhyloTree::from_newick(&first_clean)
-            .map_err(|e| format!("Failed to parse newick at index 0: {e}"))?;
-        crate::io::rename_leaf_nodes(&mut first_tree, first_translate);
+        let first_tree = parse_and_rename(first_newick, first_translate, 0)?;
 
         //sanity check: ensure all leaf names are unique within the first tree
         let first_leaves = first_tree.get_leaves();
@@ -468,37 +465,54 @@ impl Snapshots {
             .map_err(|e| format!("Failed to snapshot tree at index 0: {e}"))?;
         drop(first_tree);
 
-        // Parse all remaining trees in parallel, validating leaf sets.
-        let rest: Vec<Snapshot> = entries[1..]
-            .par_iter()
-            .enumerate()
-            .map(|(j, &(newick, translate))| {
-                let i = j + 1;
-                let clean = crate::io::strip_beast_annotations(newick);
-                let mut tree = PhyloTree::from_newick(&clean)
-                    .map_err(|e| format!("Failed to parse newick at index {i}: {e}"))?;
-                crate::io::rename_leaf_nodes(&mut tree, translate);
+        // Bound how many raw snapshots are alive at once. Holding every tree's
+        // un-interned `Vec<Bitset>` simultaneously is the dominant memory cost at
+        // construction — it can dwarf the deduplicated result and OOM the process.
+        // Estimate one snapshot's raw bytes from the first tree (all trees share
+        // the leaf set, so this is representative), parse the rest in chunks sized
+        // to ~`CHUNK_TARGET_BYTES`, and fold each chunk into the interner — freeing
+        // its bitsets — before parsing the next.
+        const CHUNK_TARGET_BYTES: usize = 256 * 1024 * 1024;
+        let per_snap_bytes = first_snap.parts.len().max(1) * first_snap.words.max(1) * 8;
+        let chunk = (CHUNK_TARGET_BYTES / per_snap_bytes.max(1)).clamp(1, 4096);
 
-                let leaves: HashSet<String> = tree
-                    .get_leaves()
-                    .iter()
-                    .filter_map(|&id| tree.get(&id).ok()?.name.clone())
-                    .collect();
-                if leaves != reference_leaves {
-                    return Err(format!(
-                        "Tree {i} has a different leaf set than tree 0. All trees must share the same taxa."
-                    ));
-                }
-                Snapshot::from_tree(&tree, rooted)
-                    .map_err(|e| format!("Failed to snapshot tree at index {i}: {e}"))
-            })
-            .collect::<Result<_, _>>()?;
+        let mut interner = Interner::new(entries.len(), first_snap.words, store_lengths);
+        interner.push(first_snap);
 
-        let mut snaps = Vec::with_capacity(entries.len());
-        snaps.push(first_snap);
-        snaps.extend(rest);
+        let mut base = 1usize; // tree 0 is already interned
+        for chunk_entries in entries[1..].chunks(chunk) {
+            // Parse this chunk in parallel, validating leaf sets.
+            let raw: Vec<Snapshot> = chunk_entries
+                .par_iter()
+                .enumerate()
+                .map(|(k, &(newick, translate))| {
+                    let i = base + k;
+                    let tree = parse_and_rename(newick, translate, i)?;
 
-        Ok(Self::intern(snaps, sorted_leaf_names, store_lengths))
+                    let leaves: HashSet<String> = tree
+                        .get_leaves()
+                        .iter()
+                        .filter_map(|&id| tree.get(&id).ok()?.name.clone())
+                        .collect();
+                    if leaves != reference_leaves {
+                        return Err(format!(
+                            "Tree {i} has a different leaf set than tree 0. All trees must share the same taxa."
+                        ));
+                    }
+                    Snapshot::from_tree(&tree, rooted)
+                        .map_err(|e| format!("Failed to snapshot tree at index {i}: {e}"))
+                })
+                .collect::<Result<_, _>>()?;
+
+            // Sequential fold: each raw snapshot's bitsets are freed right after
+            // it is interned, so peak stays near the deduplicated footprint.
+            for snap in raw {
+                interner.push(snap);
+            }
+            base += chunk_entries.len();
+        }
+
+        Ok(interner.finish(sorted_leaf_names))
     }
 
     /// Build a `Snapshots` collection from a slice of plain Newick strings.
@@ -685,65 +699,113 @@ impl Snapshots {
         crate::distances::pairwise_kf_dense(self, progress)
     }
 
-    /// Build the interning table from a `Vec<Snapshot>` (internal helper).
-    ///
-    /// Deduplicates bipartitions into split IDs using a `HashTable<u32>` that
-    /// stores only the integer IDs — each unique bitset is kept exactly once, in
-    /// `bipartitions`. When `store_lengths` is `false`, branch lengths are dropped
-    /// (RF-only paths never read them).
-    fn intern(snaps: Vec<Snapshot>, leaf_names: Vec<String>, store_lengths: bool) -> Self {
-        let words = snaps.first().map(|s| s.words).unwrap_or(0);
-        let hasher = FxBuildHasher;
-        let mut table: HashTable<u32> = HashTable::new();
-        let mut bipartitions: Vec<Bitset> = Vec::new();
-
-        let interned: Vec<InternSnap> = snaps
-            .into_iter()
-            .map(|snap| {
-                let mut paired: Vec<(u32, f64)> = snap
-                    .parts
-                    .into_iter()
-                    .zip(snap.lengths)
-                    .map(|(b, length)| {
-                        let hash = hasher.hash_one(&b);
-                        // Check if this bipartition already has an assigned ID.
-                        let id = match table.find(hash, |&id| bipartitions[id as usize] == b) {
-                            Some(&id) => id,
-                            None => {
-                                let new_id = bipartitions.len() as u32;
-                                bipartitions.push(b);
-                                // register the new ID in the hash table
-                                table.insert_unique(hash, new_id, |&id| {
-                                    hasher.hash_one(&bipartitions[id as usize])
-                                });
-                                new_id
-                            }
-                        };
-                        (id, length)
-                    })
-                    .collect();
-
-                paired.sort_unstable_by_key(|&(id, _)| id);
-                let (split_ids, lengths): (Vec<u32>, Vec<f64>) = paired.into_iter().unzip();
-                let lengths = if store_lengths { lengths } else { Vec::new() };
-                InternSnap { split_ids, lengths }
-            })
-            .collect();
-
-        Self {
-            snapshots: interned,
-            bipartitions,
-            words_per_bitset: words,
-            leaf_names,
-        }
-    }
-
     fn empty() -> Self {
         Self {
             snapshots: Vec::new(),
             bipartitions: Vec::new(),
             words_per_bitset: 0,
             leaf_names: Vec::new(),
+        }
+    }
+}
+
+/// Strip BEAST annotations, parse the Newick, and apply taxon renaming.
+///
+/// `index` only feeds the parse-error message so it points at the offending tree.
+fn parse_and_rename(
+    newick: &str,
+    translate: &HashMap<String, String>,
+    index: usize,
+) -> Result<PhyloTree, String> {
+    let clean = crate::io::strip_beast_annotations(newick);
+    let mut tree = PhyloTree::from_newick(&clean)
+        .map_err(|e| format!("Failed to parse newick at index {index}: {e}"))?;
+    crate::io::rename_leaf_nodes(&mut tree, translate);
+    Ok(tree)
+}
+
+/// Incremental bipartition interner.
+///
+/// Deduplicates bipartitions into split IDs using a `HashTable<u32>` that stores
+/// only the integer IDs — each unique bitset is kept exactly once, in
+/// `bipartitions`. Snapshots are folded in one at a time via [`Interner::push`],
+/// which consumes each raw `Snapshot` so its `Vec<Bitset>` is freed immediately.
+/// This keeps construction peak memory near the deduplicated footprint instead
+/// of holding every tree's raw bitsets at once.
+///
+/// IDs are assigned in first-seen order, so feeding snapshots in tree-index
+/// order yields exactly the same `bipartitions` ordering and `split_ids` as
+/// interning the whole `Vec<Snapshot>` at once.
+struct Interner {
+    hasher: FxBuildHasher,
+    table: HashTable<u32>,
+    bipartitions: Vec<Bitset>,
+    snapshots: Vec<InternSnap>,
+    words: usize,
+    store_lengths: bool,
+}
+
+impl Interner {
+    fn new(n_trees: usize, words: usize, store_lengths: bool) -> Self {
+        Self {
+            hasher: FxBuildHasher,
+            table: HashTable::new(),
+            bipartitions: Vec::new(),
+            snapshots: Vec::with_capacity(n_trees),
+            words,
+            store_lengths,
+        }
+    }
+
+    /// Intern one raw snapshot, consuming its bitsets. When `store_lengths` is
+    /// `false`, branch lengths are dropped (RF-only paths never read them).
+    fn push(&mut self, snap: Snapshot) {
+        // Bind disjoint fields to locals so the closures below can borrow the
+        // table mutably while reading `bipartitions`/`hasher`.
+        let hasher = &self.hasher;
+        let table = &mut self.table;
+        let bipartitions = &mut self.bipartitions;
+
+        let mut paired: Vec<(u32, f64)> = snap
+            .parts
+            .into_iter()
+            .zip(snap.lengths)
+            .map(|(b, length)| {
+                let hash = hasher.hash_one(&b);
+                // Check if this bipartition already has an assigned ID.
+                let id = match table.find(hash, |&id| bipartitions[id as usize] == b) {
+                    Some(&id) => id,
+                    None => {
+                        let new_id = bipartitions.len() as u32;
+                        bipartitions.push(b);
+                        // register the new ID in the hash table
+                        table.insert_unique(hash, new_id, |&id| {
+                            hasher.hash_one(&bipartitions[id as usize])
+                        });
+                        new_id
+                    }
+                };
+                (id, length)
+            })
+            .collect();
+
+        paired.sort_unstable_by_key(|&(id, _)| id);
+        // On RF-only paths (store_lengths == false) skip materialising the
+        // lengths column entirely instead of unzipping then discarding it.
+        let (split_ids, lengths): (Vec<u32>, Vec<f64>) = if self.store_lengths {
+            paired.into_iter().unzip()
+        } else {
+            (paired.into_iter().map(|(id, _)| id).collect(), Vec::new())
+        };
+        self.snapshots.push(InternSnap { split_ids, lengths });
+    }
+
+    fn finish(self, leaf_names: Vec<String>) -> Snapshots {
+        Snapshots {
+            snapshots: self.snapshots,
+            bipartitions: self.bipartitions,
+            words_per_bitset: self.words,
+            leaf_names,
         }
     }
 }
