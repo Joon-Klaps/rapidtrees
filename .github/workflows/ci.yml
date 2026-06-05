@@ -97,8 +97,5 @@ jobs:
                   environments: ${{ matrix.environment }}
                   cache: true
 
-            - name: Build extension
-              run: pixi run -e ${{ matrix.environment }} develop
-
             - name: Run Python API tests
-              run: .pixi/envs/${{ matrix.environment }}/bin/python -m pytest tests/test_python_api.py -v
+              run: pixi run -e ${{ matrix.environment }} test-python
