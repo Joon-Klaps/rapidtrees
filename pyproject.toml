@@ -37,6 +37,11 @@ module-name = "rapidtrees"
 channels = ["conda-forge"]
 platforms = ["linux-64", "osx-arm64"]
 
+[tool.pixi.target.linux-64.dependencies]
+# Vulkan loader (libvulkan.so.1) — needed at runtime so wgpu can reach the GPU
+libvulkan-loader = "*"
+vulkan-tools = "*"
+
 [tool.pixi.dependencies]
 python = ">=3.10,<3.13"
 r-phangorn = "*"
