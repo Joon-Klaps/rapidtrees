@@ -8,14 +8,25 @@
 //! - `api`: Python bindings via `pyo3` (gated behind "python" feature).
 
 pub mod bitset;
+pub mod clades;
 pub mod distances;
+pub mod ess;
+pub mod hipstr;
 pub mod io;
+pub mod layout;
+pub mod mds;
+pub(crate) mod par;
 pub(crate) mod snapshot;
+pub mod stats;
 
 #[cfg(feature = "python")]
 pub mod api;
 #[cfg(feature = "python")]
 pub(crate) mod progress;
+
+/// Browser bindings via `wasm-bindgen` (gated behind the "wasm" feature).
+#[cfg(feature = "wasm")]
+pub mod wasm;
 
 pub use bitset::Bitset;
 #[cfg(feature = "cli")]

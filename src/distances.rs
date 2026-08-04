@@ -8,8 +8,8 @@
 //! Call [`crate::snapshot::Snapshots::pairwise_rf`] etc. — these use the fast
 //! interned-integer path internally via the `pub(crate)` helpers in this module.
 
+use crate::par::*;
 use crate::snapshot::{Snapshot, Snapshots};
-use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(test)]
