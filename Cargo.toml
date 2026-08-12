@@ -35,7 +35,6 @@ python = ["pyo3"]
 extension-module = ["python", "pyo3/extension-module"]
 
 [dev-dependencies]
-itertools = "0.14.0"
 rand = "0.10.1"
 criterion = "0.8.2"
 cpu-time = "1.0.0"

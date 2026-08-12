@@ -5,6 +5,14 @@
 repos:
     - repo: local
       hooks:
+          - id: pixi-lock
+            name: pixi lock
+            description: Update pixi.lock to match pixi.toml/pyproject.toml
+            entry: pixi lock
+            language: system
+            files: ^(pixi\.toml|pyproject\.toml)$
+            pass_filenames: false
+
           - id: cargo-fmt
             name: cargo fmt
             description: Format Rust code with cargo fmt
