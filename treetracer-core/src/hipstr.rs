@@ -38,7 +38,7 @@ use std::collections::HashMap;
 
 use phylotree::tree::{NodeId, Tree as PhyloTree};
 
-use crate::io::rename_leaf_nodes;
+use rapidtrees::io::rename_leaf_nodes;
 
 /// Bonus applied to majority clades under MrHIPSTR.
 ///

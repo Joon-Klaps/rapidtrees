@@ -7,7 +7,7 @@
 //! `Snapshots`: `presence[i * n_bip + j] == 1` iff tree `i` contains
 //! bipartition `j`. Nothing here re-parses a newick.
 
-use crate::par::*;
+use rapidtrees::par::*;
 
 /// Per-run frequency of every bipartition, plus what the bipartition contains.
 pub struct CladeFrequencies {

@@ -21,7 +21,7 @@
 //! over D² reach ~10¹⁴ for 1000-taxon RF distances; in `f32` that would lose
 //! roughly seven significant digits and corrupt the centering subtraction.
 
-use crate::par::*;
+use rapidtrees::par::*;
 
 /// Result of a PCoA embedding.
 pub struct Pcoa {

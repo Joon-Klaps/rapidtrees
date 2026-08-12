@@ -1,14 +1,20 @@
 //! Browser bindings.
 //!
-//! Built with:
+//! Built from the workspace root with:
 //!
 //! ```text
-//! wasm-pack build --target web --no-default-features --features wasm
+//! wasm-pack build treetracer-core --target web
 //! ```
 //!
-//! `--no-default-features` matters twice over: it drops the CLI (and with it
-//! `flate2`), and it turns off `parallel`, so rayon is not compiled in at all.
-//! See `src/par.rs` for why that is currently necessary.
+//! No feature flags are needed any more. This crate depends on `rapidtrees`
+//! with `default-features = false`, which drops the CLI (and with it `flate2`)
+//! and turns off `parallel`, so rayon is not compiled in at all — see `par.rs`
+//! in `rapidtrees` for why that is currently necessary. Pushing that choice
+//! into the manifest means it cannot be forgotten at the command line.
+//!
+//! This is the only crate in the graph that links wasm-bindgen. Keeping it that
+//! way avoids the schema-version lockstep that multiple bindgen crates require,
+//! and lets `rapidtrees` stay a plain Rust library.
 //!
 //! # Why runs are pooled
 //!
@@ -35,10 +41,10 @@ use wasm_bindgen::prelude::*;
 use crate::clades;
 use crate::ess;
 use crate::hipstr as hipstr_mod;
-use crate::io::load_beast_subsampled_str;
 use crate::layout;
 use crate::mds;
-use crate::snapshot::Snapshots;
+use rapidtrees::Snapshots;
+use rapidtrees::io::load_beast_subsampled_str;
 
 /// Default share of each chain discarded as burnin, in percent.
 ///
@@ -507,8 +513,8 @@ impl TreeSet {
         let mut offsets: Vec<u32> = Vec::with_capacity(n_bip + 1);
         offsets.push(0);
 
-        for col in 0..n_bip {
-            let bip = &self.snaps.bipartitions[bip_of_col[col]];
+        for &bip_id in &bip_of_col {
+            let bip = &self.snaps.bipartitions[bip_id];
             let mut count = 0u32;
             for (leaf_idx, _) in leaves.iter().enumerate() {
                 if bip.get(leaf_idx) {
@@ -623,7 +629,7 @@ impl TreeSet {
 
         let mut tree = phylotree::tree::Tree::from_newick(raw.trim())
             .map_err(|e| JsError::new(&format!("Could not parse tree {index}: {e}")))?;
-        crate::io::rename_leaf_nodes(&mut tree, translate);
+        rapidtrees::io::rename_leaf_nodes(&mut tree, translate);
         tree.to_newick()
             .map_err(|e| JsError::new(&format!("Could not write tree {index}: {e}")))
     }

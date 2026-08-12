@@ -1,0 +1,30 @@
+[package]
+name = "treetracer-core"
+version = "0.1.0"
+edition = "2024"
+description = "Browser bindings and MCMC-diagnostic algorithms behind treetracer-web, built on rapidtrees"
+license = "MIT"
+repository = "https://github.com/Joon-Klaps/rapidtrees"
+publish = false
+
+[lib]
+name = "treetracer_core"
+# `cdylib` is what makes a single .wasm module; `rapidtrees` links in as an
+# rlib. This is the only crate in the graph that touches wasm-bindgen, which
+# sidesteps the schema-version lockstep that multiple bindgen crates require.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# `default-features = false` drops `cli` and `parallel`, so neither clap,
+# flate2 nor rayon reach the wasm build. With `parallel` off, `rapidtrees::par`
+# resolves to its sequential shim — see `par.rs` there.
+rapidtrees = { path = "..", default-features = false }
+# Same reason as in the parent manifest: `needletail` pulls bzip2/xz, which
+# have no wasm build.
+phylotree = { version = "0.1.3", default-features = false }
+wasm-bindgen = "0.2.126"
+# Pure-Rust linear algebra, used for the small dense eigenproblem inside PCoA.
+# Deliberately NOT `nalgebra-lapack` / `ndarray-linalg`: those bind to Fortran
+# LAPACK and do not build for wasm32 at all.
+nalgebra = { version = "0.34", default-features = false, features = ["std"] }
+statrs = "0.18"

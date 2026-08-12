@@ -64,7 +64,9 @@ py311 = ["py311"]
 py312 = ["py312"]
 
 [tool.pixi.tasks]
-test                   = { cmd = "cargo test --lib --features python && pytest tests/test_python_api.py -v", description = "Run rust & python tests" }
+test                   = { cmd = "cargo test --lib --features python && cargo test -p treetracer-core --lib && pytest tests/test_python_api.py -v", description = "Run rust & python tests" }
+test-core              = { cmd = "cargo test -p treetracer-core --lib", description = "Run the treetracer-core (browser/diagnostics) unit tests" }
+build-wasm             = { cmd = "wasm-pack build treetracer-core --target web --release", description = "Build the browser bundle into treetracer-core/pkg" }
 test-rust              = { cmd = "cargo test --lib --features python", description = "Run Rust unit tests (with the python feature so progress.rs + embedded-Python integration tests are included)", env = { PYO3_PYTHON = "$CONDA_PREFIX/bin/python", LD_LIBRARY_PATH = "$CONDA_PREFIX/lib", DYLD_LIBRARY_PATH = "$CONDA_PREFIX/lib" } }
 test-rust-cov          = { cmd = "cargo llvm-cov --lib --features python --lcov --output-path rust-lcov.info", description = "Run Rust + embedded-Python tests under llvm-cov and write rust-lcov.info", env = { PYO3_PYTHON = "$CONDA_PREFIX/bin/python", LD_LIBRARY_PATH = "$CONDA_PREFIX/lib", DYLD_LIBRARY_PATH = "$CONDA_PREFIX/lib" } }
 test-python            = { cmd = "pytest tests/test_python_api.py -v", description = "Run Python API tests" }
@@ -73,7 +75,7 @@ bench                  = { cmd = "cargo bench --bench codspeed", description = "
 big-bench              = { cmd = "cargo bench --bench memory_time_benchmark", description = "Run codspeed benchmarks" }
 develop                = { cmd = "maturin develop --uv", description = "Build and install in editable mode" }
 fmt                    = { cmd = "cargo fmt --check", description = "Check Rust formatting" }
-clippy                 = { cmd = "cargo clippy --all-targets --all-features -- -D warnings", description = "Run Clippy linter" }
+clippy                 = { cmd = "cargo clippy --workspace --all-targets --all-features -- -D warnings", description = "Run Clippy linter across both workspace members" }
 pre-commit             = { cmd = "prek run --config .pre-commit-config.yaml --all-files" }
 run-treetracer         = { cmd = "cd ../treetracer && uv sync --reinstall-package rapidtrees && uv run treetracer", description = "Rebuild rapidtrees (in treetracer's venv) and launch the desktop app against it" }
 run-treetracer-browser = { cmd = "cd ../treetracer && uv sync --reinstall-package rapidtrees && uv run treetracer --browser", description = "Rebuild rapidtrees (in treetracer's venv) and launch treetracer in a browser tab" }

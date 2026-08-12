@@ -14,15 +14,34 @@ convergence diagnostics, ESS calculations, and tanglegram visualisations.
 
 ## Architecture
 
+This is a two-member Cargo workspace. The root package is `rapidtrees` itself;
+`treetracer-core/` is the second member.
+
+**The split is by audience, not by subject.** `rapidtrees` answers one question —
+how far apart are two trees — and is consumed by Python (PyO3) and a CLI.
+`treetracer-core` is everything the *browser* needs on top of that answer, and is
+consumed only by `treetracer-web`. Nothing in `treetracer-core` is reachable from
+the Python or CLI side.
+
 ```
-src/
+Cargo.toml              — [workspace] + the rapidtrees package + [patch.crates-io]
+src/                    — rapidtrees: the distance kernel. No wasm-bindgen here.
   api.rs        — PyO3 bindings (keep minimal — logic lives in snapshot.rs / distances.rs)
   bitset.rs     — compact bitset for leaf sets; inner-most hot path
   snapshot.rs   — Snapshot / Snapshots types, canonicalisation, interning
   distances.rs  — RF, WRF, KF algorithms
   io.rs         — BEAST/NEXUS parsing, annotation stripping
+  par.rs        — rayon-or-sequential shim; `pub` so dependents share one policy
   main.rs       — CLI binary
   lib.rs        — public re-exports
+treetracer-core/src/    — browser bindings + diagnostics built on a distance matrix
+  wasm.rs       — the wasm-bindgen boundary (keep it thin, like api.rs)
+  mds.rs        — PCoA projection of the distance matrix
+  clades.rs     — clade frequencies, maximum clade credibility
+  ess.rs        — pseudo-ESS
+  hipstr.rs     — HIPSTR summary trees
+  layout.rs     — tree coordinates for drawing
+  stats.rs      — shared statistical helpers
 tests/
   test_python_api.py   — Python integration tests (includes phangorn R comparisons)
 benches/
@@ -31,6 +50,30 @@ docs/
   python-api.md          — full Python API reference
   rapidtrees-for-dummies.md
 ```
+
+### Rules that keep the split honest
+
+1. **`rapidtrees` must never depend on `wasm-bindgen`.** `treetracer-core` is the
+   only crate in the graph that links it. Multiple bindgen crates would force
+   every one of them onto an identical wasm-bindgen version.
+2. **`rapidtrees` stays wasm-*compatible*.** No Fortran-LAPACK linear algebra, no
+   C-library codec deps, and every parallel loop goes through `par.rs`. That is
+   what lets it link into a wasm build at all.
+3. **New browser-only algorithms go in `treetracer-core`**, not `src/`. If the
+   Python side later needs one, move it down *and* add a PyO3 binding — do not
+   leave it reachable from only one side.
+4. **`[patch.crates-io]` lives in the root manifest only.** A patch table in a
+   member manifest is silently ignored, and the build then fails on phylotree's
+   `needletail` → bzip2/xz.
+
+### Building the browser bundle
+
+```bash
+pixi run build-wasm      # wasm-pack build treetracer-core --target web --release
+```
+
+Output lands in `treetracer-core/pkg/` (gitignored) and is vendored into
+`treetracer-web/src/wasm/`.
 
 ---
 

@@ -41,7 +41,7 @@ pub(crate) fn strip_beast_annotations(newick: &str) -> String {
 ///
 /// Used to apply BEAST translate blocks (numeric ID → taxon name). A no-op if
 /// `translate` is empty.
-pub(crate) fn rename_leaf_nodes(phylo_tree: &mut Tree, translate: &HashMap<String, String>) {
+pub fn rename_leaf_nodes(phylo_tree: &mut Tree, translate: &HashMap<String, String>) {
     if translate.is_empty() {
         return;
     }
@@ -475,7 +475,7 @@ pub(crate) fn chain_of(tree_name: &str) -> &str {
 }
 
 /// Everything one `.trees` file contributes to an analysis.
-pub(crate) struct LoadedTrees {
+pub struct LoadedTrees {
     pub translate: HashMap<String, String>,
     pub names: Vec<String>,
     pub newicks: Vec<String>,
@@ -493,7 +493,7 @@ pub(crate) struct LoadedTrees {
     pub burnin: usize,
 }
 
-pub(crate) fn load_beast_subsampled_str(
+pub fn load_beast_subsampled_str(
     content: &str,
     base_name: &str,
     burnin_percent: f64,
