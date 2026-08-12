@@ -88,6 +88,9 @@ pub struct TreeSetBuilder {
     /// be merged into one map.
     translates: Vec<HashMap<String, String>>,
     run_labels: Vec<String>,
+    /// Which translate map each run uses. Runs no longer map one-to-one onto
+    /// files, so the index has to be tracked explicitly.
+    translate_of_run: Vec<usize>,
     /// Log density per tree, read from the header annotations before they were
     /// stripped. `NaN` for files that record none.
     log_density: Vec<f64>,
@@ -152,14 +155,33 @@ impl TreeSetBuilder {
             )));
         }
 
-        let run = self.run_labels.len();
+        // A file holding several chains becomes several runs. Eight chains
+        // reported as one would hide exactly the between-chain disagreement
+        // this tool exists to surface.
+        let translate_slot = self.translates.len();
+        let multi = loaded.chain_labels.len() > 1;
+        let mut run_of_chain: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+
         let kept = loaded.newicks.len();
-        for ((name, newick), (density, state)) in loaded
+        for (i, ((name, newick), (density, state))) in loaded
             .names
             .into_iter()
             .zip(loaded.newicks)
             .zip(loaded.log_density.into_iter().zip(loaded.states))
+            .enumerate()
         {
+            let chain = loaded.chains.get(i).cloned().unwrap_or_default();
+            let run = *run_of_chain.entry(chain.clone()).or_insert_with(|| {
+                let label = if multi && !chain.is_empty() {
+                    format!("{label}:{chain}")
+                } else {
+                    label.to_string()
+                };
+                self.run_labels.push(label);
+                self.translate_of_run.push(translate_slot);
+                self.run_labels.len() - 1
+            });
             self.trees.push((name, newick, run));
             self.log_density.push(density);
             self.states.push(state);
@@ -169,7 +191,6 @@ impl TreeSetBuilder {
         }
 
         self.translates.push(loaded.translate);
-        self.run_labels.push(label.to_string());
         Ok(RunSummary {
             total: loaded.total,
             burnin: loaded.burnin,
@@ -199,10 +220,12 @@ impl TreeSetBuilder {
             return Err(JsError::new("No runs added."));
         }
 
-        let entries = self
-            .trees
-            .iter()
-            .map(|(_, newick, run)| (newick.as_str(), &self.translates[*run]));
+        let entries = self.trees.iter().map(|(_, newick, run)| {
+            (
+                newick.as_str(),
+                &self.translates[self.translate_of_run[*run]],
+            )
+        });
 
         let snaps = Snapshots::from_newick_iter(entries, rooted).map_err(|e| {
             JsError::new(&format!(
@@ -224,6 +247,7 @@ impl TreeSetBuilder {
             run_ids: self.trees.iter().map(|(_, _, r)| *r as u32).collect(),
             run_labels: self.run_labels.clone(),
             translates: self.translates.clone(),
+            translate_of_run: self.translate_of_run.clone(),
             snaps,
             rf_cache: RefCell::new(None),
             presence_cache: RefCell::new(None),
@@ -269,9 +293,11 @@ pub struct TreeSet {
     density_field: Option<String>,
     run_ids: Vec<u32>,
     run_labels: Vec<String>,
-    /// Per-run translate maps, kept so a newick can be handed out with real
+    /// Per-file translate maps, kept so a newick can be handed out with real
     /// taxon names rather than the BEAST numbering.
     translates: Vec<HashMap<String, String>>,
+    /// Which translate map each run uses.
+    translate_of_run: Vec<usize>,
     snaps: Snapshots,
     /// The RF matrix is O(n²) to build and wanted by both the matrix accessor
     /// and PCoA, so it is computed at most once per `TreeSet`.
@@ -546,7 +572,10 @@ impl TreeSet {
         let cs = hipstr_mod::build_clade_system(
             &newicks,
             &self.translates,
-            &run_of,
+            &run_of
+                .iter()
+                .map(|&r| self.translate_of_run.get(r).copied().unwrap_or(0))
+                .collect::<Vec<_>>(),
             &self.snaps.leaf_names,
         )
         .map_err(|e| JsError::new(&e))?;
@@ -584,7 +613,8 @@ impl TreeSet {
             .ok_or_else(|| JsError::new(&format!("Tree {index} is out of range.")))?;
 
         let run = *self.run_ids.get(index).unwrap_or(&0) as usize;
-        let Some(translate) = self.translates.get(run) else {
+        let slot = self.translate_of_run.get(run).copied().unwrap_or(0);
+        let Some(translate) = self.translates.get(slot) else {
             return Ok(raw.clone());
         };
         if translate.is_empty() {

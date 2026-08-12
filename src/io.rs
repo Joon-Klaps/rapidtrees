@@ -455,6 +455,25 @@ fn header_log_density(header: &str) -> (f64, Option<String>) {
     (f64::NAN, None)
 }
 
+/// The chain a tree belongs to, taken from its name.
+///
+/// BEAST files are often concatenations of several independent chains — the
+/// ZIKA example ships eight in one file, named `classic1_STATE_…`,
+/// `stlbeauti4_STATE_…` and so on. Everything before `_STATE_` names the
+/// chain.
+///
+/// Recognising them matters twice over. State numbers restart at each
+/// boundary, so a trace plotted against state jumps backwards once per chain;
+/// and a convergence tool that reports eight chains as one has thrown away the
+/// comparison it exists to make.
+pub(crate) fn chain_of(tree_name: &str) -> &str {
+    match tree_name.find("_STATE_") {
+        Some(i) => &tree_name[..i],
+        // No STATE marker: treat the whole file as a single chain.
+        None => "",
+    }
+}
+
 /// Everything one `.trees` file contributes to an analysis.
 pub(crate) struct LoadedTrees {
     pub translate: HashMap<String, String>,
@@ -466,6 +485,10 @@ pub(crate) struct LoadedTrees {
     pub density_field: Option<String>,
     /// MCMC state number per kept tree, for plotting against chain position.
     pub states: Vec<u64>,
+    /// Chain label per kept tree; empty when the file holds only one.
+    pub chains: Vec<String>,
+    /// Distinct chain labels, in file order.
+    pub chain_labels: Vec<String>,
     pub total: usize,
     pub burnin: usize,
 }
@@ -493,42 +516,67 @@ pub(crate) fn load_beast_subsampled_str(
             log_density: Vec::new(),
             density_field: None,
             states: Vec::new(),
+            chains: Vec::new(),
+            chain_labels: Vec::new(),
             total: 0,
             burnin: 0,
         };
     }
 
-    let pct = burnin_percent.clamp(0.0, 100.0);
-    let burnin = (((total as f64) * pct / 100.0).floor() as usize).min(total - 1);
-    let available = total - burnin;
-    let target = if target_trees == 0 {
-        available
-    } else {
-        target_trees.min(available)
-    };
-
-    // Only now, on the survivors, do we pay for stripping and allocation.
-    let mut names = Vec::with_capacity(target);
-    let mut newicks = Vec::with_capacity(target);
-    let mut log_density = Vec::with_capacity(target);
-    let mut states = Vec::with_capacity(target);
-    let mut density_field = None;
-
-    for i in 0..target {
-        let idx = burnin + (i * available) / target;
-        let (header, body) = blocks[idx];
-        let (name, state) = extract_name_state(header);
-        // Read the header's annotations before they are stripped: `lnP` and
-        // friends live there, and discarding them was what left the browser
-        // build with no log-density trace at all.
-        let (density, field) = header_log_density(header);
-        if density_field.is_none() {
-            density_field = field;
+    // Split into chains first: burnin and subsampling are per chain, or a 1%
+    // burnin over an eight-chain file would discard the start of chain one and
+    // nothing from the other seven.
+    let mut chain_labels: Vec<String> = Vec::new();
+    let mut chain_rows: Vec<Vec<usize>> = Vec::new();
+    for (i, (header, _)) in blocks.iter().enumerate() {
+        let (name, _) = extract_name_state(header);
+        let chain = chain_of(&name).to_string();
+        match chain_labels.iter().position(|c| *c == chain) {
+            Some(k) => chain_rows[k].push(i),
+            None => {
+                chain_labels.push(chain);
+                chain_rows.push(vec![i]);
+            }
         }
-        names.push(format!("{base_name}_{name}"));
-        newicks.push(strip_beast_annotations(body));
-        log_density.push(density);
-        states.push(state as u64);
+    }
+
+    let pct = burnin_percent.clamp(0.0, 100.0);
+    let mut names = Vec::new();
+    let mut newicks = Vec::new();
+    let mut log_density = Vec::new();
+    let mut states = Vec::new();
+    let mut chains = Vec::new();
+    let mut density_field = None;
+    let mut burnin_total = 0usize;
+
+    for (k, rows) in chain_rows.iter().enumerate() {
+        let n = rows.len();
+        let burnin = (((n as f64) * pct / 100.0).floor() as usize).min(n.saturating_sub(1));
+        let available = n - burnin;
+        let target = if target_trees == 0 {
+            available
+        } else {
+            target_trees.min(available)
+        };
+        burnin_total += burnin;
+
+        for i in 0..target {
+            let idx = rows[burnin + (i * available) / target];
+            let (header, body) = blocks[idx];
+            let (name, state) = extract_name_state(header);
+            // Read the header's annotations before they are stripped: `lnP`
+            // and friends live there, and discarding them was what left the
+            // browser build with no log-density trace at all.
+            let (density, field) = header_log_density(header);
+            if density_field.is_none() {
+                density_field = field;
+            }
+            names.push(format!("{base_name}_{name}"));
+            newicks.push(strip_beast_annotations(body));
+            log_density.push(density);
+            states.push(state as u64);
+            chains.push(chain_labels[k].clone());
+        }
     }
 
     LoadedTrees {
@@ -538,8 +586,10 @@ pub(crate) fn load_beast_subsampled_str(
         log_density,
         density_field,
         states,
+        chains,
+        chain_labels,
         total,
-        burnin,
+        burnin: burnin_total,
     }
 }
 
