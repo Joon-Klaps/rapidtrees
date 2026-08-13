@@ -36,3 +36,15 @@ repos:
             language: system
             types: [rust]
             pass_filenames: false
+
+          - id: cargo-check-wasm
+            name: cargo check (wasm32)
+            description: >-
+                Hold this crate to its wasm-compatibility promise. Needs the
+                real wasm32 target: a host-target check passes even when a
+                rayon/pyo3-only path has crept in. Requires
+                `rustup target add wasm32-unknown-unknown`.
+            entry: cargo check --lib --no-default-features --target wasm32-unknown-unknown
+            language: system
+            types: [rust]
+            pass_filenames: false

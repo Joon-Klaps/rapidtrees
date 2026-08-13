@@ -14,13 +14,24 @@ convergence diagnostics, ESS calculations, and tanglegram visualisations.
 
 ## Architecture
 
+This is a single-package repo: `rapidtrees` and nothing else.
+
+**The split with treetracer is by audience, not by subject.** `rapidtrees`
+answers one question — how far apart are two trees — and is consumed by Python
+(PyO3) and a CLI. Everything the *browser* needs on top of that answer lives in
+`treetracer-core`, which is **not in this repo**: it is `core/` in the
+[treetracer-web](https://github.com/Joon-Klaps/treetracer-web) repo, and it
+depends on this crate as a pinned git dependency.
+
 ```
-src/
+Cargo.toml              — the rapidtrees package + [patch.crates-io]
+src/                    — the distance kernel. No wasm-bindgen here.
   api.rs        — PyO3 bindings (keep minimal — logic lives in snapshot.rs / distances.rs)
   bitset.rs     — compact bitset for leaf sets; inner-most hot path
   snapshot.rs   — Snapshot / Snapshots types, canonicalisation, interning
   distances.rs  — RF, WRF, KF algorithms
   io.rs         — BEAST/NEXUS parsing, annotation stripping
+  par.rs        — rayon-or-sequential shim; `pub` so dependents share one policy
   main.rs       — CLI binary
   lib.rs        — public re-exports
 tests/
@@ -31,6 +42,41 @@ docs/
   python-api.md          — full Python API reference
   rapidtrees-for-dummies.md
 ```
+
+### Rules that keep the split honest
+
+1. **`rapidtrees` must never depend on `wasm-bindgen`.** `treetracer-core` is the
+   only crate in the graph that links it. Multiple bindgen crates would force
+   every one of them onto an identical wasm-bindgen version.
+2. **`rapidtrees` stays wasm-*compatible*.** No Fortran-LAPACK linear algebra, no
+   C-library codec deps, and every parallel loop goes through `par.rs`. That is
+   what lets it link into a wasm build at all. Enforced by
+   `cargo check --lib --no-default-features --target wasm32-unknown-unknown`,
+   which runs in pre-commit and in CI.
+3. **Browser-only algorithms do not belong here.** They go in treetracer-web's
+   `core/`. The test is whether the Python API or CLI can reach it: if not, it
+   is not a `rapidtrees` concern. MCMC diagnostics — log densities, chain
+   splitting, burnin, subsampling — are the browser's, which is why BEAST
+   *header* semantics live there while NEXUS *primitives* (`parse_taxon_block`,
+   `extract_name_state`, `strip_beast_annotations`, `rename_leaf_nodes`) stay
+   here and are `pub` for it to build on.
+4. **Anything `pub` in `io.rs` is treetracer-web's API.** Changing one of those
+   four signatures breaks that repo's build with no compiler to warn you, since
+   it is a git dependency rather than a workspace member. Treat them as
+   published surface.
+
+### Building the browser bundle
+
+Not from this repo. In treetracer-web:
+
+```bash
+wasm-pack build core --release --target web --out-dir pkg
+```
+
+That crate pins `rapidtrees` by git branch, so **local changes here are invisible
+to it until pushed.** To build treetracer-web against a working tree, uncomment
+the `[patch."https://github.com/Joon-Klaps/rapidtrees"]` block at the bottom of
+`core/Cargo.toml`.
 
 ---
 

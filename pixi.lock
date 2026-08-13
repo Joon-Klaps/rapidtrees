@@ -4286,8 +4286,8 @@ packages:
   timestamp: 1775898398033
 - pypi: ./
   name: rapidtrees
-  version: 0.7.1
-  sha256: f09da4213a80d5ecbf97f759493afdacb09f7734e31c764114963aa5c2da832d
+  version: 0.8.0
+  sha256: a8c850e2fe7699f13bcc4c3a8b5fe14894805c22e4aa3491c2eb5b7e2d568ee2
   requires_dist:
   - pytest ; extra == 'dev'
   - numpy>=2.2.6 ; extra == 'dev'

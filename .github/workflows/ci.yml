@@ -60,7 +60,7 @@ jobs:
               env:
                   PYO3_PYTHON: ${{ github.workspace }}/.pixi/envs/default/bin/python
                   LD_LIBRARY_PATH: ${{ github.workspace }}/.pixi/envs/default/lib
-                  DYLD_LIBRARY_PATH: ${{ github.workspace }}/.pixi/envs/default/lib
+                  DYLD_FALLBACK_LIBRARY_PATH: ${{ github.workspace }}/.pixi/envs/default/lib:/usr/local/lib:/usr/lib
               run: cargo test --verbose --lib --features python
 
     python-test:
@@ -99,3 +99,32 @@ jobs:
 
             - name: Run Python API tests
               run: pixi run -e ${{ matrix.environment }} test-python
+
+    wasm-compat:
+        name: Wasm Compatibility
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  lfs: true
+
+            - name: Setup Rust
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  targets: wasm32-unknown-unknown
+
+            - name: Cache cargo
+              uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cargo/registry
+                      ~/.cargo/git
+                      target
+                  key: ${{ runner.os }}-wasm-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+            - name: Check wasm32 build (no default features)
+              run: cargo check --lib --no-default-features --target wasm32-unknown-unknown
+
+            - name: Clippy on the wasm32 build
+              run: cargo clippy --lib --no-default-features --target wasm32-unknown-unknown -- -D warnings

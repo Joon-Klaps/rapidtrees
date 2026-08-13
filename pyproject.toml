@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "rapidtrees"
-version = "0.7.1"
+version = "0.8.0"
 description = "Fast tree distance calculations (Robinson-Foulds, Weighted RF, Kuhner-Felsenstein) for phylogenetic trees"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -65,15 +65,16 @@ py312 = ["py312"]
 
 [tool.pixi.tasks]
 test                   = { cmd = "cargo test --lib --features python && pytest tests/test_python_api.py -v", description = "Run rust & python tests" }
-test-rust              = { cmd = "cargo test --lib --features python", description = "Run Rust unit tests (with the python feature so progress.rs + embedded-Python integration tests are included)", env = { PYO3_PYTHON = "$CONDA_PREFIX/bin/python", LD_LIBRARY_PATH = "$CONDA_PREFIX/lib", DYLD_LIBRARY_PATH = "$CONDA_PREFIX/lib" } }
-test-rust-cov          = { cmd = "cargo llvm-cov --lib --features python --lcov --output-path rust-lcov.info", description = "Run Rust + embedded-Python tests under llvm-cov and write rust-lcov.info", env = { PYO3_PYTHON = "$CONDA_PREFIX/bin/python", LD_LIBRARY_PATH = "$CONDA_PREFIX/lib", DYLD_LIBRARY_PATH = "$CONDA_PREFIX/lib" } }
+check-wasm             = { cmd = "cargo check --lib --no-default-features --target wasm32-unknown-unknown", description = "Hold the crate to its wasm-compatibility promise (needs `rustup target add wasm32-unknown-unknown`). The browser bundle itself is built from treetracer-web's core/." }
+test-rust              = { cmd = "cargo test --lib --features python", description = "Run Rust unit tests (with the python feature so progress.rs + embedded-Python integration tests are included)", env = { PYO3_PYTHON = "$CONDA_PREFIX/bin/python", LD_LIBRARY_PATH = "$CONDA_PREFIX/lib", DYLD_FALLBACK_LIBRARY_PATH = "$CONDA_PREFIX/lib:/usr/local/lib:/usr/lib" } }
+test-rust-cov          = { cmd = "cargo llvm-cov --lib --features python --lcov --output-path rust-lcov.info", description = "Run Rust + embedded-Python tests under llvm-cov and write rust-lcov.info", env = { PYO3_PYTHON = "$CONDA_PREFIX/bin/python", LD_LIBRARY_PATH = "$CONDA_PREFIX/lib", DYLD_FALLBACK_LIBRARY_PATH = "$CONDA_PREFIX/lib:/usr/local/lib:/usr/lib" } }
 test-python            = { cmd = "pytest tests/test_python_api.py -v", description = "Run Python API tests" }
 test-python-cov        = { cmd = "pytest tests/test_python_api.py -v --cov=rapidtrees --cov-report=xml:python-coverage.xml", description = "Run Python tests with coverage" }
 bench                  = { cmd = "cargo bench --bench codspeed", description = "Run codspeed benchmarks" }
 big-bench              = { cmd = "cargo bench --bench memory_time_benchmark", description = "Run codspeed benchmarks" }
 develop                = { cmd = "maturin develop --uv", description = "Build and install in editable mode" }
 fmt                    = { cmd = "cargo fmt --check", description = "Check Rust formatting" }
-clippy                 = { cmd = "cargo clippy --all-targets --all-features -- -D warnings", description = "Run Clippy linter" }
+clippy                 = { cmd = "cargo clippy --workspace --all-targets --all-features -- -D warnings", description = "Run Clippy linter across both workspace members" }
 pre-commit             = { cmd = "prek run --config .pre-commit-config.yaml --all-files" }
 run-treetracer         = { cmd = "cd ../treetracer && uv sync --reinstall-package rapidtrees && uv run treetracer", description = "Rebuild rapidtrees (in treetracer's venv) and launch the desktop app against it" }
 run-treetracer-browser = { cmd = "cd ../treetracer && uv sync --reinstall-package rapidtrees && uv run treetracer --browser", description = "Rebuild rapidtrees (in treetracer's venv) and launch treetracer in a browser tab" }

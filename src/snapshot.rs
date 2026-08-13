@@ -29,9 +29,9 @@
 //! analysis typically fits in L2 cache instead of requiring DRAM.
 
 use crate::bitset::Bitset;
+use crate::par::*;
 use hashbrown::HashTable;
 use phylotree::tree::{Tree as PhyloTree, TreeError};
-use rayon::prelude::*;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;

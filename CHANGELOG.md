@@ -8,10 +8,13 @@ This project uses release names based on random words from [codenamegenerator.co
     - PREFIX: Microsoft Corperation
     - DICTIONARY: Snakes
 
-## [Unreleased]
+## [0.8.0] - 2026-08-13
 
+- **wasm:**: Instead of calling `rayon::prelude::*` directly, it's part of `par.rs` to allow wasm compatibility.
+  - **Note**: Dependency `pyhlotree-rs` is now based on a fork until [phylotree-rs#18](https://github.com/lucblassel/phylotree-rs/pull/18) lands.
+- **CI**: Add `cargo check --lib --target wasm32-unknown-unknown` to the CI pipeline.
 - **Speed (WRF/KF):** Both weighted metrics now skip the split columns no pair can share. `wrf_diverse` 31.5 → 2.3 ms (**14×**), `kf_diverse` 38.4 → 2.2 ms (**17×**), `wrf_similar` 3.59 → 1.0 ms (**3.5×**), `kf_similar` 3.78 → 1.0 ms (**3.8×**). RF and construction unchanged.
-- **How:** `|a − b| = a + b − 2·min(a, b)` puts WRF in RF and KF's `selfᵢ + selfⱼ − 2·shared` form (the 0.7.0 note denying this was wrong), so splits only one tree holds can be dropped: 47 995 columns → 2 572 on the diverse bench shape, 38.4 → 2.1 MB. Identical trees still cancel to exactly `0.0`. WRF assumes non-negative branch lengths.
+  - **How:** `|a − b| = a + b − 2·min(a, b)` puts WRF in RF and KF's `selfᵢ + selfⱼ − 2·shared` form (the 0.7.0 note denying this was wrong), so splits only one tree holds can be dropped: 47 995 columns → 2 572 on the diverse bench shape, 38.4 → 2.1 MB. Identical trees still cancel to exactly `0.0`. WRF assumes non-negative branch lengths.
 - **Validation:** Unchanged against R phangorn on four 162-taxon BEAST HIV sets, all three metrics. A new randomized differential test checks the backends against a naive test-only oracle.
 - **API (Rust, breaking):** Removed the per-pair `rf_distance` / `wrf_distance` / `kf_distance` — a second implementation nothing ran. The entire collection of snapshots is now only allowed in the `*_distance` functions. `Snapshot` is no longer exported and `Snapshot::from_newick` is gone.
 - **Speed (other):** `build_branch_length_matrix` writes bytes straight out, halving its allocation. `fill_symmetric` mirrors in 64×64 tiles rather than writing down a column.

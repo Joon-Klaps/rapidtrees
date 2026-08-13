@@ -19,7 +19,7 @@ use std::io;
 use std::io::{BufReader, BufWriter, Read, Write};
 
 /// Strip BEAST `[&...]` annotations from a Newick string.
-pub(crate) fn strip_beast_annotations(newick: &str) -> String {
+pub fn strip_beast_annotations(newick: &str) -> String {
     let mut result = String::with_capacity(newick.len());
     let mut in_annotation = false;
     let mut chars = newick.chars().peekable();
@@ -41,7 +41,7 @@ pub(crate) fn strip_beast_annotations(newick: &str) -> String {
 ///
 /// Used to apply BEAST translate blocks (numeric ID → taxon name). A no-op if
 /// `translate` is empty.
-pub(crate) fn rename_leaf_nodes(phylo_tree: &mut Tree, translate: &HashMap<String, String>) {
+pub fn rename_leaf_nodes(phylo_tree: &mut Tree, translate: &HashMap<String, String>) {
     if translate.is_empty() {
         return;
     }
@@ -332,7 +332,8 @@ fn snap_read_strings<R: io::Read>(r: &mut R, n: usize) -> io::Result<Vec<String>
         .collect()
 }
 
-fn extract_name_state(header: &str) -> (String, usize) {
+/// Split a NEXUS tree header into `(tree_name, state_number)`.
+pub fn extract_name_state(header: &str) -> (String, usize) {
     let upper = header.to_ascii_uppercase();
     if let Some(state_pos) = upper.find("STATE_")
         && let Some((_, rest)) = header.split_once(' ')
@@ -368,7 +369,8 @@ fn collect_tree_blocks(content: &str) -> Vec<TreeBlock<'_>> {
         .collect()
 }
 
-fn parse_taxon_block(content: &str) -> HashMap<String, String> {
+/// Read a NEXUS `TRANSLATE` block into a numeric-ID → taxon-name map.
+pub fn parse_taxon_block(content: &str) -> HashMap<String, String> {
     content
         .lines()
         .skip_while(|line| !line.trim().to_ascii_uppercase().starts_with("TRANSLATE"))

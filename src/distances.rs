@@ -9,8 +9,8 @@
 //! There is no per-pair entry point. To compare two trees, build a two-tree
 //! `Snapshots` and read the off-diagonal cell.
 
+use crate::par::*;
 use crate::snapshot::Snapshots;
-use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Fill a symmetric `n × n` matrix from `cell(i, j)`, one rayon task per row.

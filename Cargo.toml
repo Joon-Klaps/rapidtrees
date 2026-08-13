@@ -1,6 +1,6 @@
 [package]
 name = "rapidtrees"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2024"
 description = "Fast pairwise tree distance calculations (Robinson-Foulds, Weighted RF, Kuhner-Felsenstein) for phylogenetic trees"
 license = "MIT"
@@ -20,19 +20,29 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [dependencies]
-phylotree = "0.1.3"
+# Until https://github.com/lucblassel/phylotree-rs/pull/18 lands, take
+# phylotree from the fork that makes it wasm-clean. Pinned to a rev rather
+phylotree = { version = "0.1.3", default-features = false }
 pyo3 = { version = "0.27.1", optional = true }
-rayon = "1"
+rayon = { version = "1", optional = true }
 clap = { version = "4.5", features = ["derive"], optional = true }
 flate2 = { version = "1", optional = true }
 rustc-hash = "2.1"
 hashbrown = "0.17.1"
 
 [features]
-default = ["cli"]
+default = ["cli", "parallel"]
 cli = ["clap", "flate2"]
-python = ["pyo3"]
+# Rayon-backed parallelism (`par.rs`). On by default; off for wasm32.
+parallel = ["rayon"]
+python = ["pyo3", "parallel"]
 extension-module = ["python", "pyo3/extension-module"]
+
+# Until https://github.com/lucblassel/phylotree-rs/pull/18 lands, take
+# phylotree from the fork that makes it wasm-clean. Pinned to a rev rather
+# than a branch so review force-pushes cannot silently change a build.
+[patch.crates-io]
+phylotree = { git = "https://github.com/Joon-Klaps/phylotree-rs", rev = "a2391b7" }
 
 [dev-dependencies]
 rand = "0.10.1"
