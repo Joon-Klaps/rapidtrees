@@ -278,7 +278,7 @@ pub fn load_snapshots<P: AsRef<Path>>(path: P) -> io::Result<(Vec<String>, Snaps
     if &magic != b"SNAP" {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("invalid snap magic: expected SNAP, got {:?}", &magic),
+            format!("invalid snap magic: expected SNAP, got {magic:?}"),
         ));
     }
 

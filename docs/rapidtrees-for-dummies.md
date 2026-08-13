@@ -15,7 +15,7 @@
 7. [Step 5 — Computing RF distance via two-pointer merge](#step-5--computing-rf-distance-via-two-pointer-merge)
 8. [Step 6 — The scaling problem at large taxa counts](#step-6--the-scaling-problem-at-large-taxa-counts)
 9. [Step 7 — InternSnap: replacing bitsets with integer IDs](#step-7--internsnap-replacing-bitsets-with-integer-ids)
-10. [Step 8 — Single-pair distances via the sorted merge](#step-8--single-pair-distances-via-the-sorted-merge)
+10. [Step 8 — Why interning pays off: the sorted merge](#step-8--why-interning-pays-off-the-sorted-merge)
 11. [Step 9 — Bulk pairwise: the dense backend (RF, WRF, KF)](#step-9--bulk-pairwise-the-dense-backend-rf-wrf-kf)
 12. [The full pipeline at a glance](#the-full-pipeline-at-a-glance)
 13. [Cheat sheet: all representations](#cheat-sheet-all-representations)
@@ -334,9 +334,9 @@ The Bitsets still exist in the global table — but there's only **one copy of e
 
 ---
 
-## Step 8 — Single-pair distances via the sorted merge
+## Step 8 — Why interning pays off: the sorted merge
 
-> This section describes the single-pair functions `rf_distance`, `wrf_distance`, and `kf_distance`. For computing all pairwise distances at once (`pairwise_rf` / `pairwise_wrf` / `pairwise_kf`), see Step 9.
+> **Conceptual step.** This is the easiest way to see what interning buys, but it is not a code path any more — `rapidtrees` ships only the bulk backends in Step 9, which replace the merge with popcounts and dense row sweeps. There is no single-pair entry point: to compare exactly two trees, build a two-tree `Snapshots` and read the one off-diagonal cell.
 
 Exactly the same two-pointer merge as Step 5, but now each comparison is **one integer vs one integer**:
 
@@ -356,7 +356,9 @@ RF = 4 + 4 - 2×2 = 4   ← identical answer
 
 The comparison `1 vs 1` is a **single CPU instruction** instead of comparing 32 × 64-bit words. With 5 000 trees × ~600 splits × millions of pairs, this compounds into a huge speedup because the entire working set now fits in L3 cache.
 
-For WRF and KF, the same merge runs but accumulates branch-length differences (`|lenᵢ − lenⱼ|` for WRF) or squared differences (`(lenᵢ − lenⱼ)²` for KF) instead of counting shared IDs. The branch lengths live in the parallel `lengths` vector of each `InternSnap`.
+The same merge would accumulate branch-length differences for WRF (`|lenᵢ − lenⱼ|`) or squared differences for KF (`(lenᵢ − lenⱼ)²`) instead of counting shared IDs. The branch lengths live in the parallel `lengths` vector of each `InternSnap`.
+
+Step 9 keeps this payoff — the small integer IDs — and drops the merge itself, which has a branch per split and reads two lists at once. Laying the splits out as one contiguous row per tree turns each pair into a straight-line sweep the CPU can vectorise.
 
 ---
 
@@ -382,7 +384,7 @@ RF(1, 2) = a₁  +  a₂  −  2 · popcount( row₁  AND  row₂ )
 
 One extra win: splits present in *every* tree ("universal" splits — always at least the pendant/leaf edges) contribute equally to both `a` values and to the shared count, so they cancel out of RF exactly. They are dropped *before* packing, shrinking the rows. For MCMC-like sets where trees are nearly identical, most splits are universal and the bit-rows become very short — this is why RF is **~15× faster** on posterior samples.
 
-### WRF — dense length rows
+### WRF — minimum-overlap form
 
 Build a **length matrix** with one row per tree. Column *u* of tree *t*'s row holds the branch length of split *u* (0.0 if absent):
 
@@ -397,7 +399,13 @@ WRF(1, 2) = |0.20−0.00| + |0.30−0.30| + |0.40−0.00| + |0.10−0.10| + |0.0
            = 1.00
 ```
 
-There is no "shared term" shortcut for an absolute difference, so this is a per-element sweep — but walking two contiguous `f64` arrays is cache-friendly and vectorises well.
+An absolute difference looks like it resists RF's shared-term trick, but it doesn't — for any two numbers `|a − b| = a + b − 2·min(a, b)`, so summing over all splits gives
+
+```text
+WRF(i, j) = Σ Wᵢ + Σ Wⱼ − 2 · Σ min(Wᵢ, Wⱼ)
+```
+
+Each tree's **total branch length** `Σ Wᵢ` is computed once up front. Each pair then costs only a running minimum over the two rows — the weighted echo of RF's `popcount(AND)`.
 
 ### KF — dot-product (Gram) form
 
@@ -408,6 +416,20 @@ KF(i, j) = sqrt( ‖Wᵢ‖² + ‖Wⱼ‖² − 2 · ⟨Wᵢ, Wⱼ⟩ )
 ```
 
 The **self-norms** `‖Wᵢ‖²` are computed once up front for all trees. Each pair then costs only one dot product `⟨Wᵢ, Wⱼ⟩` — analogous to RF's `popcount(AND)`. A clamp to zero before `sqrt` guards against floating-point rounding making the bracket slightly negative for near-identical trees.
+
+### Dropping columns that can't matter
+
+Because all three metrics take the form "what each tree has on its own, minus twice what the pair shares", each can discard splits it knows cannot affect the shared term — before the O(n²) sweep starts:
+
+| Metric | Shared term | Columns dropped | Why they can't matter |
+|---|---|---|---|
+| RF | `popcount(AND)` | splits in **every** tree | contribute equally to both `a` values *and* the shared count, so they cancel |
+| WRF | `Σ min` | splits in **exactly one** tree | no pair shares them, so `min` is always 0 |
+| KF | `⟨·,·⟩` | splits in **exactly one** tree | no pair shares them, so the product is always 0 |
+
+The two filters bite in opposite regimes, which is what keeps all three fast across the board. RF's filter wins on near-identical MCMC samples (most splits universal). The weighted filter wins on diverse tree sets, where nearly every internal split is unique to its tree: 100 random 500-tip topologies yield ~48 000 distinct splits but only ~2 600 that any pair shares — a 19× cut in both the length matrix and the per-pair sweep.
+
+A tree's lengths for the dropped columns are folded into its own total once, so nothing is lost.
 
 ---
 
@@ -437,8 +459,9 @@ BEAST/Newick file
        ▼
  Snapshots  ← the only public representation
        │
-       ├─  rf_distance / wrf_distance / kf_distance    (one pair — sorted merge)
        └─  pairwise_rf / pairwise_wrf / pairwise_kf   (all pairs — dense backend)
+              (the only distance entry points; a two-tree `Snapshots`
+               gives a single pair as its one off-diagonal cell)
 ```
 
 ---
@@ -459,6 +482,6 @@ BEAST/Newick file
 | Name | Metric | What it stores | Size |
 |---|---|---|---|
 | Packed presence matrix | `pairwise_rf` | One bit-row per tree over non-universal splits, packed into `u64` words | `n_trees × ceil(U_nonuniversal/64) × 8` bytes |
-| Dense length matrix | `pairwise_wrf`, `pairwise_kf` | One `f64` row per tree over all unique splits (0.0 if absent) | `n_trees × U × 8` bytes |
+| Dense length matrix | `pairwise_wrf`, `pairwise_kf` | One `f64` row per tree over the splits at least two trees share (0.0 if absent) | `n_trees × U_shared × 8` bytes |
 
 > **tl;dr:** `TreeSnapshot` is a private stepping stone used during parsing. `Snapshots` is what everything else touches. The packed/dense matrices are built on the fly for each bulk pairwise call and freed immediately after.

@@ -60,7 +60,6 @@ extension-module = ["python", "pyo3/extension-module"]
 phylotree = { git = "https://github.com/Joon-Klaps/phylotree-rs", rev = "a2391b7" }
 
 [dev-dependencies]
-itertools = "0.14.0"
 rand = "0.10.1"
 criterion = "0.8.2"
 cpu-time = "1.0.0"

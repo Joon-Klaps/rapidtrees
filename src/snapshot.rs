@@ -50,60 +50,29 @@ thread_local! {
         RefCell::new(FxHashMap::default());
 }
 
-/// An immutable snapshot of all bipartitions in one phylogenetic tree.
+/// One tree's bipartitions, on the way into a [`Snapshots`] collection.
 ///
-/// Stores sorted `Vec<Bitset>` + parallel `Vec<f64>` branch lengths so any
-/// two `Snapshot`s with the same leaf set can be directly compared via
-/// [`crate::distances::rf_distance`], [`crate::distances::wrf_distance`], or
-/// [`crate::distances::kf_distance`].
-///
-/// Passing snapshots with different leaf sets to a distance function will
-/// panic — that is a programming error.
-///
-/// # Fields
-/// - `parts`: all edges (internal bipartitions + pendant edges), canonicalized
-///   and sorted ascending for O(m+n) merge
-/// - `lengths`: branch lengths parallel to `parts`
-/// - `leaf_names`: alphabetically sorted taxon names (defines the bit ordering)
-/// - `words`: number of u64 words per bitset
+/// Short-lived: built per tree, handed straight to the interner, dropped. That
+/// is what keeps construction peak memory near the deduplicated footprint.
+/// Taxon names live once on [`Snapshots`], not per tree.
 ///
 /// # Canonicalization
-/// Each internal bipartition can be represented as two complementary bitsets.
-/// We always store the side that does NOT contain the first leaf (index 0)
-/// so identical splits always have identical bitset representations.
-/// Pendant edges are stored as-is (single-bit bitsets, no flip needed).
+/// Each internal bipartition has two complementary bitsets; we always store the
+/// side without leaf 0, so identical splits get identical representations.
+/// Pendant edges are stored as-is.
 #[derive(Debug, Clone)]
-pub struct Snapshot {
+pub(crate) struct Snapshot {
     /// All edges (internal bipartitions + pendant edges), canonicalized and sorted ascending.
     pub(crate) parts: Vec<Bitset>,
 
     /// Branch lengths, parallel to `parts`.
     pub(crate) lengths: Vec<f64>,
 
-    /// Alphabetically sorted taxon names — defines the bit ordering.
-    pub leaf_names: Vec<String>,
-
     /// Number of u64 words per bitset.
     pub(crate) words: usize,
-
-    /// Whether the tree was treated as rooted when snapshotted.
-    pub rooted: bool,
 }
 
 impl Snapshot {
-    /// Parse a Newick string and extract a snapshot of its bipartitions.
-    ///
-    /// The tree must be a plain Newick string (no BEAST annotations). For
-    /// BEAST-format files use `Snapshots::from_newick_iter` which handles
-    /// annotation stripping and taxon renaming automatically.
-    ///
-    /// # Errors
-    /// Returns an error string if the string cannot be parsed or the tree is malformed.
-    pub fn from_newick(newick: &str, rooted: bool) -> Result<Self, String> {
-        let tree = PhyloTree::from_newick(newick).map_err(|e| e.to_string())?;
-        Snapshot::from_tree(&tree, rooted).map_err(|e| e.to_string())
-    }
-
     /// Extract a snapshot from an already-parsed tree.
     ///
     /// # Algorithm
@@ -117,7 +86,6 @@ impl Snapshot {
     /// # Errors
     /// Returns `TreeError` if the tree is empty, malformed, or has unnamed leaves.
     pub(crate) fn from_tree(tree: &PhyloTree, rooted_mode: bool) -> Result<Self, TreeError> {
-        let rooted = tree.is_rooted()?;
         // Step 1: Extract leaf names and sort them alphabetically
         let mut leaf_id_names: Vec<(usize, String)> = tree
             .get_leaves()
@@ -131,7 +99,6 @@ impl Snapshot {
         // Sort by taxon name (alphabetically) for consistent ordering
         leaf_id_names.sort_unstable_by(|a, b| a.1.cmp(&b.1));
 
-        let sorted_leaf_names: Vec<String> = leaf_id_names.iter().map(|(_, n)| n.clone()).collect();
         let num_leaves = leaf_id_names.len();
         let words = num_leaves.div_ceil(64);
 
@@ -164,9 +131,7 @@ impl Snapshot {
             Ok(Snapshot {
                 parts: parts_canonical,
                 lengths: lengths_canonical,
-                leaf_names: sorted_leaf_names,
                 words,
-                rooted,
             })
         })
     }
@@ -628,20 +593,20 @@ impl Snapshots {
             return (Vec::new(), col_to_bip_id);
         }
 
-        let mut matrix = vec![0.0f64; n_trees * n_bip];
-        matrix
-            .par_chunks_mut(n_bip)
+        // Write bytes straight out rather than building an `f64` matrix and
+        // copying it: one allocation instead of two. Absent edges stay 0.0,
+        // whose native-endian encoding is the zero bytes we start from.
+        let mut bytes = vec![0u8; n_trees * n_bip * 8];
+        bytes
+            .par_chunks_mut(n_bip * 8)
             .zip(&self.snapshots)
             .for_each(|(row, snap)| {
                 for (&split_id, &length) in snap.split_ids.iter().zip(&snap.lengths) {
-                    row[id_to_col[split_id as usize]] = length;
+                    let col = id_to_col[split_id as usize];
+                    row[col * 8..(col + 1) * 8].copy_from_slice(&length.to_ne_bytes());
                 }
             });
 
-        let mut bytes = Vec::with_capacity(matrix.len() * 8);
-        for &v in &matrix {
-            bytes.extend_from_slice(&v.to_ne_bytes());
-        }
         (bytes, col_to_bip_id)
     }
 
@@ -682,21 +647,21 @@ impl Snapshots {
     /// counter is bumped by `n - i - 1`, reaching `n*(n-1)/2` when done. Pass
     /// `None` to skip the (negligible) counter work entirely.
     pub fn pairwise_rf(&self, progress: Option<&std::sync::atomic::AtomicUsize>) -> Vec<usize> {
-        crate::distances::pairwise_rf_packed(self, progress)
+        crate::distances::distance_rf(self, progress)
     }
 
     /// Compute all pairwise Weighted Robinson–Foulds distances as a symmetric n×n matrix.
     ///
     /// See [`Self::pairwise_rf`] for the `progress` argument.
     pub fn pairwise_wrf(&self, progress: Option<&std::sync::atomic::AtomicUsize>) -> Vec<f64> {
-        crate::distances::pairwise_wrf_dense(self, progress)
+        crate::distances::distance_wrf(self, progress)
     }
 
     /// Compute all pairwise Kuhner–Felsenstein distances as a symmetric n×n matrix.
     ///
     /// See [`Self::pairwise_rf`] for the `progress` argument.
     pub fn pairwise_kf(&self, progress: Option<&std::sync::atomic::AtomicUsize>) -> Vec<f64> {
-        crate::distances::pairwise_kf_dense(self, progress)
+        crate::distances::distance_kf(self, progress)
     }
 
     fn empty() -> Self {
@@ -911,10 +876,19 @@ mod tests {
     fn test_rooted_vs_unrooted_partitions() {
         use phylotree::tree::Tree as PhyloTree;
 
-        let rf_pair = |a: &Snapshot, b: &Snapshot| -> usize { crate::distances::rf_distance(a, b) };
+        // Two trees means a two-tree `Snapshots`, read at the off-diagonal cell.
+        let rf_pair = |a: &str, b: &str, rooted: bool| -> usize {
+            Snapshots::from_newicks(&[a, b], rooted)
+                .unwrap()
+                .pairwise_rf(None)[1]
+        };
 
-        let tree1 = PhyloTree::from_newick("((A:1,B:1):1,(C:1,D:1):1);").unwrap();
-        let tree2 = PhyloTree::from_newick("((A:1,C:1):1,(B:1,D:1):1);").unwrap();
+        const TREE1: &str = "((A:1,B:1):1,(C:1,D:1):1);";
+        const TREE2: &str = "((A:1,C:1):1,(B:1,D:1):1);";
+        const TREE1B: &str = "((B:2,A:2):2,(D:2,C:2):2);";
+
+        let tree1 = PhyloTree::from_newick(TREE1).unwrap();
+        let tree2 = PhyloTree::from_newick(TREE2).unwrap();
 
         // Unrooted mode: 4 pendant edges + 1 internal bipartition = 5 entries per tree.
         let snap1_u = Snapshot::from_tree(&tree1, false).unwrap();
@@ -925,7 +899,7 @@ mod tests {
             "Unrooted: 4 pendant + 1 internal for 4-leaf tree"
         );
         assert_eq!(snap2_u.parts.len(), 5);
-        assert_eq!(rf_pair(&snap1_u, &snap2_u), 2, "Unrooted RF = 2");
+        assert_eq!(rf_pair(TREE1, TREE2, false), 2, "Unrooted RF = 2");
 
         // Rooted mode: 4 pendant edges + 2 internal clades = 6 entries per tree.
         let snap1_r = Snapshot::from_tree(&tree1, true).unwrap();
@@ -936,14 +910,11 @@ mod tests {
             "Rooted: 4 pendant + 2 clades for 4-leaf tree"
         );
         assert_eq!(snap2_r.parts.len(), 6);
-        assert_eq!(rf_pair(&snap1_r, &snap2_r), 4, "Rooted RF = 4");
+        assert_eq!(rf_pair(TREE1, TREE2, true), 4, "Rooted RF = 4");
 
-        // Same topology: both modes give RF = 0
-        let tree1b = PhyloTree::from_newick("((B:2,A:2):2,(D:2,C:2):2);").unwrap();
-        let snap1b_u = Snapshot::from_tree(&tree1b, false).unwrap();
-        let snap1b_r = Snapshot::from_tree(&tree1b, true).unwrap();
-        assert_eq!(rf_pair(&snap1_u, &snap1b_u), 0, "Unrooted same topo = 0");
-        assert_eq!(rf_pair(&snap1_r, &snap1b_r), 0, "Rooted same topo = 0");
+        // Same topology written differently: both modes give RF = 0.
+        assert_eq!(rf_pair(TREE1, TREE1B, false), 0, "Unrooted same topo = 0");
+        assert_eq!(rf_pair(TREE1, TREE1B, true), 0, "Rooted same topo = 0");
     }
 
     /// Better example: Asymmetric tree with distinct partitions

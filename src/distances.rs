@@ -1,147 +1,22 @@
-//! Tree distance functions.
+//! Pairwise tree distance backends for [`crate::snapshot::Snapshots`].
 //!
-//! # Public API
-//! - [`rf_distance`], [`wrf_distance`], [`kf_distance`] — compare two standalone
-//!   [`crate::snapshot::Snapshot`]s (use bitset sorted-merge; panics if leaf sets differ).
+//! All three metrics have the form `selfᵢ + selfⱼ − 2·shared`, where `shared` is
+//! a popcount (RF), a running minimum (WRF), or a dot product (KF). That shape
+//! lets each drop the splits that cannot affect `shared` before the O(n²) sweep:
+//! RF drops splits held by every tree, WRF/KF drop splits held by only one. Both
+//! filters are pure optimisations — disabling either changes no distance.
 //!
-//! # Bulk pairwise computation
-//! Call [`crate::snapshot::Snapshots::pairwise_rf`] etc. — these use the fast
-//! interned-integer path internally via the `pub(crate)` helpers in this module.
+//! There is no per-pair entry point. To compare two trees, build a two-tree
+//! `Snapshots` and read the off-diagonal cell.
 
-use crate::par::*;
-use crate::snapshot::{Snapshot, Snapshots};
+use crate::snapshot::Snapshots;
+use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-#[cfg(test)]
-use itertools::Itertools;
-
-// ─── Public: Snapshot-based distance functions ────────────────────────────────
-
-/// Robinson–Foulds distance between two snapshots.
+/// Fill a symmetric `n × n` matrix from `cell(i, j)`, one rayon task per row.
 ///
-/// Uses a sorted-merge on `Vec<Bitset>`. RF = |A| + |B| − 2|A ∩ B|.
-///
-/// # Panics
-/// Panics if `a` and `b` have different leaf sets — that is a caller error.
-pub fn rf_distance(a: &Snapshot, b: &Snapshot) -> usize {
-    assert_eq!(
-        a.leaf_names, b.leaf_names,
-        "rf_distance: leaf sets differ — cannot compare snapshots from different taxa"
-    );
-    let mut inter = 0;
-    let mut i = 0;
-    let mut j = 0;
-    while i < a.parts.len() && j < b.parts.len() {
-        match a.parts[i].cmp(&b.parts[j]) {
-            std::cmp::Ordering::Equal => {
-                inter += 1;
-                i += 1;
-                j += 1;
-            }
-            std::cmp::Ordering::Less => i += 1,
-            std::cmp::Ordering::Greater => j += 1,
-        }
-    }
-    a.parts.len() + b.parts.len() - 2 * inter
-}
-
-/// Weighted Robinson–Foulds distance between two snapshots.
-///
-/// For each bipartition:
-/// - Shared: contributes `|len_a − len_b|`.
-/// - Only in A: contributes `len_a`.
-/// - Only in B: contributes `len_b`.
-///
-/// # Panics
-/// Panics if `a` and `b` have different leaf sets.
-pub fn wrf_distance(a: &Snapshot, b: &Snapshot) -> f64 {
-    assert_eq!(
-        a.leaf_names, b.leaf_names,
-        "wrf_distance: leaf sets differ — cannot compare snapshots from different taxa"
-    );
-    let mut dist = 0.0;
-    let mut i = 0;
-    let mut j = 0;
-    while i < a.parts.len() && j < b.parts.len() {
-        match a.parts[i].cmp(&b.parts[j]) {
-            std::cmp::Ordering::Equal => {
-                dist += (a.lengths[i] - b.lengths[j]).abs();
-                i += 1;
-                j += 1;
-            }
-            std::cmp::Ordering::Less => {
-                dist += a.lengths[i];
-                i += 1;
-            }
-            std::cmp::Ordering::Greater => {
-                dist += b.lengths[j];
-                j += 1;
-            }
-        }
-    }
-    dist += a.lengths[i..].iter().sum::<f64>();
-    dist += b.lengths[j..].iter().sum::<f64>();
-    dist
-}
-
-/// Kuhner–Felsenstein (Branch Score) distance between two snapshots.
-///
-/// Like WRF but uses squared differences: `sqrt(Σ (len_a − len_b)²)`.
-/// More sensitive to large branch-length differences; a Euclidean metric in
-/// branch-length space.
-///
-/// # Panics
-/// Panics if `a` and `b` have different leaf sets.
-pub fn kf_distance(a: &Snapshot, b: &Snapshot) -> f64 {
-    assert_eq!(
-        a.leaf_names, b.leaf_names,
-        "kf_distance: leaf sets differ — cannot compare snapshots from different taxa"
-    );
-    let mut sum_sq = 0.0;
-    let mut i = 0;
-    let mut j = 0;
-    while i < a.parts.len() && j < b.parts.len() {
-        match a.parts[i].cmp(&b.parts[j]) {
-            std::cmp::Ordering::Equal => {
-                let d = a.lengths[i] - b.lengths[j];
-                sum_sq += d * d;
-                i += 1;
-                j += 1;
-            }
-            std::cmp::Ordering::Less => {
-                sum_sq += a.lengths[i] * a.lengths[i];
-                i += 1;
-            }
-            std::cmp::Ordering::Greater => {
-                sum_sq += b.lengths[j] * b.lengths[j];
-                j += 1;
-            }
-        }
-    }
-    sum_sq += a.lengths[i..].iter().map(|&l| l * l).sum::<f64>();
-    sum_sq += b.lengths[j..].iter().map(|&l| l * l).sum::<f64>();
-    sum_sq.sqrt()
-}
-
-// ─── pub(crate): bulk pairwise paths used by Snapshots::pairwise_rf/wrf/kf ──
-//
-// All three metrics lay every tree's splits out as one contiguous row — packed
-// bits for RF, branch lengths for WRF/KF — and then sweep the upper triangle
-// once. RF and KF share the same shape: "what each tree has on its own, minus
-// twice what the pair has in common", where "in common" is a popcount for RF
-// and a dot product for KF. WRF is the odd one out (an absolute difference has
-// no shared-term shortcut), so it just sweeps the two length rows directly.
-
-/// Fill a symmetric `n × n` distance matrix in parallel.
-///
-/// Every distance shows up twice — the matrix is a mirror image across its
-/// diagonal — so we only ever compute the upper triangle (one rayon task per
-/// row) and then copy each value across to its mirror slot. The diagonal stays
-/// at zero: a tree's distance to itself. `cell(i, j)` returns the distance for
-/// the tree pair `(i, j)`.
-///
-/// If `progress` is given, it's bumped by that row's pair count the moment the
-/// row finishes, so another thread can watch the total climb to `n*(n-1)/2`.
+/// Only the upper triangle is computed; the diagonal stays at `T::default()`.
+/// `progress` is bumped by each row's pair count as that row finishes.
 fn fill_symmetric<T, F>(n: usize, progress: Option<&AtomicUsize>, cell: F) -> Vec<T>
 where
     T: Copy + Default + Send,
@@ -158,21 +33,26 @@ where
         }
     });
 
-    for i in 0..n {
-        for j in (i + 1)..n {
-            matrix[j * n + i] = matrix[i * n + j];
+    // Mirror into the lower triangle in tiles: a plain row-read/column-write
+    // sweep puts every write on its own cache line at large `n`.
+    const TILE: usize = 64;
+    for i0 in (0..n).step_by(TILE) {
+        for j0 in (i0..n).step_by(TILE) {
+            for i in i0..(i0 + TILE).min(n) {
+                for j in j0.max(i + 1)..(j0 + TILE).min(n) {
+                    matrix[j * n + i] = matrix[i * n + j];
+                }
+            }
         }
     }
 
     matrix
 }
 
-/// How many distinct splits exist across all the trees.
+/// Number of distinct splits across all trees.
 ///
-/// Split IDs are handed out densely from 0 and each tree's list is sorted, so
-/// the biggest ID anywhere is the largest last element; +1 turns that into a
-/// count. We read it from `split_ids` (never the bitset table), so it still
-/// works on the paths that free the bitsets to save memory.
+/// Read from `split_ids` (dense from 0, sorted per tree) rather than the bitset
+/// table, so it still works on paths that free the bitsets.
 fn n_distinct_splits(snaps: &Snapshots) -> usize {
     snaps
         .snapshots
@@ -189,57 +69,52 @@ fn row_slice<T>(flat: &[T], i: usize, stride: usize) -> &[T] {
     &flat[i * stride..][..stride]
 }
 
-// ─── pub(crate): dense bit-packed popcount RF (the hot path) ────────────────
+/// How many trees hold each split, indexed by split ID.
+fn split_tree_counts(snaps: &Snapshots) -> Vec<u32> {
+    let mut counts = vec![0u32; n_distinct_splits(snaps)];
+    for snap in &snaps.snapshots {
+        for &id in &snap.split_ids {
+            counts[id as usize] += 1;
+        }
+    }
+    counts
+}
 
-/// Compute every pairwise Robinson–Foulds distance with bit-packed popcounts.
+/// Give every split `keep` accepts a packed column index.
 ///
-/// The trick: the RF distance between two trees is just "how many splits each
-/// one has, minus twice the splits they share." We write that as
+/// Returns `(column_of, n_columns)`; `column_of[id]` is `u32::MAX` if dropped.
+/// Packing the survivors together is what shrinks the per-pair sweep.
+fn assign_columns(counts: &[u32], keep: impl Fn(u32) -> bool) -> (Vec<u32>, usize) {
+    let mut column_of = vec![u32::MAX; counts.len()];
+    let mut n_columns = 0u32;
+    for (id, &count) in counts.iter().enumerate() {
+        if keep(count) {
+            column_of[id] = n_columns;
+            n_columns += 1;
+        }
+    }
+    (column_of, n_columns as usize)
+}
+
+// ─── Robinson–Foulds ────────────────────────────────────────────────────────
+
+/// `RF(i, j) = aᵢ + aⱼ − 2·popcount(rowᵢ & rowⱼ)` over presence bit-rows.
 ///
-/// ```text
-///   RF(i, j) = aᵢ + aⱼ − 2 · (splits that i and j share)
-/// ```
-///
-/// and get the shared count by AND-ing the two trees' presence bitmasks and
-/// counting the set bits (`popcount`). That's much faster than walking two
-/// sorted lists.
-///
-/// One extra simplification: a split that shows up in *every* tree (always the
-/// pendant/leaf edges, plus anything the whole set happens to agree on) adds the
-/// same amount to both `a` values and to the shared count, so it cancels out of
-/// RF entirely. We drop those "everywhere" splits before packing, which makes
-/// the bitmasks shorter and the popcounts cheaper without changing any distance.
-pub(crate) fn pairwise_rf_packed(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> Vec<usize> {
+/// Splits held by *every* tree add equally to both `a` values and to the shared
+/// count, so they cancel exactly and are dropped before packing.
+pub(crate) fn distance_rf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> Vec<usize> {
     let n = snaps.snapshots.len();
     if n == 0 {
         return Vec::new();
     }
 
-    let n_splits = n_distinct_splits(snaps);
-
-    // Count how many trees each split appears in. A split in all `n` trees is an
-    // "everywhere" split, which we drop below.
-    let mut tree_count = vec![0u32; n_splits];
-    for snap in &snaps.snapshots {
-        for &id in &snap.split_ids {
-            tree_count[id as usize] += 1;
-        }
-    }
-
-    // Give each kept (non-everywhere) split a fresh, packed-together bit slot.
-    let mut bit_slot = vec![u32::MAX; n_splits];
-    let mut kept = 0u32;
-    for (id, &count) in tree_count.iter().enumerate() {
-        if count < n as u32 {
-            bit_slot[id] = kept;
-            kept += 1;
-        }
-    }
-    let kept = kept as usize;
+    let counts = split_tree_counts(snaps);
+    let n_splits = counts.len();
+    let (bit_slot, kept) = assign_columns(&counts, |count| count < n as u32);
     let everywhere = n_splits - kept;
     let words = kept.div_ceil(64);
 
-    // Build one bitmask row per tree: a set bit means "this tree has that split."
+    // One bitmask row per tree: a set bit means "this tree has that split".
     let mut packed = vec![0u64; n * words];
     if words > 0 {
         packed
@@ -256,8 +131,8 @@ pub(crate) fn pairwise_rf_packed(snaps: &Snapshots, progress: Option<&AtomicUsiz
             });
     }
 
-    // Splits per tree once the everywhere-splits are ignored. Every tree holds
-    // all of them, so it's just each tree's total minus that fixed count.
+    // Every tree holds all the everywhere-splits, so `a` is just its total minus
+    // that fixed count.
     let kept_per_tree: Vec<usize> = snaps
         .snapshots
         .iter()
@@ -276,97 +151,118 @@ pub(crate) fn pairwise_rf_packed(snaps: &Snapshots, progress: Option<&AtomicUsiz
     })
 }
 
-// ─── pub(crate): dense branch-length WRF / KF (the weighted hot paths) ──────
+// ─── weighted metrics (WRF, KF) ─────────────────────────────────────────────
 
-/// Lay every tree's branch lengths out as one long row of `f64`s, where column
-/// `k` holds the length of split `k` (0 if that tree doesn't have the split).
+/// Branch lengths over the shared-candidate splits, plus each tree's `self`
+/// contribution from the splits it holds alone.
+struct SharedRows {
+    /// Flat `n × stride` matrix of lengths; 0 where a tree lacks the split.
+    rows: Vec<f64>,
+    /// Row stride — how many split columns survived the filter.
+    stride: usize,
+    /// Per tree, `Σ term(length)` over splits no other tree holds.
+    unique_self: Vec<f64>,
+}
+
+/// Lay out branch lengths over only the splits at least two trees hold.
 ///
-/// This is the weighted-metric twin of the RF bit-packing: instead of one bit
-/// per split we store the actual branch length, so the inner loops below can
-/// read two trees' lengths straight from contiguous memory. Returns the flat
-/// `n × n_splits` matrix and `n_splits` (the row stride).
-///
-/// Unlike RF, we keep *every* split column: an "everywhere" split still has a
-/// different length in each tree, so it doesn't cancel out of a weighted score.
-fn dense_length_rows(snaps: &Snapshots) -> (Vec<f64>, usize) {
+/// A split held by one tree alone can never be shared, so it gets no column —
+/// its `term(length)` folds into that tree's `unique_self` instead. On diverse
+/// sets this cuts ~48 000 splits to ~2 600 (~19×); on similar sets it is nearly
+/// a no-op. "Everywhere" splits are kept: unlike in RF, they do not cancel out
+/// of a weighted score.
+fn shared_length_rows(snaps: &Snapshots, term: impl Fn(f64) -> f64) -> SharedRows {
     let n = snaps.snapshots.len();
-    let n_splits = n_distinct_splits(snaps);
+    let counts = split_tree_counts(snaps);
+    let (column_of, stride) = assign_columns(&counts, |count| count >= 2);
 
-    let mut rows = vec![0.0f64; n * n_splits];
-    if n_splits > 0 {
-        rows.par_chunks_mut(n_splits)
+    let mut rows = vec![0.0f64; n * stride];
+    if stride > 0 {
+        rows.par_chunks_mut(stride)
             .zip(&snaps.snapshots)
             .for_each(|(row, snap)| {
                 for (&id, &length) in snap.split_ids.iter().zip(&snap.lengths) {
-                    row[id as usize] = length;
+                    let col = column_of[id as usize];
+                    if col != u32::MAX {
+                        row[col as usize] = length;
+                    }
                 }
             });
     }
-    (rows, n_splits)
+
+    let unique_self = snaps
+        .snapshots
+        .iter()
+        .map(|snap| {
+            snap.split_ids
+                .iter()
+                .zip(&snap.lengths)
+                .filter(|&(&id, _)| column_of[id as usize] == u32::MAX)
+                .map(|(_, &l)| term(l))
+                .sum()
+        })
+        .collect();
+
+    SharedRows {
+        rows,
+        stride,
+        unique_self,
+    }
 }
 
-/// Compute every pairwise Weighted Robinson–Foulds distance on dense length rows.
+/// `finish(selfᵢ + selfⱼ − 2·Σ overlap)` — the shape WRF and KF share.
 ///
-/// WRF just adds up, split by split, how far apart the two trees' branch lengths
-/// are: `Σ |lenᵢ − lenⱼ|`. A split missing from one tree counts as length 0
-/// there, which the dense layout hands us for free. Walking the two rows side by
-/// side — no sorted-merge, no per-split branching — is friendlier to the CPU and
-/// vectorises well.
+/// `term` maps a length to its `self` contribution, `overlap` is the per-split
+/// shared term, `finish` is applied last.
 ///
-/// WRF is the one metric that can't reuse RF/KF's "shared term" shortcut: an
-/// absolute difference doesn't factor into a single matrix product, so this
-/// stays an honest per-pair sweep — just a faster-laid-out one.
-pub(crate) fn pairwise_wrf_dense(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> Vec<f64> {
+/// `self` is summed over each row in column order, the same order `overlap`
+/// walks, so identical trees cancel to exactly 0.0. The clamp stops rounding
+/// from handing `finish` a negative.
+fn weighted_distances(
+    snaps: &Snapshots,
+    progress: Option<&AtomicUsize>,
+    term: impl Fn(f64) -> f64 + Sync,
+    overlap: impl Fn(f64, f64) -> f64 + Sync,
+    finish: impl Fn(f64) -> f64 + Sync,
+) -> Vec<f64> {
     let n = snaps.snapshots.len();
     if n == 0 {
         return Vec::new();
     }
 
-    let (rows, n_splits) = dense_length_rows(snaps);
+    let shared = shared_length_rows(snaps, &term);
+    let (rows, stride) = (&shared.rows, shared.stride);
 
-    fill_symmetric(n, progress, |i, j| {
-        let row_i = row_slice(&rows, i, n_splits);
-        let row_j = row_slice(&rows, j, n_splits);
-        row_i.iter().zip(row_j).map(|(&a, &b)| (a - b).abs()).sum()
-    })
-}
-
-/// Compute every pairwise Kuhner–Felsenstein distance with the same
-/// "selfᵢ + selfⱼ − 2·shared" trick RF uses, adapted for branch lengths.
-///
-/// KF is the straight-line (Euclidean) distance between two trees' branch
-/// lengths: `sqrt(Σ (lenᵢ − lenⱼ)²)`. Multiplying out the bracket rewrites the
-/// sum as
-///
-/// ```text
-///   Σ lenᵢ²  +  Σ lenⱼ²  −  2 · Σ (lenᵢ · lenⱼ)
-/// ```
-///
-/// The first two pieces are each tree's own "self length" (`norm_sq`), which we
-/// work out once up front. The last piece is the dot product of the two length
-/// rows — the weighted echo of RF's shared-split popcount. Tiny rounding error
-/// can nudge the bracket a hair below zero for near-identical trees, so we clamp
-/// at zero before taking the square root.
-pub(crate) fn pairwise_kf_dense(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> Vec<f64> {
-    let n = snaps.snapshots.len();
-    if n == 0 {
-        return Vec::new();
-    }
-
-    let (rows, n_splits) = dense_length_rows(snaps);
-
-    // Each tree's own squared length, summed once so the pair loop only needs
-    // the dot product between the two rows.
-    let norm_sq: Vec<f64> = (0..n)
-        .map(|i| row_slice(&rows, i, n_splits).iter().map(|&l| l * l).sum())
+    let self_total: Vec<f64> = (0..n)
+        .map(|i| {
+            row_slice(rows, i, stride)
+                .iter()
+                .map(|&l| term(l))
+                .sum::<f64>()
+                + shared.unique_self[i]
+        })
         .collect();
 
     fill_symmetric(n, progress, |i, j| {
-        let row_i = row_slice(&rows, i, n_splits);
-        let row_j = row_slice(&rows, j, n_splits);
-        let dot: f64 = row_i.iter().zip(row_j).map(|(&a, &b)| a * b).sum();
-        (norm_sq[i] + norm_sq[j] - 2.0 * dot).max(0.0).sqrt()
+        let row_i = row_slice(rows, i, stride);
+        let row_j = row_slice(rows, j, stride);
+        let shared_term: f64 = row_i.iter().zip(row_j).map(|(&a, &b)| overlap(a, b)).sum();
+        finish((self_total[i] + self_total[j] - 2.0 * shared_term).max(0.0))
     })
+}
+
+/// `WRF(i, j) = Σ lenᵢ + Σ lenⱼ − 2·Σ min(lenᵢ, lenⱼ)`.
+///
+/// The `min` form follows from `|a − b| = a + b − 2·min(a, b)`. Assumes
+/// non-negative branch lengths; missing lengths parse as 0.0.
+pub(crate) fn distance_wrf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> Vec<f64> {
+    weighted_distances(snaps, progress, |l| l, f64::min, |d| d)
+}
+
+/// `KF(i, j) = sqrt(Σ lenᵢ² + Σ lenⱼ² − 2·Σ lenᵢ·lenⱼ)` — Euclidean distance in
+/// branch-length space.
+pub(crate) fn distance_kf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> Vec<f64> {
+    weighted_distances(snaps, progress, |l| l * l, |a, b| a * b, f64::sqrt)
 }
 
 /// Twelve 10-taxon trees from the PHYLIP treedist reference suite.
@@ -409,20 +305,15 @@ fn robinson_foulds_treedist() {
         vec![10, 10, 10, 2, 4, 2, 4, 0, 2, 2, 10, 0],
     ];
 
-    trees.iter().combinations(2).for_each(|pair| {
-        let (t0, t1) = (pair[0], pair[1]);
-        let (i0, i1) = (
-            trees.iter().position(|&t| t == *t0).unwrap(),
-            trees.iter().position(|&t| t == *t1).unwrap(),
-        );
-        let s0 = Snapshot::from_newick(t0, false).unwrap();
-        let s1 = Snapshot::from_newick(t1, false).unwrap();
-        assert_eq!(
-            rf_distance(&s0, &s1),
-            rfs[i0][i1],
-            "RF mismatch at [{i0}, {i1}]"
-        );
-    });
+    let snaps = Snapshots::from_newicks(&trees, false).unwrap();
+    let n = snaps.len();
+    let mat = snaps.pairwise_rf(None);
+
+    for (i, want_row) in rfs.iter().enumerate() {
+        for (j, &want) in want_row.iter().enumerate() {
+            assert_eq!(mat[i * n + j], want, "RF mismatch at [{i}, {j}]");
+        }
+    }
 }
 
 #[test]
@@ -601,19 +492,22 @@ fn weighted_robinson_foulds_treedist() {
         ],
     ];
 
-    trees.iter().combinations(2).for_each(|pair| {
-        let (t0, t1) = (pair[0], pair[1]);
-        let (i0, i1) = (
-            trees.iter().position(|&t| t == *t0).unwrap(),
-            trees.iter().position(|&t| t == *t1).unwrap(),
-        );
-        let s0 = Snapshot::from_newick(t0, false).unwrap();
-        let s1 = Snapshot::from_newick(t1, false).unwrap();
-        assert!(
-            (wrf_distance(&s0, &s1) - expected[i0][i1]).abs() <= f64::EPSILON,
-            "WRF mismatch at [{i0}, {i1}]"
-        );
-    });
+    let snaps = Snapshots::from_newicks(&trees, false).unwrap();
+    let n = snaps.len();
+    let mat = snaps.pairwise_wrf(None);
+
+    // The shared-term rewrite reassociates the sum, so this lands a few ulp off
+    // the published value. Distances are ~1.0, so 1e-12 is still far tighter
+    // than any real disagreement.
+    for (i, want_row) in expected.iter().enumerate() {
+        for (j, &want) in want_row.iter().enumerate() {
+            assert!(
+                (mat[i * n + j] - want).abs() <= 1e-12,
+                "WRF mismatch at [{i}, {j}]: got {}, want {want}",
+                mat[i * n + j]
+            );
+        }
+    }
 }
 
 #[test]
@@ -792,25 +686,27 @@ fn kuhner_felsenstein_treedist() {
         ],
     ];
 
-    trees.iter().combinations(2).for_each(|pair| {
-        let (t0, t1) = (pair[0], pair[1]);
-        let (i0, i1) = (
-            trees.iter().position(|&t| t == *t0).unwrap(),
-            trees.iter().position(|&t| t == *t1).unwrap(),
-        );
-        let s0 = Snapshot::from_newick(t0, false).unwrap();
-        let s1 = Snapshot::from_newick(t1, false).unwrap();
-        assert!(
-            (kf_distance(&s0, &s1) - expected[i0][i1]).abs() <= f64::EPSILON,
-            "KF mismatch at [{i0}, {i1}]"
-        );
-    });
+    let snaps = Snapshots::from_newicks(&trees, false).unwrap();
+    let n = snaps.len();
+    let mat = snaps.pairwise_kf(None);
+
+    // Tolerance as in `weighted_robinson_foulds_treedist`.
+    for (i, want_row) in expected.iter().enumerate() {
+        for (j, &want) in want_row.iter().enumerate() {
+            assert!(
+                (mat[i * n + j] - want).abs() <= 1e-12,
+                "KF mismatch at [{i}, {j}]: got {}, want {want}",
+                mat[i * n + j]
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TREEDIST_TREES, kf_distance, rf_distance, wrf_distance};
-    use crate::snapshot::{Snapshot, Snapshots};
+    use super::TREEDIST_TREES;
+    use crate::snapshot::{InternSnap, Snapshots};
+    use std::collections::{BTreeMap, BTreeSet};
 
     const T0: &str = "(A:0.1,(B:0.1,(H:0.1,(D:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);";
     const T1: &str = "(A:0.1,(B:0.1,(D:0.1,((J:0.1,H:0.1):0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1);";
@@ -975,73 +871,63 @@ mod tests {
         }
     }
 
-    fn treedist_snapshots() -> Snapshots {
-        Snapshots::from_newicks(&TREEDIST_TREES, false).unwrap()
-    }
+    /// Test oracle: all three metrics for one pair, straight from the
+    /// definitions over the union of both trees' splits (absent = length 0).
+    ///
+    /// Deliberately naive — no filtering, no `selfᵢ + selfⱼ − 2·shared` rewrite —
+    /// so it cannot reproduce a backend bug by construction.
+    fn reference_distances(a: &InternSnap, b: &InternSnap) -> (usize, f64, f64) {
+        let lengths_by_split = |s: &InternSnap| -> BTreeMap<u32, f64> {
+            s.split_ids
+                .iter()
+                .copied()
+                .zip(s.lengths.iter().copied())
+                .collect()
+        };
+        let (ma, mb) = (lengths_by_split(a), lengths_by_split(b));
 
-    fn treedist_singles() -> Vec<Snapshot> {
-        TREEDIST_TREES
-            .iter()
-            .map(|t| Snapshot::from_newick(t, false).unwrap())
-            .collect()
-    }
-
-    // The bulk `pairwise_*` paths pack every tree into one matrix and sweep it,
-    // while the public per-pair `*_distance` functions walk two trees directly.
-    // The per-pair functions are pinned to PHYLIP ground truth by the
-    // `*_treedist` tests above, so matching them pins the bulk paths too.
-
-    #[test]
-    fn pairwise_rf_matches_per_pair_ground_truth() {
-        let snaps = treedist_snapshots();
-        let singles = treedist_singles();
-        let n = snaps.snapshots.len();
-        let mat = snaps.pairwise_rf(None);
-        for i in 0..n {
-            for j in 0..n {
-                assert_eq!(
-                    mat[i * n + j],
-                    rf_distance(&singles[i], &singles[j]),
-                    "bulk RF disagrees with per-pair RF at [{i}][{j}]"
-                );
+        let (mut rf, mut wrf, mut sum_sq) = (0usize, 0.0, 0.0);
+        for id in ma
+            .keys()
+            .chain(mb.keys())
+            .copied()
+            .collect::<BTreeSet<u32>>()
+        {
+            let x = ma.get(&id).copied().unwrap_or(0.0);
+            let y = mb.get(&id).copied().unwrap_or(0.0);
+            if ma.contains_key(&id) != mb.contains_key(&id) {
+                rf += 1;
             }
+            wrf += (x - y).abs();
+            sum_sq += (x - y) * (x - y);
         }
+        (rf, wrf, sum_sq.sqrt())
     }
 
-    #[test]
-    fn pairwise_wrf_matches_per_pair_ground_truth() {
-        let snaps = treedist_snapshots();
-        let singles = treedist_singles();
+    /// Assert all three backends agree with [`reference_distances`] on `snaps`.
+    fn assert_matches_reference(snaps: &Snapshots, ctx: &str) {
         let n = snaps.snapshots.len();
-        let mat = snaps.pairwise_wrf(None);
+        let (rf, wrf, kf) = (
+            snaps.pairwise_rf(None),
+            snaps.pairwise_wrf(None),
+            snaps.pairwise_kf(None),
+        );
+
         for i in 0..n {
             for j in 0..n {
-                let expected = wrf_distance(&singles[i], &singles[j]);
+                let (want_rf, want_wrf, want_kf) =
+                    reference_distances(&snaps.snapshots[i], &snaps.snapshots[j]);
+
+                assert_eq!(rf[i * n + j], want_rf, "RF at [{i}][{j}], {ctx}");
                 assert!(
-                    (mat[i * n + j] - expected).abs() < 1e-12,
-                    "bulk WRF {} disagrees with per-pair WRF {expected} at [{i}][{j}]",
-                    mat[i * n + j],
+                    (wrf[i * n + j] - want_wrf).abs() <= 1e-9 * want_wrf.max(1.0),
+                    "WRF {} vs reference {want_wrf} at [{i}][{j}], {ctx}",
+                    wrf[i * n + j],
                 );
-            }
-        }
-    }
-
-    #[test]
-    fn pairwise_kf_matches_per_pair_ground_truth() {
-        let snaps = treedist_snapshots();
-        let singles = treedist_singles();
-        let n = snaps.snapshots.len();
-        let mat = snaps.pairwise_kf(None);
-        for i in 0..n {
-            for j in 0..n {
-                let expected = kf_distance(&singles[i], &singles[j]);
-                // KF's Gram reformulation (selfᵢ + selfⱼ − 2·dot) reorders the
-                // summation, so it agrees within floating-point tolerance, not
-                // bit-for-bit.
                 assert!(
-                    (mat[i * n + j] - expected).abs() < 1e-9,
-                    "bulk KF {} disagrees with per-pair KF {expected} at [{i}][{j}]",
-                    mat[i * n + j],
+                    (kf[i * n + j] - want_kf).abs() <= 1e-9 * want_kf.max(1.0),
+                    "KF {} vs reference {want_kf} at [{i}][{j}], {ctx}",
+                    kf[i * n + j],
                 );
             }
         }
@@ -1059,6 +945,103 @@ mod tests {
             mat.iter().all(|&d| d == 0),
             "identical trees must have RF 0 everywhere"
         );
+    }
+
+    #[test]
+    fn pairwise_wrf_identical_trees_all_zero() {
+        // Exactly 0.0 only holds because self and shared are summed in the same
+        // column order; reordering either would leave a rounding crumb.
+        let t = TREEDIST_TREES[0];
+        let snaps = Snapshots::from_newicks(&[t, t, t], false).unwrap();
+        let mat = snaps.pairwise_wrf(None);
+        assert!(
+            mat.iter().all(|&d| d == 0.0),
+            "identical trees must have WRF exactly 0 everywhere"
+        );
+    }
+
+    /// Trees sharing almost nothing, so most splits land in the "held by one
+    /// tree only" bucket that [`shared_length_rows`] drops — which the treedist
+    /// fixtures barely exercise. Branch lengths are all distinct so a wrongly
+    /// dropped column changes the answer visibly.
+    const DIVERSE_TREES: [&str; 4] = [
+        "(((A:0.11,B:0.12):0.13,(C:0.14,D:0.15):0.16):0.17,((E:0.18,F:0.19):0.21,(G:0.22,H:0.23):0.24):0.25);",
+        "(((A:0.31,E:0.32):0.33,(C:0.34,G:0.35):0.36):0.37,((B:0.38,F:0.39):0.41,(D:0.42,H:0.43):0.44):0.45);",
+        "(((A:0.51,H:0.52):0.53,(B:0.54,G:0.55):0.56):0.57,((C:0.58,F:0.59):0.61,(D:0.62,E:0.63):0.64):0.65);",
+        "(((A:0.71,D:0.72):0.73,(F:0.74,G:0.75):0.76):0.77,((B:0.78,H:0.79):0.81,(C:0.82,E:0.83):0.84):0.85);",
+    ];
+
+    #[test]
+    fn pairwise_weighted_metrics_match_reference_on_diverse_trees() {
+        let snaps = Snapshots::from_newicks(&DIVERSE_TREES, false).unwrap();
+        assert_matches_reference(&snaps, "diverse fixtures");
+    }
+
+    /// Deterministic LCG, so a failure here is always reproducible.
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state >> 33
+    }
+
+    /// Random binary topology over `n_taxa` leaves, built by repeatedly joining
+    /// two randomly chosen subtrees.
+    fn random_newick(n_taxa: usize, state: &mut u64) -> String {
+        let mut parts: Vec<String> = (0..n_taxa).map(|i| format!("T{i}")).collect();
+        while parts.len() > 1 {
+            let i = (lcg(state) as usize) % parts.len();
+            let a = parts.swap_remove(i);
+            let j = (lcg(state) as usize) % parts.len();
+            let b = parts.swap_remove(j);
+            let la = (lcg(state) % 100 + 1) as f64 / 100.0;
+            let lb = (lcg(state) % 100 + 1) as f64 / 100.0;
+            parts.push(format!("({a}:{la},{b}:{lb})"));
+        }
+        format!("{};", parts.pop().unwrap())
+    }
+
+    /// Differential test against [`reference_distances`] over a spread of taxon
+    /// counts and sharing levels.
+    ///
+    /// `duplicates` matters because the column filter keys off how many trees
+    /// hold a split: distinct trees push splits into the dropped bucket,
+    /// duplicates pull them back into shared columns.
+    #[test]
+    fn pairwise_backends_match_reference_on_random_trees() {
+        for &(n_taxa, n_trees, duplicates, seed) in &[
+            (8usize, 6usize, 0usize, 1u64),
+            (12, 8, 0, 2),
+            (20, 10, 0, 3),
+            (31, 9, 0, 4),
+            (16, 6, 3, 5),   // forces splits into the shared-column bucket
+            (24, 5, 5, 6),   // majority duplicates
+            (10, 12, 11, 7), // all but one identical
+        ] {
+            let mut state = seed;
+            let mut newicks: Vec<String> = (0..n_trees)
+                .map(|_| random_newick(n_taxa, &mut state))
+                .collect();
+            for k in 0..duplicates {
+                newicks.push(newicks[k % n_trees].clone());
+            }
+
+            let refs: Vec<&str> = newicks.iter().map(|s| s.as_str()).collect();
+            let snaps = Snapshots::from_newicks(&refs, false).unwrap();
+            assert_matches_reference(&snaps, &format!("seed={seed} taxa={n_taxa}"));
+
+            // Duplicated trees must land on exactly zero, not a rounding crumb.
+            let n = snaps.snapshots.len();
+            let (wrf, kf) = (snaps.pairwise_wrf(None), snaps.pairwise_kf(None));
+            for i in 0..n {
+                for j in 0..n {
+                    if refs[i] == refs[j] {
+                        assert_eq!(wrf[i * n + j], 0.0, "WRF identical, seed={seed} [{i}][{j}]");
+                        assert_eq!(kf[i * n + j], 0.0, "KF identical, seed={seed} [{i}][{j}]");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
