@@ -64,9 +64,8 @@ py311 = ["py311"]
 py312 = ["py312"]
 
 [tool.pixi.tasks]
-test                   = { cmd = "cargo test --lib --features python && cargo test -p treetracer-core --lib && pytest tests/test_python_api.py -v", description = "Run rust & python tests" }
-test-core              = { cmd = "cargo test -p treetracer-core --lib", description = "Run the treetracer-core (browser/diagnostics) unit tests" }
-build-wasm             = { cmd = "wasm-pack build treetracer-core --target web --release", description = "Build the browser bundle into treetracer-core/pkg" }
+test                   = { cmd = "cargo test --lib --features python && pytest tests/test_python_api.py -v", description = "Run rust & python tests" }
+check-wasm             = { cmd = "cargo check --lib --no-default-features --target wasm32-unknown-unknown", description = "Hold the crate to its wasm-compatibility promise (needs `rustup target add wasm32-unknown-unknown`). The browser bundle itself is built from treetracer-web's core/." }
 test-rust              = { cmd = "cargo test --lib --features python", description = "Run Rust unit tests (with the python feature so progress.rs + embedded-Python integration tests are included)", env = { PYO3_PYTHON = "$CONDA_PREFIX/bin/python", LD_LIBRARY_PATH = "$CONDA_PREFIX/lib", DYLD_LIBRARY_PATH = "$CONDA_PREFIX/lib" } }
 test-rust-cov          = { cmd = "cargo llvm-cov --lib --features python --lcov --output-path rust-lcov.info", description = "Run Rust + embedded-Python tests under llvm-cov and write rust-lcov.info", env = { PYO3_PYTHON = "$CONDA_PREFIX/bin/python", LD_LIBRARY_PATH = "$CONDA_PREFIX/lib", DYLD_LIBRARY_PATH = "$CONDA_PREFIX/lib" } }
 test-python            = { cmd = "pytest tests/test_python_api.py -v", description = "Run Python API tests" }

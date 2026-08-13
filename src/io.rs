@@ -19,7 +19,7 @@ use std::io;
 use std::io::{BufReader, BufWriter, Read, Write};
 
 /// Strip BEAST `[&...]` annotations from a Newick string.
-pub(crate) fn strip_beast_annotations(newick: &str) -> String {
+pub fn strip_beast_annotations(newick: &str) -> String {
     let mut result = String::with_capacity(newick.len());
     let mut in_annotation = false;
     let mut chars = newick.chars().peekable();
@@ -77,37 +77,14 @@ pub(crate) fn load_beast_raw<P: AsRef<Path>>(
         .map(|s| s.trim_end_matches(".trees"))
         .unwrap_or("unknown");
 
-    load_beast_raw_str(
-        &content,
-        base_name,
-        burnin_trees,
-        burnin_states,
-        use_real_taxa,
-    )
-}
-
-/// String-based counterpart to [`load_beast_raw`].
-///
-/// Exists for callers with no filesystem: the browser build receives the file
-/// contents through the File API and never has a path. Keeping both entry
-/// points on one body means the NEXUS handling — translate blocks, burnin,
-/// BEAST annotation stripping — cannot drift between the desktop and web
-/// builds.
-pub(crate) fn load_beast_raw_str(
-    content: &str,
-    base_name: &str,
-    burnin_trees: usize,
-    burnin_states: usize,
-    use_real_taxa: bool,
-) -> (HashMap<String, String>, Vec<(String, String)>) {
-    let taxons = parse_taxon_block(content);
+    let taxons = parse_taxon_block(&content);
     let translate_map = if use_real_taxa {
         taxons
     } else {
         HashMap::new()
     };
 
-    let tree_pairs: Vec<(String, String)> = collect_tree_blocks(content)
+    let tree_pairs: Vec<(String, String)> = collect_tree_blocks(&content)
         .into_iter()
         .enumerate()
         .map(|(idx, tree)| {
@@ -355,7 +332,8 @@ fn snap_read_strings<R: io::Read>(r: &mut R, n: usize) -> io::Result<Vec<String>
         .collect()
 }
 
-fn extract_name_state(header: &str) -> (String, usize) {
+/// Split a NEXUS tree header into `(tree_name, state_number)`.
+pub fn extract_name_state(header: &str) -> (String, usize) {
     let upper = header.to_ascii_uppercase();
     if let Some(state_pos) = upper.find("STATE_")
         && let Some((_, rest)) = header.split_once(' ')
@@ -377,222 +355,6 @@ struct TreeBlock<'a> {
     body: String,
 }
 
-/// Zero-copy counterpart to [`collect_tree_blocks`]: borrows each tree body out
-/// of `content` instead of allocating a `String` per tree.
-///
-/// Used by [`load_beast_subsampled_str`], where most trees are about to be
-/// discarded and allocating them first is pure waste. On a 252 MB BEAST file
-/// with 4001 trees, materialising every body costs ~240 MB before subsampling
-/// even runs.
-fn collect_tree_block_refs(content: &str) -> Vec<(&str, &str)> {
-    content
-        .lines()
-        .skip_while(|line| !line.to_ascii_uppercase().starts_with("TREE "))
-        .take_while(|line| !line.trim().to_ascii_uppercase().starts_with("END;"))
-        .filter_map(|line| {
-            let mut parts = line.splitn(2, " = ");
-            let header = parts.next()?.trim();
-            let body = parts.next()?.trim();
-            Some((header, body))
-        })
-        .collect()
-}
-
-/// Load a BEAST file, applying proportional burnin and even subsampling before
-/// any per-tree allocation happens.
-///
-/// Returns `(translate_map, kept_pairs, total_trees, burnin_count)`.
-///
-/// * `burnin_percent` — share of the chain dropped from the front (1.0 = 1%).
-///   Proportional rather than absolute, so one setting is meaningful across
-///   chains of different lengths. Never drops the whole chain.
-/// * `target_trees` — how many to keep afterwards, spaced evenly across what
-///   remains. `0` keeps everything; a target above the chain length keeps
-///   everything.
-///
-/// Even spacing rather than "the first N": a contiguous slice would sample one
-/// narrow window of the chain and misrepresent how it mixed.
-/// Keys carrying a log density in a BEAST tree header, in preference order.
-///
-/// A `.trees` line looks like
-/// `tree STATE_0 [&lnP=-72411.03,joint=-72411.03] = [&R] (…);`
-/// and which key is present depends on the BEAST version and what was logged.
-/// The order here matches `callbacks/diagnostics.py`.
-const DENSITY_KEYS: [&str; 5] = ["lnP", "lnL", "posterior", "joint", "loglikelihood"];
-
-/// Pull `key=value` pairs out of the `[&…]` block in a tree header.
-///
-/// Only the header is scanned, never the newick body — branch annotations like
-/// `[&rate=0.65]` appear thousands of times per line and none of them are a
-/// tree-level statistic.
-pub(crate) fn parse_header_annotations(header: &str) -> Vec<(String, String)> {
-    let Some(open) = header.find("[&") else {
-        return Vec::new();
-    };
-    let rest = &header[open + 2..];
-    let Some(close) = rest.find(']') else {
-        return Vec::new();
-    };
-    rest[..close]
-        .split(',')
-        .filter_map(|kv| {
-            let (k, v) = kv.split_once('=')?;
-            Some((k.trim().to_string(), v.trim().to_string()))
-        })
-        .collect()
-}
-
-/// The log density of a tree, taking the first key that is present.
-fn header_log_density(header: &str) -> (f64, Option<String>) {
-    let anns = parse_header_annotations(header);
-    for key in DENSITY_KEYS {
-        if let Some((_, v)) = anns.iter().find(|(k, _)| k.eq_ignore_ascii_case(key))
-            && let Ok(parsed) = v.parse::<f64>()
-        {
-            return (parsed, Some(key.to_string()));
-        }
-    }
-    (f64::NAN, None)
-}
-
-/// The chain a tree belongs to, taken from its name.
-///
-/// BEAST files are often concatenations of several independent chains — the
-/// ZIKA example ships eight in one file, named `classic1_STATE_…`,
-/// `stlbeauti4_STATE_…` and so on. Everything before `_STATE_` names the
-/// chain.
-///
-/// Recognising them matters twice over. State numbers restart at each
-/// boundary, so a trace plotted against state jumps backwards once per chain;
-/// and a convergence tool that reports eight chains as one has thrown away the
-/// comparison it exists to make.
-pub(crate) fn chain_of(tree_name: &str) -> &str {
-    match tree_name.find("_STATE_") {
-        Some(i) => &tree_name[..i],
-        // No STATE marker: treat the whole file as a single chain.
-        None => "",
-    }
-}
-
-/// Everything one `.trees` file contributes to an analysis.
-pub struct LoadedTrees {
-    pub translate: HashMap<String, String>,
-    pub names: Vec<String>,
-    pub newicks: Vec<String>,
-    /// Log density per kept tree; `NaN` where the file records none.
-    pub log_density: Vec<f64>,
-    /// Which annotation key supplied it, for axis labelling.
-    pub density_field: Option<String>,
-    /// MCMC state number per kept tree, for plotting against chain position.
-    pub states: Vec<u64>,
-    /// Chain label per kept tree; empty when the file holds only one.
-    pub chains: Vec<String>,
-    /// Distinct chain labels, in file order.
-    pub chain_labels: Vec<String>,
-    pub total: usize,
-    pub burnin: usize,
-}
-
-pub fn load_beast_subsampled_str(
-    content: &str,
-    base_name: &str,
-    burnin_percent: f64,
-    target_trees: usize,
-    use_real_taxa: bool,
-) -> LoadedTrees {
-    let translate_map = if use_real_taxa {
-        parse_taxon_block(content)
-    } else {
-        HashMap::new()
-    };
-
-    let blocks = collect_tree_block_refs(content);
-    let total = blocks.len();
-    if total == 0 {
-        return LoadedTrees {
-            translate: translate_map,
-            names: Vec::new(),
-            newicks: Vec::new(),
-            log_density: Vec::new(),
-            density_field: None,
-            states: Vec::new(),
-            chains: Vec::new(),
-            chain_labels: Vec::new(),
-            total: 0,
-            burnin: 0,
-        };
-    }
-
-    // Split into chains first: burnin and subsampling are per chain, or a 1%
-    // burnin over an eight-chain file would discard the start of chain one and
-    // nothing from the other seven.
-    let mut chain_labels: Vec<String> = Vec::new();
-    let mut chain_rows: Vec<Vec<usize>> = Vec::new();
-    for (i, (header, _)) in blocks.iter().enumerate() {
-        let (name, _) = extract_name_state(header);
-        let chain = chain_of(&name).to_string();
-        match chain_labels.iter().position(|c| *c == chain) {
-            Some(k) => chain_rows[k].push(i),
-            None => {
-                chain_labels.push(chain);
-                chain_rows.push(vec![i]);
-            }
-        }
-    }
-
-    let pct = burnin_percent.clamp(0.0, 100.0);
-    let mut names = Vec::new();
-    let mut newicks = Vec::new();
-    let mut log_density = Vec::new();
-    let mut states = Vec::new();
-    let mut chains = Vec::new();
-    let mut density_field = None;
-    let mut burnin_total = 0usize;
-
-    for (k, rows) in chain_rows.iter().enumerate() {
-        let n = rows.len();
-        let burnin = (((n as f64) * pct / 100.0).floor() as usize).min(n.saturating_sub(1));
-        let available = n - burnin;
-        let target = if target_trees == 0 {
-            available
-        } else {
-            target_trees.min(available)
-        };
-        burnin_total += burnin;
-
-        for i in 0..target {
-            let idx = rows[burnin + (i * available) / target];
-            let (header, body) = blocks[idx];
-            let (name, state) = extract_name_state(header);
-            // Read the header's annotations before they are stripped: `lnP`
-            // and friends live there, and discarding them was what left the
-            // browser build with no log-density trace at all.
-            let (density, field) = header_log_density(header);
-            if density_field.is_none() {
-                density_field = field;
-            }
-            names.push(format!("{base_name}_{name}"));
-            newicks.push(strip_beast_annotations(body));
-            log_density.push(density);
-            states.push(state as u64);
-            chains.push(chain_labels[k].clone());
-        }
-    }
-
-    LoadedTrees {
-        translate: translate_map,
-        names,
-        newicks,
-        log_density,
-        density_field,
-        states,
-        chains,
-        chain_labels,
-        total,
-        burnin: burnin_total,
-    }
-}
-
 fn collect_tree_blocks(content: &str) -> Vec<TreeBlock<'_>> {
     content
         .lines()
@@ -607,7 +369,8 @@ fn collect_tree_blocks(content: &str) -> Vec<TreeBlock<'_>> {
         .collect()
 }
 
-fn parse_taxon_block(content: &str) -> HashMap<String, String> {
+/// Read a NEXUS `TRANSLATE` block into a numeric-ID → taxon-name map.
+pub fn parse_taxon_block(content: &str) -> HashMap<String, String> {
     content
         .lines()
         .skip_while(|line| !line.trim().to_ascii_uppercase().starts_with("TRANSLATE"))
@@ -885,46 +648,5 @@ mod tests {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(b"NOPE").unwrap();
         assert!(load_snapshots(tmp.path()).is_err());
-    }
-}
-
-#[cfg(test)]
-mod annotation_tests {
-    use super::*;
-
-    #[test]
-    fn reads_lnp_from_a_real_beast_header() {
-        let header = "tree STATE_0 [&lnP=-72411.03428232882,joint=-72411.03428232882]";
-        let (v, field) = header_log_density(header);
-        assert!((v + 72411.03428232882).abs() < 1e-9, "got {v}");
-        assert_eq!(field.as_deref(), Some("lnP"));
-    }
-
-    #[test]
-    fn prefers_lnp_over_joint() {
-        let header = "tree STATE_1 [&joint=-5.0,lnP=-1.0]";
-        assert_eq!(header_log_density(header).1.as_deref(), Some("lnP"));
-    }
-
-    #[test]
-    fn falls_back_through_the_key_list() {
-        let (v, f) = header_log_density("tree STATE_2 [&posterior=-3.5]");
-        assert_eq!(f.as_deref(), Some("posterior"));
-        assert!((v + 3.5).abs() < 1e-12);
-    }
-
-    #[test]
-    fn missing_annotations_give_nan() {
-        assert!(header_log_density("tree STATE_3").0.is_nan());
-        assert!(header_log_density("tree STATE_4 [&rate=0.5]").0.is_nan());
-    }
-
-    #[test]
-    fn only_the_header_is_scanned() {
-        // A branch annotation in the body must not be mistaken for a
-        // tree-level statistic; callers pass the header alone.
-        let anns = parse_header_annotations("tree STATE_5 [&lnP=-2.0]");
-        assert_eq!(anns.len(), 1);
-        assert_eq!(anns[0].0, "lnP");
     }
 }

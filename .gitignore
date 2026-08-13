@@ -11,6 +11,3 @@ treetracer/
 # pixi environments
 .pixi/*
 !.pixi/config.toml
-
-# wasm-pack output for the treetracer-core member
-treetracer-core/pkg/

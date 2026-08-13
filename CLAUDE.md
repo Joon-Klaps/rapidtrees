@@ -14,18 +14,18 @@ convergence diagnostics, ESS calculations, and tanglegram visualisations.
 
 ## Architecture
 
-This is a two-member Cargo workspace. The root package is `rapidtrees` itself;
-`treetracer-core/` is the second member.
+This is a single-package repo: `rapidtrees` and nothing else.
 
-**The split is by audience, not by subject.** `rapidtrees` answers one question —
-how far apart are two trees — and is consumed by Python (PyO3) and a CLI.
-`treetracer-core` is everything the *browser* needs on top of that answer, and is
-consumed only by `treetracer-web`. Nothing in `treetracer-core` is reachable from
-the Python or CLI side.
+**The split with treetracer is by audience, not by subject.** `rapidtrees`
+answers one question — how far apart are two trees — and is consumed by Python
+(PyO3) and a CLI. Everything the *browser* needs on top of that answer lives in
+`treetracer-core`, which is **not in this repo**: it is `core/` in the
+[treetracer-web](https://github.com/Joon-Klaps/treetracer-web) repo, and it
+depends on this crate as a pinned git dependency.
 
 ```
-Cargo.toml              — [workspace] + the rapidtrees package + [patch.crates-io]
-src/                    — rapidtrees: the distance kernel. No wasm-bindgen here.
+Cargo.toml              — the rapidtrees package + [patch.crates-io]
+src/                    — the distance kernel. No wasm-bindgen here.
   api.rs        — PyO3 bindings (keep minimal — logic lives in snapshot.rs / distances.rs)
   bitset.rs     — compact bitset for leaf sets; inner-most hot path
   snapshot.rs   — Snapshot / Snapshots types, canonicalisation, interning
@@ -34,14 +34,6 @@ src/                    — rapidtrees: the distance kernel. No wasm-bindgen her
   par.rs        — rayon-or-sequential shim; `pub` so dependents share one policy
   main.rs       — CLI binary
   lib.rs        — public re-exports
-treetracer-core/src/    — browser bindings + diagnostics built on a distance matrix
-  wasm.rs       — the wasm-bindgen boundary (keep it thin, like api.rs)
-  mds.rs        — PCoA projection of the distance matrix
-  clades.rs     — clade frequencies, maximum clade credibility
-  ess.rs        — pseudo-ESS
-  hipstr.rs     — HIPSTR summary trees
-  layout.rs     — tree coordinates for drawing
-  stats.rs      — shared statistical helpers
 tests/
   test_python_api.py   — Python integration tests (includes phangorn R comparisons)
 benches/
@@ -58,22 +50,33 @@ docs/
    every one of them onto an identical wasm-bindgen version.
 2. **`rapidtrees` stays wasm-*compatible*.** No Fortran-LAPACK linear algebra, no
    C-library codec deps, and every parallel loop goes through `par.rs`. That is
-   what lets it link into a wasm build at all.
-3. **New browser-only algorithms go in `treetracer-core`**, not `src/`. If the
-   Python side later needs one, move it down *and* add a PyO3 binding — do not
-   leave it reachable from only one side.
-4. **`[patch.crates-io]` lives in the root manifest only.** A patch table in a
-   member manifest is silently ignored, and the build then fails on phylotree's
-   `needletail` → bzip2/xz.
+   what lets it link into a wasm build at all. Enforced by
+   `cargo check --lib --no-default-features --target wasm32-unknown-unknown`,
+   which runs in pre-commit and in CI.
+3. **Browser-only algorithms do not belong here.** They go in treetracer-web's
+   `core/`. The test is whether the Python API or CLI can reach it: if not, it
+   is not a `rapidtrees` concern. MCMC diagnostics — log densities, chain
+   splitting, burnin, subsampling — are the browser's, which is why BEAST
+   *header* semantics live there while NEXUS *primitives* (`parse_taxon_block`,
+   `extract_name_state`, `strip_beast_annotations`, `rename_leaf_nodes`) stay
+   here and are `pub` for it to build on.
+4. **Anything `pub` in `io.rs` is treetracer-web's API.** Changing one of those
+   four signatures breaks that repo's build with no compiler to warn you, since
+   it is a git dependency rather than a workspace member. Treat them as
+   published surface.
 
 ### Building the browser bundle
 
+Not from this repo. In treetracer-web:
+
 ```bash
-pixi run build-wasm      # wasm-pack build treetracer-core --target web --release
+wasm-pack build core --release --target web --out-dir pkg
 ```
 
-Output lands in `treetracer-core/pkg/` (gitignored) and is vendored into
-`treetracer-web/src/wasm/`.
+That crate pins `rapidtrees` by git branch, so **local changes here are invisible
+to it until pushed.** To build treetracer-web against a working tree, uncomment
+the `[patch."https://github.com/Joon-Klaps/rapidtrees"]` block at the bottom of
+`core/Cargo.toml`.
 
 ---
 

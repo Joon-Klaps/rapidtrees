@@ -1,11 +1,3 @@
-# This package is also the workspace root, so `[patch.crates-io]` below applies
-# to every member. A patch table in a member manifest is silently ignored.
-[workspace]
-members = ["treetracer-core"]
-# Explicit rather than inherited from edition 2024: v1 unifies features across
-# members, which would drag pyo3/rayon into the wasm build of `treetracer-core`.
-resolver = "3"
-
 [package]
 name = "rapidtrees"
 version = "0.7.1"
@@ -47,11 +39,6 @@ cli = ["clap", "flate2"]
 parallel = ["rayon"]
 python = ["pyo3", "parallel"]
 extension-module = ["python", "pyo3/extension-module"]
-# NOTE: there is no `wasm` feature here any more. Browser bindings live in the
-# `treetracer-core` member, which depends on this crate with
-# `default-features = false`. This crate stays wasm-*compatible* (that is what
-# the phylotree fork, the `parallel` gate and the pure-Rust deps buy) without
-# knowing that wasm-bindgen exists.
 
 # Until https://github.com/lucblassel/phylotree-rs/pull/18 lands, take
 # phylotree from the fork that makes it wasm-clean. Pinned to a rev rather
