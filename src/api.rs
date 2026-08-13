@@ -567,27 +567,6 @@ mod tests {
 /// Embedded-Python integration tests that exercise every PyO3 entry point
 /// from Rust.
 ///
-/// **Why** — `cargo test --lib` would normally never enter any `#[pyfunction]`
-/// body or `ProgressCounter`'s `#[pymethods]`: they are only reachable through
-/// the Python interpreter that loads the wheel. That made codecov report all
-/// PyO3 surface as `FNDA:0` (untested) even though pytest exercised it.
-///
-/// This module pulls the Python interpreter into the test binary instead.
-/// `append_to_inittab!(rapidtrees)` registers the `#[pymodule] rapidtrees`
-/// function into the interpreter's built-in module table, and
-/// `prepare_freethreaded_python()` initialises CPython. From then on we can
-/// `py.import("rapidtrees")` and call the real `pairwise_*` / `ProgressCounter`
-/// functions exactly like Python would. cargo test now measures coverage of
-/// the whole PyO3 surface without needing pytest to be run under
-/// `cargo llvm-cov`.
-///
-/// Requires `cargo test --features python` (no `extension-module`, so the test
-/// binary links libpython) and `DYLD_FALLBACK_LIBRARY_PATH` (macOS) /
-/// `LD_LIBRARY_PATH` (Linux) pointing at the python lib dir — `pixi run
-/// test-rust` sets those for you. On macOS use the *fallback* variable:
-/// `DYLD_LIBRARY_PATH` outranks the normal search and is inherited by `cargo`
-/// itself, which then loads the conda env's libcurl/libiconv over the system
-/// ones and segfaults before printing anything.
 #[cfg(test)]
 mod py_integration_tests {
     use pyo3::prelude::*;
