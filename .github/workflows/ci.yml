@@ -60,7 +60,7 @@ jobs:
               env:
                   PYO3_PYTHON: ${{ github.workspace }}/.pixi/envs/default/bin/python
                   LD_LIBRARY_PATH: ${{ github.workspace }}/.pixi/envs/default/lib
-                  DYLD_LIBRARY_PATH: ${{ github.workspace }}/.pixi/envs/default/lib
+                  DYLD_FALLBACK_LIBRARY_PATH: ${{ github.workspace }}/.pixi/envs/default/lib:/usr/local/lib:/usr/lib
               run: cargo test --verbose --lib --features python
 
     python-test:

@@ -20,8 +20,8 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [dependencies]
-# `default-features = false` drops phylotree's CLI-only deps — `needletail`
-# pulls in the bzip2 and xz C libraries, which have no wasm build.
+# Until https://github.com/lucblassel/phylotree-rs/pull/18 lands, take
+# phylotree from the fork that makes it wasm-clean. Pinned to a rev rather
 phylotree = { version = "0.1.3", default-features = false }
 pyo3 = { version = "0.27.1", optional = true }
 rayon = { version = "1", optional = true }
@@ -33,9 +33,7 @@ hashbrown = "0.17.1"
 [features]
 default = ["cli", "parallel"]
 cli = ["clap", "flate2"]
-# Rayon-backed parallelism. On by default; off for wasm32, where rayon cannot
-# spawn threads without `wasm-bindgen-rayon` and cross-origin isolation.
-# See `src/par.rs`.
+# Rayon-backed parallelism (`par.rs`). On by default; off for wasm32.
 parallel = ["rayon"]
 python = ["pyo3", "parallel"]
 extension-module = ["python", "pyo3/extension-module"]

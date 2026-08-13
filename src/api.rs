@@ -581,9 +581,13 @@ mod tests {
 /// the whole PyO3 surface without needing pytest to be run under
 /// `cargo llvm-cov`.
 ///
-/// Requires `cargo test --features python` (no `extension-module`, so the
-/// test binary links libpython) and `DYLD_LIBRARY_PATH` / `LD_LIBRARY_PATH`
-/// pointing at the python lib dir — pixi tasks set those for you.
+/// Requires `cargo test --features python` (no `extension-module`, so the test
+/// binary links libpython) and `DYLD_FALLBACK_LIBRARY_PATH` (macOS) /
+/// `LD_LIBRARY_PATH` (Linux) pointing at the python lib dir — `pixi run
+/// test-rust` sets those for you. On macOS use the *fallback* variable:
+/// `DYLD_LIBRARY_PATH` outranks the normal search and is inherited by `cargo`
+/// itself, which then loads the conda env's libcurl/libiconv over the system
+/// ones and segfaults before printing anything.
 #[cfg(test)]
 mod py_integration_tests {
     use pyo3::prelude::*;
