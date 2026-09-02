@@ -30,6 +30,7 @@ src/                    — the distance kernel. No wasm-bindgen here.
   bitset.rs     — compact bitset for leaf sets; inner-most hot path
   snapshot.rs   — Snapshot / Snapshots types, canonicalisation, interning
   distances.rs  — RF, WRF, KF algorithms
+  gpu_layout.rs — GPU buffer layouts + WGSL sources; no GPU dep. `pub` for treetracer-web
   io.rs         — BEAST/NEXUS parsing, annotation stripping
   par.rs        — rayon-or-sequential shim; `pub` so dependents share one policy
   main.rs       — CLI binary
@@ -45,14 +46,26 @@ docs/
 
 ### Rules that keep the split honest
 
-1. **`rapidtrees` must never depend on `wasm-bindgen`.** `treetracer-core` is the
-   only crate in the graph that links it. Multiple bindgen crates would force
-   every one of them onto an identical wasm-bindgen version.
+1. **`rapidtrees` must never depend on `wasm-bindgen` *directly*.** `treetracer-core`
+   is the only crate in the graph that should `use` it. Note it is already a
+   transitive dependency on wasm32 — `phylotree → rand → rand_core → getrandom
+   0.2 → js-sys → wasm-bindgen` — so cargo already unifies the two crates onto
+   one version whether we like it or not; the rule is about not *adding* to that
+   coupling, not a claim that the graph is clean. Check with
+   `cargo tree --target wasm32-unknown-unknown -e normal -i wasm-bindgen`.
+   The practical consequence: no `wgpu`. It links wasm-bindgen on wasm, drags
+   naga in behind it, and would put megabytes of GPU plumbing in a crate whose
+   CLI and Python consumers will never dispatch a shader. GPU *layouts* and
+   WGSL text are dependency-free and do live here, in `gpu_layout.rs`; the
+   device, pipelines and dispatch belong to treetracer-web.
 2. **`rapidtrees` stays wasm-*compatible*.** No Fortran-LAPACK linear algebra, no
    C-library codec deps, and every parallel loop goes through `par.rs`. That is
    what lets it link into a wasm build at all. Enforced by
    `cargo check --lib --no-default-features --target wasm32-unknown-unknown`,
-   which runs in pre-commit and in CI.
+   which runs in pre-commit and in CI. CI additionally checks the *threaded*
+   configuration treetracer-web actually ships (`pixi run check-wasm-threads`:
+   rayon on, atomics-enabled std, nightly + `-Z build-std`). That one is not a
+   pre-commit hook — it rebuilds std and is far too slow for a commit.
 3. **Browser-only algorithms do not belong here.** They go in treetracer-web's
    `core/`. The test is whether the Python API or CLI can reach it: if not, it
    is not a `rapidtrees` concern. MCMC diagnostics — log densities, chain
@@ -60,10 +73,13 @@ docs/
    *header* semantics live there while NEXUS *primitives* (`parse_taxon_block`,
    `extract_name_state`, `strip_beast_annotations`, `rename_leaf_nodes`) stay
    here and are `pub` for it to build on.
-4. **Anything `pub` in `io.rs` is treetracer-web's API.** Changing one of those
-   four signatures breaks that repo's build with no compiler to warn you, since
-   it is a git dependency rather than a workspace member. Treat them as
-   published surface.
+4. **Anything `pub` in `io.rs` or `gpu_layout.rs` is treetracer-web's API.**
+   Changing one of those signatures breaks that repo's build with no compiler to
+   warn you, since it is a git dependency rather than a workspace member. Treat
+   them as published surface. For `gpu_layout` the coupling is tighter than a
+   signature: the WGSL text and the buffer layout have to agree, so a change to
+   one is a change to both, and the CPU-replay tests in that module are what
+   catch it.
 
 ### Building the browser bundle
 
@@ -135,6 +151,10 @@ pixi run develop
 
 # Rust tests
 pixi run pre-commit          # cargo test --lib & cargo clippy & cargo fmt
+
+# Wasm compatibility (sequential fallback, and the threaded build the browser ships)
+pixi run check-wasm
+pixi run check-wasm-threads  # needs nightly + `rustup component add rust-src --toolchain nightly`
 
 # Python API tests
 pixi run test-python         # pytest tests/test_python_api.py -v

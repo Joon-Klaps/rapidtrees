@@ -8,6 +8,18 @@ This project uses release names based on random words from [codenamegenerator.co
     - PREFIX: Microsoft Corperation
     - DICTIONARY: Snakes
 
+## [Unreleased]
+
+- **wasm (threads):** The threaded browser configuration is now a supported, CI-checked build. Nothing in this crate blocked it — rayon already compiled for `wasm32-unknown-unknown`, the `parallel` feature was simply never switched on by the consumer — so this is documentation and CI rather than new code. `par.rs`'s module docs were wrong on the key point: rayon's *iterators* work on wasm, only its *default pool* does not, because `rayon-core` spawns through `std::thread::Builder`. Building the pool stays the caller's job (`treetracer-core`, via `wasm-bindgen-rayon`), which needs no API between the two crates — rayon's global pool is picked up by these call sites automatically.
+  - **CI:** New `wasm-compat` step checks rayon-on + atomics-enabled std (nightly, `-Z build-std`, `-C target-feature=+atomics,+bulk-memory,+mutable-globals`). Exposed as `pixi run check-wasm-threads`. Deliberately not a pre-commit hook: `-Z build-std` rebuilds std and is far too slow for a commit.
+  - **Note:** the threaded build requires nightly — `atomics` is still an unstable `-C target-feature` — and a cross-origin-isolated page at runtime.
+- **API (Rust, additive):** New `gpu_layout` module: WGSL kernel sources plus the buffer layouts they read (`split_bit_rows`, `weighted_rows`). No GPU dependency — `wgpu` on wasm links `wasm-bindgen`, and a browser device request and buffer readback are both async, so the device, pipelines and dispatch stay in `treetracer-core`. Only the layout lives here, so the bit packing cannot be reimplemented against the public API and drift from `distances.rs`. Like the `pub` items in `io.rs`, this is published surface for treetracer-web.
+  - The weighted kernels run over *shared-candidate columns only*, folding splits held by one tree alone into a per-tree `unique_self` term, rather than dense over every split. At 4 000 trees that is ~42 MB instead of ~768 MB — the dense form does not fit WebGPU's default 128 MiB `maxStorageBufferBindingSize` at all.
+  - `weighted_rows` delegates column filtering to the same `shared_length_rows` the CPU path uses, so the two backends cannot disagree about which splits earn a column.
+  - Lengths downcast to `f32` (WGSL has no `f64`): expect ~1e-5 relative error against `pairwise_wrf` / `pairwise_kf`. RF is integer and exact.
+  - **Tests:** each shader's arithmetic is replayed on the CPU over these buffers and required to match `pairwise_*`, so a layout bug fails `cargo test` with no GPU present.
+- **Docs:** Corrected the claim, in both `CLAUDE.md` and `par.rs`, that this crate never depends on `wasm-bindgen`. On wasm32 it already does, transitively: `phylotree → rand → rand_core → getrandom 0.2 → js-sys → wasm-bindgen`. The reasons to keep `wgpu` out of this crate are real but different ones — binary size for CLI and Python consumers, and the async device API.
+
 ## [0.8.0] - 2026-08-13
 
 - **wasm:**: Instead of calling `rayon::prelude::*` directly, it's part of `par.rs` to allow wasm compatibility.

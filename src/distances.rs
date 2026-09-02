@@ -70,7 +70,7 @@ fn row_slice<T>(flat: &[T], i: usize, stride: usize) -> &[T] {
 }
 
 /// How many trees hold each split, indexed by split ID.
-fn split_tree_counts(snaps: &Snapshots) -> Vec<u32> {
+pub(crate) fn split_tree_counts(snaps: &Snapshots) -> Vec<u32> {
     let mut counts = vec![0u32; n_distinct_splits(snaps)];
     for snap in &snaps.snapshots {
         for &id in &snap.split_ids {
@@ -84,7 +84,7 @@ fn split_tree_counts(snaps: &Snapshots) -> Vec<u32> {
 ///
 /// Returns `(column_of, n_columns)`; `column_of[id]` is `u32::MAX` if dropped.
 /// Packing the survivors together is what shrinks the per-pair sweep.
-fn assign_columns(counts: &[u32], keep: impl Fn(u32) -> bool) -> (Vec<u32>, usize) {
+pub(crate) fn assign_columns(counts: &[u32], keep: impl Fn(u32) -> bool) -> (Vec<u32>, usize) {
     let mut column_of = vec![u32::MAX; counts.len()];
     let mut n_columns = 0u32;
     for (id, &count) in counts.iter().enumerate() {
@@ -155,13 +155,13 @@ pub(crate) fn distance_rf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> 
 
 /// Branch lengths over the shared-candidate splits, plus each tree's `self`
 /// contribution from the splits it holds alone.
-struct SharedRows {
+pub(crate) struct SharedRows {
     /// Flat `n × stride` matrix of lengths; 0 where a tree lacks the split.
-    rows: Vec<f64>,
+    pub(crate) rows: Vec<f64>,
     /// Row stride — how many split columns survived the filter.
-    stride: usize,
+    pub(crate) stride: usize,
     /// Per tree, `Σ term(length)` over splits no other tree holds.
-    unique_self: Vec<f64>,
+    pub(crate) unique_self: Vec<f64>,
 }
 
 /// Lay out branch lengths over only the splits at least two trees hold.
@@ -171,7 +171,7 @@ struct SharedRows {
 /// sets this cuts ~48 000 splits to ~2 600 (~19×); on similar sets it is nearly
 /// a no-op. "Everywhere" splits are kept: unlike in RF, they do not cancel out
 /// of a weighted score.
-fn shared_length_rows(snaps: &Snapshots, term: impl Fn(f64) -> f64) -> SharedRows {
+pub(crate) fn shared_length_rows(snaps: &Snapshots, term: impl Fn(f64) -> f64) -> SharedRows {
     let n = snaps.snapshots.len();
     let counts = split_tree_counts(snaps);
     let (column_of, stride) = assign_columns(&counts, |count| count >= 2);
@@ -270,7 +270,7 @@ pub(crate) fn distance_kf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> 
 /// Ground-truth RF, WRF, and KF distances verified against
 /// https://evolution.genetics.washington.edu/phylip/doc/treedist.html
 #[cfg(test)]
-const TREEDIST_TREES: [&str; 12] = [
+pub(crate) const TREEDIST_TREES: [&str; 12] = [
     "(A:0.1,(B:0.1,(H:0.1,(D:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
     "(A:0.1,(B:0.1,(D:0.1,((J:0.1,H:0.1):0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1);",
     "(A:0.1,(B:0.1,(D:0.1,(H:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);",
@@ -703,7 +703,7 @@ fn kuhner_felsenstein_treedist() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::TREEDIST_TREES;
     use crate::snapshot::{InternSnap, Snapshots};
     use std::collections::{BTreeMap, BTreeSet};
@@ -964,7 +964,7 @@ mod tests {
     /// tree only" bucket that [`shared_length_rows`] drops — which the treedist
     /// fixtures barely exercise. Branch lengths are all distinct so a wrongly
     /// dropped column changes the answer visibly.
-    const DIVERSE_TREES: [&str; 4] = [
+    pub(crate) const DIVERSE_TREES: [&str; 4] = [
         "(((A:0.11,B:0.12):0.13,(C:0.14,D:0.15):0.16):0.17,((E:0.18,F:0.19):0.21,(G:0.22,H:0.23):0.24):0.25);",
         "(((A:0.31,E:0.32):0.33,(C:0.34,G:0.35):0.36):0.37,((B:0.38,F:0.39):0.41,(D:0.42,H:0.43):0.44):0.45);",
         "(((A:0.51,H:0.52):0.53,(B:0.54,G:0.55):0.56):0.57,((C:0.58,F:0.59):0.61,(D:0.62,E:0.63):0.64):0.65);",
@@ -987,7 +987,7 @@ mod tests {
 
     /// Random binary topology over `n_taxa` leaves, built by repeatedly joining
     /// two randomly chosen subtrees.
-    fn random_newick(n_taxa: usize, state: &mut u64) -> String {
+    pub(crate) fn random_newick(n_taxa: usize, state: &mut u64) -> String {
         let mut parts: Vec<String> = (0..n_taxa).map(|i| format!("T{i}")).collect();
         while parts.len() > 1 {
             let i = (lcg(state) as usize) % parts.len();

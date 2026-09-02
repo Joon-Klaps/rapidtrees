@@ -128,3 +128,22 @@ jobs:
 
             - name: Clippy on the wasm32 build
               run: cargo clippy --lib --no-default-features --target wasm32-unknown-unknown -- -D warnings
+
+            # The browser build treetracer-web ships is threaded, which is a
+            # different configuration again: rayon on, atomics-enabled std. It
+            # needs nightly because `atomics` is still an unstable target
+            # feature, and `-Z build-std` because the prebuilt wasm32 std is
+            # compiled without it. Without this job a change that breaks the
+            # threaded build is invisible here and only fails in that repo.
+            - name: Setup nightly for the threaded wasm build
+              uses: dtolnay/rust-toolchain@nightly
+              with:
+                  targets: wasm32-unknown-unknown
+                  components: rust-src
+
+            - name: Check wasm32 build (threaded, atomics-enabled std)
+              env:
+                  RUSTFLAGS: "-C target-feature=+atomics,+bulk-memory,+mutable-globals"
+              run: >-
+                  cargo +nightly check --lib --no-default-features --features parallel
+                  --target wasm32-unknown-unknown -Z build-std=std,panic_abort

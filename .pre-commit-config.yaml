@@ -44,6 +44,11 @@ repos:
                 real wasm32 target: a host-target check passes even when a
                 rayon/pyo3-only path has crept in. Requires
                 `rustup target add wasm32-unknown-unknown`.
+
+                Only the sequential configuration is checked here. The threaded
+                one treetracer-web ships needs nightly and `-Z build-std`, which
+                rebuilds std and is far too slow for a commit hook; CI covers it
+                (`wasm-compat`), or run `pixi run check-wasm-threads` by hand.
             entry: cargo check --lib --no-default-features --target wasm32-unknown-unknown
             language: system
             types: [rust]
