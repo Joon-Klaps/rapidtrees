@@ -133,9 +133,6 @@ pub(crate) fn distance_rf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> 
 
     // Every tree holds all the everywhere-splits, so `a` is just its total minus
     // that fixed count.
-    // `u32` rather than `usize`: RF is bounded by the split count, far under
-    // `u32::MAX`, and the matrix is `n²` cells — at 100 000 trees that is 40 GB
-    // instead of 80 GB.
     let kept_per_tree: Vec<u32> = snaps
         .snapshots
         .iter()

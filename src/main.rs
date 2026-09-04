@@ -145,9 +145,7 @@ fn main() {
         .as_deref()
         .expect("output is required when not exporting snap");
 
-    // Each arm keeps its own element type all the way to the writer. RF used to
-    // be widened to `f64` here, which cost 8 bytes a cell on top of the matrix
-    // it was widened from — 160 GB at 100 000 trees, against 40 GB now.
+    // Each arm keeps its own element type all the way to the writer.
     let write_result = match args.metric {
         MetricArg::Rf => {
             let mat = run_with_progress(n_pairs, show_progress, |counter| {
