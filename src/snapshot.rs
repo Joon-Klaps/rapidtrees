@@ -779,6 +779,17 @@ impl Interner {
 mod tests {
     use super::*;
 
+    /// Decode a native-endian `f64` matrix emitted by `build_branch_length_matrix`.
+    fn decode_f64(bytes: &[u8]) -> Vec<f64> {
+        bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .copied()
+            .map(f64::from_ne_bytes)
+            .collect()
+    }
+
     /// A symmetric 4-leaf tree produces a single bipartition after canonicalization.
     ///
     /// ```text
@@ -1310,10 +1321,7 @@ mod tests {
         assert_eq!(n_bip, snaps.bipartitions.len());
 
         // Decode bytes to f64 matrix: shape (2, n_bip)
-        let floats: Vec<f64> = bytes
-            .chunks_exact(8)
-            .map(|b| f64::from_ne_bytes(b.try_into().unwrap()))
-            .collect();
+        let floats = decode_f64(&bytes);
         assert_eq!(floats.len(), 2 * n_bip);
 
         let row0 = &floats[..n_bip];
@@ -1370,10 +1378,7 @@ mod tests {
         assert_eq!(bl_col_to_bip, pres_col_to_bip);
 
         let n_bip = bl_col_to_bip.len();
-        let bl: Vec<f64> = bl_bytes
-            .chunks_exact(8)
-            .map(|b| f64::from_ne_bytes(b.try_into().unwrap()))
-            .collect();
+        let bl = decode_f64(&bl_bytes);
 
         // For every (tree, bipartition) cell: bl > 0 ↔ presence == 1.
         for tree in 0..2 {
@@ -1400,10 +1405,7 @@ mod tests {
         assert_eq!(col_to_bip_id.len(), 2);
         assert_eq!(bytes.len(), 2 * 2 * 8); // 2 trees × 2 bips × 8 bytes
 
-        let floats: Vec<f64> = bytes
-            .chunks_exact(8)
-            .map(|b| f64::from_ne_bytes(b.try_into().unwrap()))
-            .collect();
+        let floats = decode_f64(&bytes);
         // Both pendant columns must be non-zero in both trees.
         assert!(floats.iter().all(|&v| v > 0.0));
     }
@@ -1423,10 +1425,7 @@ mod tests {
         let (bytes, col_to_bip_id) = snaps.build_branch_length_matrix();
         let n_bip = col_to_bip_id.len();
 
-        let floats: Vec<f64> = bytes
-            .chunks_exact(8)
-            .map(|b| f64::from_ne_bytes(b.try_into().unwrap()))
-            .collect();
+        let floats = decode_f64(&bytes);
 
         // Find the column for the {C,D} bipartition (bits 2 and 3 set = 0b1100).
         let cd_col = col_to_bip_id.iter().position(|&id| {
