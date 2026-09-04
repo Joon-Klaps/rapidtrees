@@ -8,6 +8,10 @@ This project uses release names based on random words from [codenamegenerator.co
     - PREFIX: Microsoft Corperation
     - DICTIONARY: Snakes
 
+## [0.8.1] - Cortana Krait (2026-09-04)
+
+- ([#20](https://github.com/Joon-Klaps/rapidtrees/pull/20)) - **Memory (RF):** The RF matrix stays `u32` from kernel to writer instead of being built as `Vec<usize>` and widened to `f64` in `main.rs`
+
 ## [0.8.0] - 2026-08-13
 
 - **wasm:**: Instead of calling `rayon::prelude::*` directly, it's part of `par.rs` to allow wasm compatibility.
