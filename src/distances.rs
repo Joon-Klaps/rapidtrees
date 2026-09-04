@@ -102,7 +102,7 @@ fn assign_columns(counts: &[u32], keep: impl Fn(u32) -> bool) -> (Vec<u32>, usiz
 ///
 /// Splits held by *every* tree add equally to both `a` values and to the shared
 /// count, so they cancel exactly and are dropped before packing.
-pub(crate) fn distance_rf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> Vec<usize> {
+pub(crate) fn distance_rf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> Vec<u32> {
     let n = snaps.snapshots.len();
     if n == 0 {
         return Vec::new();
@@ -133,19 +133,22 @@ pub(crate) fn distance_rf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> 
 
     // Every tree holds all the everywhere-splits, so `a` is just its total minus
     // that fixed count.
-    let kept_per_tree: Vec<usize> = snaps
+    // `u32` rather than `usize`: RF is bounded by the split count, far under
+    // `u32::MAX`, and the matrix is `n²` cells — at 100 000 trees that is 40 GB
+    // instead of 80 GB.
+    let kept_per_tree: Vec<u32> = snaps
         .snapshots
         .iter()
-        .map(|snap| snap.split_ids.len() - everywhere)
+        .map(|snap| (snap.split_ids.len() - everywhere) as u32)
         .collect();
 
     fill_symmetric(n, progress, |i, j| {
         let row_i = row_slice(&packed, i, words);
         let row_j = row_slice(&packed, j, words);
-        let shared: usize = row_i
+        let shared: u32 = row_i
             .iter()
             .zip(row_j)
-            .map(|(&x, &y)| (x & y).count_ones() as usize)
+            .map(|(&x, &y)| (x & y).count_ones())
             .sum();
         kept_per_tree[i] + kept_per_tree[j] - 2 * shared
     })
@@ -918,7 +921,7 @@ mod tests {
                 let (want_rf, want_wrf, want_kf) =
                     reference_distances(&snaps.snapshots[i], &snaps.snapshots[j]);
 
-                assert_eq!(rf[i * n + j], want_rf, "RF at [{i}][{j}], {ctx}");
+                assert_eq!(rf[i * n + j] as usize, want_rf, "RF at [{i}][{j}], {ctx}");
                 assert!(
                     (wrf[i * n + j] - want_wrf).abs() <= 1e-9 * want_wrf.max(1.0),
                     "WRF {} vs reference {want_wrf} at [{i}][{j}], {ctx}",

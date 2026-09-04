@@ -139,7 +139,7 @@ fn pairwise_rf_from_newick_iter(
     })?;
     let rf_bytes: Vec<u8> = rf_matrix
         .chunks(n)
-        .flat_map(|row| row.iter().flat_map(|&v| (v as u32).to_ne_bytes()))
+        .flat_map(|row| row.iter().flat_map(|&v: &u32| v.to_ne_bytes()))
         .collect();
 
     let py_rf = PyBytes::new(py, &rf_bytes);
@@ -227,7 +227,7 @@ fn pairwise_rf_with_snapshots_from_newick_iter(
     })?;
     let rf_bytes: Vec<u8> = rf_matrix
         .chunks(n)
-        .flat_map(|row| row.iter().flat_map(|&v| (v as u32).to_ne_bytes()))
+        .flat_map(|row| row.iter().flat_map(|&v: &u32| v.to_ne_bytes()))
         .collect();
 
     let n_bipartitions = snaps.bipartitions.len();

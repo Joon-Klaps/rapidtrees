@@ -139,35 +139,46 @@ fn main() {
 
     let t = Instant::now();
     let show_progress = !quiet && std::io::stderr().is_terminal();
-    let mat: Vec<f64> = match args.metric {
-        MetricArg::Rf => run_with_progress(n_pairs, show_progress, |counter| {
-            interned
-                .pairwise_rf(Some(counter))
-                .into_iter()
-                .map(|dist| dist as f64)
-                .collect()
-        }),
-        MetricArg::Weighted => run_with_progress(n_pairs, show_progress, |counter| {
-            interned.pairwise_wrf(Some(counter))
-        }),
-        MetricArg::Kf => run_with_progress(n_pairs, show_progress, |counter| {
-            interned.pairwise_kf(Some(counter))
-        }),
-    };
-    log_if(
-        quiet,
-        format!(
-            "Computed {metric_label} distances in {:.3}s",
-            t.elapsed().as_secs_f64()
-        ),
-    );
 
-    let t = Instant::now();
     let output_path = args
         .output
         .as_deref()
         .expect("output is required when not exporting snap");
-    if let Err(e) = write_matrix_tsv(output_path, &names, &mat, interned.len()) {
+
+    // Each arm keeps its own element type all the way to the writer. RF used to
+    // be widened to `f64` here, which cost 8 bytes a cell on top of the matrix
+    // it was widened from — 160 GB at 100 000 trees, against 40 GB now.
+    let write_result = match args.metric {
+        MetricArg::Rf => {
+            let mat = run_with_progress(n_pairs, show_progress, |counter| {
+                interned.pairwise_rf(Some(counter))
+            });
+            log_computed(quiet, metric_label, &t);
+            let t = Instant::now();
+            let r = write_matrix_tsv(output_path, &names, &mat, interned.len());
+            (r, t)
+        }
+        MetricArg::Weighted => {
+            let mat = run_with_progress(n_pairs, show_progress, |counter| {
+                interned.pairwise_wrf(Some(counter))
+            });
+            log_computed(quiet, metric_label, &t);
+            let t = Instant::now();
+            let r = write_matrix_tsv(output_path, &names, &mat, interned.len());
+            (r, t)
+        }
+        MetricArg::Kf => {
+            let mat = run_with_progress(n_pairs, show_progress, |counter| {
+                interned.pairwise_kf(Some(counter))
+            });
+            log_computed(quiet, metric_label, &t);
+            let t = Instant::now();
+            let r = write_matrix_tsv(output_path, &names, &mat, interned.len());
+            (r, t)
+        }
+    };
+    let (write_result, t) = write_result;
+    if let Err(e) = write_result {
         eprintln!("Failed to write output {}: {e}", output_path.display());
         std::process::exit(4);
     }
@@ -183,6 +194,16 @@ fn main() {
     log_if(
         quiet,
         format!("Total runtime: {:.3}s", t_total.elapsed().as_secs_f64()),
+    );
+}
+
+fn log_computed(quiet: bool, metric_label: &str, t: &Instant) {
+    log_if(
+        quiet,
+        format!(
+            "Computed {metric_label} distances in {:.3}s",
+            t.elapsed().as_secs_f64()
+        ),
     );
 }
 

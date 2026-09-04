@@ -646,7 +646,7 @@ impl Snapshots {
     /// Pass `Some(counter)` to track progress: after each row `i` finishes, the
     /// counter is bumped by `n - i - 1`, reaching `n*(n-1)/2` when done. Pass
     /// `None` to skip the (negligible) counter work entirely.
-    pub fn pairwise_rf(&self, progress: Option<&std::sync::atomic::AtomicUsize>) -> Vec<usize> {
+    pub fn pairwise_rf(&self, progress: Option<&std::sync::atomic::AtomicUsize>) -> Vec<u32> {
         crate::distances::distance_rf(self, progress)
     }
 
@@ -877,7 +877,7 @@ mod tests {
         use phylotree::tree::Tree as PhyloTree;
 
         // Two trees means a two-tree `Snapshots`, read at the off-diagonal cell.
-        let rf_pair = |a: &str, b: &str, rooted: bool| -> usize {
+        let rf_pair = |a: &str, b: &str, rooted: bool| -> u32 {
             Snapshots::from_newicks(&[a, b], rooted)
                 .unwrap()
                 .pairwise_rf(None)[1]
