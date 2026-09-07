@@ -29,7 +29,7 @@ use pyo3::prelude::*;
 /// can keep reading the counter.
 ///
 /// Reading is lock-free: `.value()` is a single atomic load (~1 ns).
-#[pyclass(module = "rapidtrees")]
+#[pyclass(module = "rapidtrees", skip_from_py_object)]
 #[derive(Clone)]
 pub struct ProgressCounter {
     /// Pairs completed so far. Bumped by rayon workers via `fetch_add`.

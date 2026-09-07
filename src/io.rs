@@ -605,6 +605,41 @@ mod load_tests {
         assert!(translate.is_empty());
     }
 
+    /// Writes `content` to a temporary `.trees` file and loads it.
+    fn load_raw_from_str(content: &str) -> Vec<(String, String)> {
+        use std::io::Write;
+        let mut tmp = tempfile::Builder::new()
+            .suffix(".trees")
+            .tempfile()
+            .unwrap();
+        tmp.write_all(content.as_bytes()).unwrap();
+        load_beast_raw(tmp.path(), 0, 0, false).1
+    }
+
+    #[test]
+    fn test_load_beast_raw_reads_indented_starred_tree_lines() {
+        // ape/R writes tab-indented `TREE * STATE_n = ...` lines; see issue #21.
+        let pairs = load_raw_from_str(
+            "#NEXUS\nBEGIN TREES;\n\tTREE * STATE_1 = [&R] (A:1,B:1);\n\tTREE * STATE_2 = [&R] (A:2,B:2);\nEND;\n",
+        );
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs[0].0.ends_with("_STATE_1"), "got {}", pairs[0].0);
+        // Stripping `[&R]` leaves the space that followed it; phylotree tolerates it.
+        assert_eq!(pairs[0].1.trim(), "(A:1,B:1);");
+    }
+
+    #[test]
+    fn test_load_beast_raw_without_tree_lines_returns_empty() {
+        // Non-empty NEXUS with no `tree` lines: warns on stderr, yields nothing.
+        let pairs = load_raw_from_str("#NEXUS\nBEGIN TAXA;\n\tDIMENSIONS NTAX=2;\nEND;\n");
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn test_load_beast_raw_empty_file_returns_empty() {
+        assert!(load_raw_from_str("").is_empty());
+    }
+
     // ── load_beast_trees ──────────────────────────────────────────────────────
 
     #[test]
