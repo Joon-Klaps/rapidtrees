@@ -146,6 +146,9 @@ kf = np.array(kf_flat, dtype=np.float64).reshape(n, n)
 The Rust API does not expose file reading — parse your `.trees` file in Python
 and feed the newick strings to the iterator API.  The translate maps carry the
 BEAST `TRANSLATE` block so that numeric taxon IDs are resolved to real names.
+Plain Newick files need no parsing at all: read the lines, pass them straight to
+the iterator API, and name the trees however you like (the CLI names them after
+their line number).
 
 ```python
 import re

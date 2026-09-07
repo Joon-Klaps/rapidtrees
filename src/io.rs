@@ -52,68 +52,132 @@ pub fn rename_leaf_nodes(phylo_tree: &mut Tree, translate: &HashMap<String, Stri
     }
 }
 
-/// Load raw tree data from a BEAST `.trees` file without parsing.
+/// Tree-file formats [`load_beast_trees`] can read.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TreeFormat {
+    /// NEXUS: optional `#NEXUS` header and `TRANSLATE` block, one
+    /// `tree <name> = <newick>` line per tree.
+    Nexus,
+    /// Plain Newick: `;`-terminated trees and nothing else — no tree names.
+    Newick,
+}
+
+/// Sniff whether `content` is a NEXUS trees file or a plain Newick file.
 ///
-/// Returns `(translate_map, [(tree_name, stripped_newick)])`. Burnin filtering
-/// and annotation stripping are applied but no Newick parsing is done.
+/// NEXUS is anything opening with `#NEXUS`, or holding at least one
+/// `tree ... = ...` line that [`nexus_tree_lines`] recognises; everything else
+/// reads as Newick. Keeping the header check means a NEXUS file whose trees
+/// block is empty still reports as NEXUS, so its loader can say so instead of
+/// handing the content to the Newick parser.
+#[must_use]
+pub fn detect_format(content: &str) -> TreeFormat {
+    let nexus_header = content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .is_some_and(|line| starts_with_ci(line, "#nexus"));
+
+    if nexus_header || nexus_tree_lines(content).next().is_some() {
+        TreeFormat::Nexus
+    } else {
+        TreeFormat::Newick
+    }
+}
+
+/// One tree as read from a file, before burn-in filtering.
+struct RawTree {
+    /// Display name, already prefixed with the file stem.
+    name: String,
+    /// MCMC state it was sampled at; `0` when the format records none.
+    state: usize,
+    /// Newick string, annotations already stripped.
+    newick: String,
+}
+
+/// Load raw tree data from a NEXUS or plain-Newick tree file without parsing.
+///
+/// The format is sniffed with [`detect_format`]. Returns
+/// `(translate_map, [(tree_name, stripped_newick)])`; burnin filtering and
+/// annotation stripping are applied but no Newick parsing is done.
+///
+/// Plain Newick files name nothing, so their trees are called
+/// `<file stem>_line<n>` after the 1-based line each tree starts on. They carry
+/// no `STATE_` labels either, so `burnin_states` does not apply, and they have
+/// no `TRANSLATE` block, so `use_real_taxa` leaves the returned map empty.
 pub(crate) fn load_beast_raw<P: AsRef<Path>>(
     path: P,
     burnin_trees: usize,
     burnin_states: usize,
     use_real_taxa: bool,
 ) -> (HashMap<String, String>, Vec<(String, String)>) {
-    let content = match fs::read_to_string(path.as_ref()) {
+    let path = path.as_ref();
+    let content = match fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Failed to read {:?}: {e}", path.as_ref());
+            eprintln!("Failed to read {path:?}: {e}");
             return (HashMap::new(), Vec::new());
         }
     };
 
     let base_name = path
-        .as_ref()
-        .file_name()
+        .file_stem()
         .and_then(|s| s.to_str())
-        .map(|s| s.trim_end_matches(".trees"))
         .unwrap_or("unknown");
+    let format = detect_format(&content);
 
-    let taxons = parse_taxon_block(&content);
-    let translate_map = if use_real_taxa {
-        taxons
+    // Newick trees carry no `STATE_` labels, so a state threshold cannot apply.
+    let burnin_states = if format == TreeFormat::Newick && burnin_states > 0 {
+        eprintln!("Ignoring burn-in by state for {path:?}: Newick trees carry no `STATE_` labels");
+        0
     } else {
-        HashMap::new()
+        burnin_states
     };
 
-    let blocks = collect_tree_blocks(&content);
-    if blocks.is_empty() && !content.trim().is_empty() {
-        eprintln!(
-            "No NEXUS `tree` lines found in {:?}: check that it is a NEXUS trees file",
-            path.as_ref()
-        );
+    let (translate_map, trees) = match format {
+        TreeFormat::Nexus => {
+            let translate = if use_real_taxa {
+                parse_taxon_block(&content)
+            } else {
+                HashMap::new()
+            };
+            (translate, collect_nexus_trees(&content, base_name))
+        }
+        TreeFormat::Newick => (HashMap::new(), collect_newick_trees(&content, base_name)),
+    };
+
+    if trees.is_empty() && !content.trim().is_empty() {
+        let missing = match format {
+            TreeFormat::Nexus => "no NEXUS `tree ... = ...` lines",
+            TreeFormat::Newick => "no `;`-terminated Newick trees",
+        };
+        eprintln!("No trees found in {path:?}: {missing}");
     }
 
-    let tree_pairs: Vec<(String, String)> = blocks
+    let tree_pairs = trees
         .into_iter()
         .enumerate()
-        .map(|(idx, tree)| {
-            let (name, state) = extract_name_state(tree.header);
-            (idx, tree, state, format!("{base_name}_{name}"))
-        })
-        .filter(|(idx, _tree, state, _name)| {
-            (burnin_trees == 0 && burnin_states == 0)
-                || (burnin_trees > 0 && *idx >= burnin_trees)
-                || (burnin_states > 0 && *state > burnin_states)
-        })
-        .map(|(_, tree, _, name)| (name, strip_beast_annotations(tree.body)))
+        .filter(|(idx, tree)| keep_tree(*idx, tree.state, burnin_trees, burnin_states))
+        .map(|(_, tree)| (tree.name, tree.newick))
         .collect();
 
     (translate_map, tree_pairs)
 }
 
-/// Load and parse all trees from a BEAST `.trees` file.
+/// Burn-in predicate shared by both formats: keep tree `idx` (0-based), sampled
+/// at MCMC `state`, unless a threshold excludes it.
+#[inline]
+fn keep_tree(idx: usize, state: usize, burnin_trees: usize, burnin_states: usize) -> bool {
+    (burnin_trees == 0 && burnin_states == 0)
+        || (burnin_trees > 0 && idx >= burnin_trees)
+        || (burnin_states > 0 && state > burnin_states)
+}
+
+/// Load and parse all trees from a NEXUS or plain-Newick tree file.
 ///
-/// Returns `(tree_names, Snapshots)`. On any error, prints to stderr and
-/// returns an empty `Snapshots`.
+/// The format is detected per file with [`detect_format`]: NEXUS trees keep
+/// their `tree` header name, plain Newick trees are named `<file stem>_line<n>`
+/// after the line they start on. Returns `(tree_names, Snapshots)`. On any
+/// error, prints to stderr and returns an empty `Snapshots`.
 pub fn load_beast_trees<P: AsRef<Path>>(
     path: P,
     burnin_trees: usize,
@@ -363,34 +427,94 @@ pub fn extract_name_state(header: &str) -> (String, usize) {
     (String::new(), 0)
 }
 
-struct TreeBlock<'a> {
-    header: &'a str,
-    body: &'a str,
+/// Case-insensitive ASCII prefix test that allocates no uppercased copy.
+#[inline]
+fn starts_with_ci(s: &str, prefix: &str) -> bool {
+    s.get(..prefix.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(prefix))
 }
 
-fn collect_tree_blocks(content: &str) -> Vec<TreeBlock<'_>> {
+/// Every `tree ... = ...` line of a NEXUS trees block, as `(header, body)`.
+///
+/// Lazy, so [`detect_format`] can stop at the first hit instead of collecting
+/// the whole block just to ask whether one exists.
+fn nexus_tree_lines(content: &str) -> impl Iterator<Item = (&str, &str)> {
     content
         .lines()
         .map(str::trim)
-        .skip_while(|line| !line.to_ascii_uppercase().starts_with("TREE "))
-        .take_while(|line| !line.to_ascii_uppercase().starts_with("END;"))
+        .skip_while(|line| !starts_with_ci(line, "tree "))
+        .take_while(|line| !starts_with_ci(line, "end;"))
         .filter_map(|line| {
             let (header, body) = line.split_once(" = ")?;
-            Some(TreeBlock {
-                header: header.trim(),
-                body: body.trim(),
-            })
+            Some((header.trim(), body.trim()))
+        })
+}
+
+/// Collect a NEXUS trees block, naming each tree after its `tree` header.
+fn collect_nexus_trees(content: &str, base_name: &str) -> Vec<RawTree> {
+    nexus_tree_lines(content)
+        .map(|(header, body)| {
+            let (name, state) = extract_name_state(header);
+            RawTree {
+                name: format!("{base_name}_{name}"),
+                state,
+                newick: strip_beast_annotations(body),
+            }
         })
         .collect()
+}
+
+/// Collect a plain Newick file, naming each tree after the line it starts on.
+///
+/// Trees are delimited by `;`, so a line may hold several and one tree may wrap
+/// across lines. [`strip_beast_annotations`] runs per line, which keeps the line
+/// count intact and takes `[&...]` comments out of the way before the `;` split.
+fn collect_newick_trees(content: &str, base_name: &str) -> Vec<RawTree> {
+    let mut trees = Vec::new();
+    let mut buf = String::new();
+    let mut start_line = 1;
+
+    for (idx, line) in content.lines().enumerate() {
+        let stripped = strip_beast_annotations(line.trim());
+        let line = stripped.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if buf.is_empty() {
+            start_line = idx + 1;
+        }
+        buf.push_str(line);
+
+        // Several trees may share a line; each keeps that line as its origin.
+        while let Some(end) = buf.find(';') {
+            let rest = buf.split_off(end + 1);
+            let newick = std::mem::replace(&mut buf, rest.trim_start().to_string());
+            trees.extend(newick_tree(base_name, start_line, newick));
+        }
+    }
+
+    // A trailing tree with no `;` is kept, leaving the parser to complain.
+    trees.extend(newick_tree(base_name, start_line, buf));
+    trees
+}
+
+/// A collected chunk is a tree only if it opens with `(`, which is what keeps a
+/// file of neither format from coming back as one nonsense tree.
+fn newick_tree(base_name: &str, line: usize, newick: String) -> Option<RawTree> {
+    newick.starts_with('(').then(|| RawTree {
+        name: format!("{base_name}_line{line}"),
+        state: 0,
+        newick,
+    })
 }
 
 /// Read a NEXUS `TRANSLATE` block into a numeric-ID → taxon-name map.
 pub fn parse_taxon_block(content: &str) -> HashMap<String, String> {
     content
         .lines()
-        .skip_while(|line| !line.trim().to_ascii_uppercase().starts_with("TRANSLATE"))
+        .skip_while(|line| !starts_with_ci(line.trim(), "translate"))
         .skip(1)
-        .take_while(|line| !line.trim().to_ascii_uppercase().starts_with(";"))
+        .take_while(|line| !line.trim().starts_with(';'))
         .filter_map(|line| {
             let line = line.trim().trim_end_matches(',');
             let mut parts = line.split_whitespace();
@@ -407,6 +531,11 @@ mod load_tests {
 
     fn hiv2_path() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/hiv2.trees")
+    }
+
+    /// The same 21 trees as `hiv2.trees`, written one per line as plain Newick.
+    fn hiv2_newick_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/hiv2.newick")
     }
 
     // ── strip_beast_annotations ───────────────────────────────────────────────
@@ -475,34 +604,28 @@ mod load_tests {
         assert!(parse_taxon_block(content).is_empty());
     }
 
-    // ── collect_tree_blocks ───────────────────────────────────────────────────
+    // ── nexus_tree_lines ──────────────────────────────────────────────────────
 
     #[test]
-    fn test_collect_tree_blocks_count() {
+    fn test_nexus_tree_lines_count() {
         let content = "Begin trees;\ntree t1 = (A:1,B:1);\ntree t2 = (A:2,B:2);\nEnd;\n";
-        let blocks = collect_tree_blocks(content);
-        assert_eq!(blocks.len(), 2);
+        assert_eq!(nexus_tree_lines(content).count(), 2);
     }
 
     #[test]
-    fn test_collect_tree_blocks_header_and_body() {
+    fn test_nexus_tree_lines_header_and_body() {
         let content = "Begin trees;\ntree STATE_0 = (A:1,B:1);\nEnd;\n";
-        let blocks = collect_tree_blocks(content);
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].header, "tree STATE_0");
-        assert_eq!(blocks[0].body, "(A:1,B:1);");
+        let lines: Vec<_> = nexus_tree_lines(content).collect();
+        assert_eq!(lines, vec![("tree STATE_0", "(A:1,B:1);")]);
     }
 
     #[test]
-    fn test_collect_tree_blocks_indented_and_starred() {
+    fn test_nexus_tree_lines_indented_and_starred() {
         let content = "Begin trees;\n\tTREE * STATE_10 = (A:1,B:1);\n\tEnd;\n";
-        let blocks = collect_tree_blocks(content);
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].body, "(A:1,B:1);");
-        assert_eq!(
-            extract_name_state(blocks[0].header),
-            ("STATE_10".into(), 10)
-        );
+        let lines: Vec<_> = nexus_tree_lines(content).collect();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].1, "(A:1,B:1);");
+        assert_eq!(extract_name_state(lines[0].0), ("STATE_10".into(), 10));
     }
 
     // ── rename_leaf_nodes ─────────────────────────────────────────────────────
@@ -607,13 +730,20 @@ mod load_tests {
 
     /// Writes `content` to a temporary `.trees` file and loads it.
     fn load_raw_from_str(content: &str) -> Vec<(String, String)> {
+        load_raw_from_str_burnin(content, ".trees", 0, 0)
+    }
+
+    /// Writes `content` to a temporary file named `*<suffix>` and loads it.
+    fn load_raw_from_str_burnin(
+        content: &str,
+        suffix: &str,
+        burnin_trees: usize,
+        burnin_states: usize,
+    ) -> Vec<(String, String)> {
         use std::io::Write;
-        let mut tmp = tempfile::Builder::new()
-            .suffix(".trees")
-            .tempfile()
-            .unwrap();
+        let mut tmp = tempfile::Builder::new().suffix(suffix).tempfile().unwrap();
         tmp.write_all(content.as_bytes()).unwrap();
-        load_beast_raw(tmp.path(), 0, 0, false).1
+        load_beast_raw(tmp.path(), burnin_trees, burnin_states, false).1
     }
 
     #[test]
@@ -662,6 +792,205 @@ mod load_tests {
         let (names, snaps) = load_beast_trees("nonexistent.trees", 0, 0, false, false);
         assert!(names.is_empty());
         assert_eq!(snaps.len(), 0);
+    }
+
+    // ── detect_format ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_detect_format_nexus_header() {
+        assert_eq!(
+            detect_format("#NEXUS\nBEGIN TREES;\ntree t1 = (A:1,B:1);\nEND;\n"),
+            TreeFormat::Nexus
+        );
+    }
+
+    #[test]
+    fn test_detect_format_nexus_without_header() {
+        // Some writers omit `#NEXUS`; the trees block still gives it away.
+        assert_eq!(
+            detect_format("Begin trees;\n\ttree t1 = (A:1,B:1);\nEnd;\n"),
+            TreeFormat::Nexus
+        );
+    }
+
+    #[test]
+    fn test_detect_format_plain_newick() {
+        assert_eq!(
+            detect_format("(A:1,B:1);\n(A:2,B:2);\n"),
+            TreeFormat::Newick
+        );
+    }
+
+    #[test]
+    fn test_detect_format_newick_with_rooting_flag() {
+        assert_eq!(detect_format("[&R] (A:1,B:1);\n"), TreeFormat::Newick);
+    }
+
+    #[test]
+    fn test_detect_format_newick_after_blank_lines() {
+        assert_eq!(detect_format("\n\n   \n(A:1,B:1);\n"), TreeFormat::Newick);
+    }
+
+    #[test]
+    fn test_detect_format_unrecognised_reads_as_newick() {
+        // Nothing NEXUS about it, so it falls through to the Newick reader,
+        // which drops any block that does not open with `(`.
+        assert_eq!(detect_format("not a tree file\n"), TreeFormat::Newick);
+        assert!(collect_newick_trees("not a tree file\n", "f").is_empty());
+    }
+
+    #[test]
+    fn test_detect_format_nexus_header_survives_empty_trees_block() {
+        // No `tree` lines, but the header keeps it on the NEXUS error path.
+        assert_eq!(
+            detect_format("#NEXUS\nBEGIN TAXA;\n\tDIMENSIONS NTAX=2;\nEND;\n"),
+            TreeFormat::Nexus
+        );
+    }
+
+    #[test]
+    fn test_detect_format_real_files() {
+        let nexus = std::fs::read_to_string(hiv2_path()).unwrap();
+        let newick = std::fs::read_to_string(hiv2_newick_path()).unwrap();
+        assert_eq!(detect_format(&nexus), TreeFormat::Nexus);
+        assert_eq!(detect_format(&newick), TreeFormat::Newick);
+    }
+
+    // ── collect_newick_trees ──────────────────────────────────────────────────
+
+    /// `(line number, newick)` for each tree, which is all these tests assert on.
+    fn newick_blocks(content: &str) -> Vec<(String, String)> {
+        collect_newick_trees(content, "f")
+            .into_iter()
+            .map(|tree| (tree.name, tree.newick))
+            .collect()
+    }
+
+    #[test]
+    fn test_collect_newick_trees_one_tree_per_line() {
+        assert_eq!(
+            newick_blocks("(A:1,B:1);\n(A:2,B:2);\n"),
+            vec![
+                ("f_line1".to_string(), "(A:1,B:1);".to_string()),
+                ("f_line2".to_string(), "(A:2,B:2);".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_collect_newick_trees_skips_blank_lines() {
+        // Line numbers track the file, not the tree index.
+        let blocks = newick_blocks("\n(A:1,B:1);\n\n(A:2,B:2);\n");
+        assert_eq!(
+            blocks.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            ["f_line2", "f_line4"]
+        );
+    }
+
+    #[test]
+    fn test_collect_newick_trees_several_trees_on_one_line() {
+        let blocks = newick_blocks("(A:1,B:1);(A:2,B:2);\n");
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks.iter().all(|(name, _)| name == "f_line1"));
+    }
+
+    #[test]
+    fn test_collect_newick_trees_tree_wrapped_over_lines() {
+        // A tree split across lines is joined and reported at its first line.
+        assert_eq!(
+            newick_blocks("((A:1,\nB:1):1,\n(C:1,D:1):1);\n"),
+            vec![(
+                "f_line1".to_string(),
+                "((A:1,B:1):1,(C:1,D:1):1);".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_collect_newick_trees_strips_annotations_before_splitting() {
+        // Annotations go first, so a `;` inside one cannot end the tree early.
+        assert_eq!(
+            newick_blocks("(A[&note=a;b]:1,B:1);\n"),
+            vec![("f_line1".to_string(), "(A:1,B:1);".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_collect_newick_trees_drops_leading_rooting_flag() {
+        assert_eq!(
+            newick_blocks("[&R] (A:1,B:1);\n"),
+            vec![("f_line1".to_string(), "(A:1,B:1);".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_collect_newick_trees_keeps_unterminated_tail() {
+        let blocks = newick_blocks("(A:1,B:1);\n(A:2,B:2)\n");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[1], ("f_line2".to_string(), "(A:2,B:2)".to_string()));
+    }
+
+    #[test]
+    fn test_collect_newick_trees_have_no_state() {
+        // No `STATE_` labels in Newick, so every tree sits at state 0.
+        let trees = collect_newick_trees("(A:1,B:1);\n(A:2,B:2);\n", "f");
+        assert!(trees.iter().all(|tree| tree.state == 0));
+    }
+
+    // ── load_beast_raw: plain Newick ──────────────────────────────────────────
+
+    #[test]
+    fn test_load_newick_raw_names_trees_by_line() {
+        let pairs = load_raw_from_str_burnin("(A:1,B:1);\n(A:2,B:2);\n", ".newick", 0, 0);
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs[0].0.ends_with("_line1"), "got {}", pairs[0].0);
+        assert!(pairs[1].0.ends_with("_line2"), "got {}", pairs[1].0);
+    }
+
+    #[test]
+    fn test_load_newick_raw_strips_annotations() {
+        let pairs = load_raw_from_str_burnin("(A[&rate=0.5]:1,B:1);\n", ".newick", 0, 0);
+        assert_eq!(pairs[0].1, "(A:1,B:1);");
+    }
+
+    #[test]
+    fn test_load_newick_raw_burnin_by_tree_count() {
+        let pairs =
+            load_raw_from_str_burnin("(A:1,B:1);\n(A:2,B:2);\n(A:3,B:3);\n", ".newick", 2, 0);
+        assert_eq!(pairs.len(), 1);
+        assert!(pairs[0].0.ends_with("_line3"), "got {}", pairs[0].0);
+    }
+
+    #[test]
+    fn test_load_newick_raw_burnin_by_state_is_ignored() {
+        // Newick carries no STATE_ labels, so burnin-by-state cannot apply.
+        let pairs = load_raw_from_str_burnin("(A:1,B:1);\n(A:2,B:2);\n", ".newick", 0, 500);
+        assert_eq!(pairs.len(), 2);
+    }
+
+    #[test]
+    fn test_load_newick_raw_hiv2_returns_all_trees() {
+        let (translate, pairs) = load_beast_raw(hiv2_newick_path(), 0, 0, true);
+        assert_eq!(pairs.len(), 21);
+        assert!(translate.is_empty(), "Newick files have no TRANSLATE block");
+        assert!(pairs[0].0.starts_with("hiv2_line"), "got {}", pairs[0].0);
+        for (_, newick) in &pairs {
+            assert!(!newick.contains("[&"), "annotations must be stripped");
+        }
+    }
+
+    #[test]
+    fn test_load_beast_trees_newick_matches_nexus() {
+        // hiv2.newick holds the same 21 trees as hiv2.trees, so both files must
+        // yield identical RF distances regardless of format.
+        let (nexus_names, nexus_snaps) = load_beast_trees(hiv2_path(), 0, 0, false, false);
+        let (newick_names, newick_snaps) = load_beast_trees(hiv2_newick_path(), 0, 0, false, false);
+        assert_eq!(newick_names.len(), nexus_names.len());
+        assert_eq!(newick_snaps.len(), nexus_snaps.len());
+        assert_eq!(
+            newick_snaps.pairwise_rf(None),
+            nexus_snaps.pairwise_rf(None)
+        );
     }
 }
 

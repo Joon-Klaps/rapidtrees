@@ -25,7 +25,7 @@
 
 ## 🗺️ Overview
 
-`rapidtrees` computes pairwise tree distances from [BEAST](https://beast.community/)/NEXUS `.trees` files or from precomputed `.snap` files and writes a labeled distance matrix. Three metrics are supported:
+`rapidtrees` computes pairwise tree distances from [BEAST](https://beast.community/)/NEXUS `.trees` files, plain multi-tree Newick files, or precomputed `.snap` files, and writes a labeled distance matrix. Three metrics are supported:
 
 | Metric             | Flag                | Output  | Description                                   |
 | ------------------ | ------------------- | ------- | --------------------------------------------- |
@@ -113,7 +113,7 @@ rapidtrees \
 
 | Flag                          | Description                                                        |
 | ----------------------------- | ------------------------------------------------------------------ |
-| `-i, --input <INPUT>`         | Path to BEAST `.trees` (NEXUS) file                                |
+| `-i, --input <INPUT>`         | Path to a NEXUS `.trees` or plain Newick file (auto-detected)      |
 | `--snap-input <SNAP_INPUT>`   | Path to `.snap` file (currently supports only `--metric rf`)       |
 | `-o, --output <OUTPUT>`       | Output path. Use `.gz` suffix for gzip compression; `-` for stdout |
 | `-t, --burnin-trees <N>`      | Drop the first N trees (default: `0`)                              |
@@ -122,7 +122,9 @@ rapidtrees \
 | `--metric <rf\|weighted\|kf>` | Distance metric (default: `rf`)                                    |
 | `-q, --quiet`                 | Suppress progress messages (errors still go to stderr)             |
 
-The output is a **square TSV matrix** where both the header row and first column contain tree names formatted as `<file_basename>_tree_STATE<state>`. Use `-o -` to write to stdout for easy piping.
+**Input formats.** `--input` takes either a NEXUS/BEAST trees file or a plain Newick file with one tree per line; the format is sniffed from the contents, not the extension. Newick files name nothing, carry no `TRANSLATE` block and no `STATE_` labels, so their trees are named after the line they start on, and `--burnin-states` / `--use-real-taxa` have nothing to act on (`--burnin-trees` still works).
+
+The output is a **square TSV matrix** where both the header row and first column contain tree names: `<file_basename>_<tree_name>` for NEXUS (e.g. `hiv1_STATE_10000`) and `<file_basename>_line<n>` for Newick (e.g. `hiv1_line3`). Use `-o -` to write to stdout for easy piping.
 
 ### 💡 Examples
 
@@ -354,7 +356,7 @@ Benchmarks were run on a MacBook Pro M1. Trees are parsed **once** and bitset sn
 
 ## 🔍 Troubleshooting
 
-- **No trees parsed?** Verify the input is a valid NEXUS `.trees` file and adjust `--burnin-*` settings.
+- **No trees parsed?** Verify the input is a valid NEXUS `.trees` or Newick file and adjust `--burnin-*` settings.
 - **Piping to other tools?** Use `-q` to suppress timing messages on stdout.
 - **Gzipped output not working?** Ensure the output filename ends with `.gz`.
 
