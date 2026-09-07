@@ -84,7 +84,15 @@ pub(crate) fn load_beast_raw<P: AsRef<Path>>(
         HashMap::new()
     };
 
-    let tree_pairs: Vec<(String, String)> = collect_tree_blocks(&content)
+    let blocks = collect_tree_blocks(&content);
+    if blocks.is_empty() && !content.trim().is_empty() {
+        eprintln!(
+            "No NEXUS `tree` lines found in {:?}: check that it is a NEXUS trees file",
+            path.as_ref()
+        );
+    }
+
+    let tree_pairs: Vec<(String, String)> = blocks
         .into_iter()
         .enumerate()
         .map(|(idx, tree)| {
@@ -96,7 +104,7 @@ pub(crate) fn load_beast_raw<P: AsRef<Path>>(
                 || (burnin_trees > 0 && *idx >= burnin_trees)
                 || (burnin_states > 0 && *state > burnin_states)
         })
-        .map(|(_, tree, _, name)| (name, strip_beast_annotations(&tree.body)))
+        .map(|(_, tree, _, name)| (name, strip_beast_annotations(tree.body)))
         .collect();
 
     (translate_map, tree_pairs)
@@ -338,7 +346,12 @@ pub fn extract_name_state(header: &str) -> (String, usize) {
     if let Some(state_pos) = upper.find("STATE_")
         && let Some((_, rest)) = header.split_once(' ')
     {
-        let tree_name = rest.split_whitespace().next().unwrap_or("").to_string();
+        // NEXUS allows an optional `*` marking the default tree: `TREE * STATE_0 = ...`
+        let tree_name = rest
+            .split_whitespace()
+            .find(|&t| t != "*")
+            .unwrap_or("")
+            .to_string();
         let digits = header[state_pos + 6..]
             .chars()
             .take_while(|c| c.is_ascii_digit())
@@ -352,19 +365,21 @@ pub fn extract_name_state(header: &str) -> (String, usize) {
 
 struct TreeBlock<'a> {
     header: &'a str,
-    body: String,
+    body: &'a str,
 }
 
 fn collect_tree_blocks(content: &str) -> Vec<TreeBlock<'_>> {
     content
         .lines()
+        .map(str::trim)
         .skip_while(|line| !line.to_ascii_uppercase().starts_with("TREE "))
-        .take_while(|line| !line.trim().to_ascii_uppercase().starts_with("END;"))
+        .take_while(|line| !line.to_ascii_uppercase().starts_with("END;"))
         .filter_map(|line| {
-            let mut parts = line.splitn(2, " = ");
-            let header = parts.next()?.trim();
-            let body = parts.next()?.trim().to_string();
-            Some(TreeBlock { header, body })
+            let (header, body) = line.split_once(" = ")?;
+            Some(TreeBlock {
+                header: header.trim(),
+                body: body.trim(),
+            })
         })
         .collect()
 }
@@ -476,6 +491,18 @@ mod load_tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].header, "tree STATE_0");
         assert_eq!(blocks[0].body, "(A:1,B:1);");
+    }
+
+    #[test]
+    fn test_collect_tree_blocks_indented_and_starred() {
+        let content = "Begin trees;\n\tTREE * STATE_10 = (A:1,B:1);\n\tEnd;\n";
+        let blocks = collect_tree_blocks(content);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].body, "(A:1,B:1);");
+        assert_eq!(
+            extract_name_state(blocks[0].header),
+            ("STATE_10".into(), 10)
+        );
     }
 
     // ── rename_leaf_nodes ─────────────────────────────────────────────────────
