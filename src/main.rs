@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
     about = "Fast pairwise tree distance calculations (Robinson-Foulds, Weighted RF, Kuhner-Felsenstein) for phylogenetic trees"
 )]
 struct Args {
-    /// Path to BEAST .trees (NEXUS) file
+    /// Path to a tree file: BEAST/NEXUS .trees or plain Newick (format is auto-detected)
     #[arg(
         short = 'i',
         long = "input",
@@ -34,7 +34,7 @@ struct Args {
     #[arg(short = 't', long = "burnin-trees", default_value_t = 0)]
     burnin_trees: usize,
 
-    /// Burn-in by state (keep trees with STATE_ > value)
+    /// Burn-in by state (keep trees with STATE_ > value); NEXUS only, ignored for Newick
     #[arg(short = 's', long = "burnin-states", default_value_t = 0)]
     burnin_states: usize,
 
