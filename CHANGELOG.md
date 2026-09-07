@@ -10,8 +10,8 @@ This project uses release names based on random words from [codenamegenerator.co
 
 ## [0.8.2] - Redstone Racer (2026-09-07)
 
-- ([#21](https://github.com/Joon-Klaps/rapidtrees/issues/21)) - **NEXUS parsing:** `tree` lines are now recognised when indented (as `ape` writes them) and when carrying the optional `*` default-tree marker (`TREE * STATE_0 = ...`). A non-empty file with no `tree` lines now reports an error naming the file instead of failing silently with a tree count.
-- ([#21](https://github.com/Joon-Klaps/rapidtrees/issues/21)) - **Dependencies:** bumped to latest — notably `pyo3` 0.27 → 0.29 and `codspeed-divan-compat` 4 → 5.
+- ([#22](https://github.com/Joon-Klaps/rapidtrees/issues/21)) - **NEXUS parsing:** `tree` lines are now recognised when indented (as `ape` writes them) and when carrying the optional `*` default-tree marker (`TREE * STATE_0 = ...`). A non-empty file with no `tree` lines now reports an error naming the file instead of failing silently with a tree count.
+- ([#22](https://github.com/Joon-Klaps/rapidtrees/issues/21)) - **Dependencies:** bumped to latest — notably `pyo3` 0.27 → 0.29 and `codspeed-divan-compat` 4 → 5.
 
 ## [0.8.1] - Cortana Krait (2026-09-04)
 
