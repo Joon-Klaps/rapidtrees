@@ -8,6 +8,10 @@ This project uses release names based on random words from [codenamegenerator.co
     - PREFIX: Microsoft Corperation
     - DICTIONARY: Snakes
 
+## [Unreleased]
+
+- ([#24](https://github.com/Joon-Klaps/rapidtrees/issues/24)) - **Benchmarks:** Added more larger tree datasets for benchmarking. Added one-thread (`*_st`) variants for 1-thread-vs-1-thread comparisons.
+
 ## [0.8.3] - Longhorn Sidewinder (2026-09-07)
 
 - ([#23](https://github.com/Joon-Klaps/rapidtrees/issues/23)) - **Input formats:** `--input` now accepts plain Newick files as well as NEXUS.
