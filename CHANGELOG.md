@@ -8,6 +8,15 @@ This project uses release names based on random words from [codenamegenerator.co
     - PREFIX: Microsoft Corperation
     - DICTIONARY: Snakes
 
+## [Unreleased]
+
+- **Speed & memory (diverse tree sets):** Both dense backends now have a merge fallback and a memory guard. Per-pair dense cost is `⌈U/64⌉` words, where `U` is the collection's distinct-split count — a property of the dataset's diversity, not its size. On a posterior `U` collapses and dense wins; on a diverse collection `U` approaches `trees × (taxa − 3)` and dense degrades without limit. At 500 taxa × 2 000 fully-shuffled trees: WRF **27.7 s → 0.53 s (52×)**, RF **1 206 → 558 ms (2.2×)**. At 200 taxa × 800 shuffled trees WRF is **707 → 34 ms (21×)**. Posterior-shaped inputs are unchanged — they keep the dense path.
+  - **How:** the two-pointer merge over the sorted `split_ids` is a shipped backend again for all three metrics. Universal splits cancel out of `|Sᵢ| + |Sⱼ| − 2·|Sᵢ ∩ Sⱼ|`, so the merge needs no column filter at all.
+  - **Choosing:** one decision per call, never per pair, made before either matrix is allocated. `Backend::Auto` weighs the dense per-pair sweep against the mean row the merge would walk, and refuses a dense matrix over 1 GB outright — the case that previously allocated 1.55 GB unchecked at 5 000 trees × 500 taxa. The thresholds are calibrated from measurement across 200–500 taxa, not derived.
+  - **Validation:** the two backends must agree cell-for-cell. Checked on the PHYLIP `treedist` reference suite, a fully-identical set, a fully-diverse set, and random sets at two taxon counts; the existing randomized differential test now runs both backends against the naive oracle.
+- **CLI:** new `--backend auto|dense|sparse` forces a kernel for benchmarking, and the run log names the one that ran.
+- **API (Rust):** new `Backend` enum, `Snapshots::pairwise_{rf,wrf,kf}_with(progress, backend)`, and `last_backend_was_dense()`. The existing `pairwise_*` methods are unchanged and use `Backend::Auto`. No Python API change.
+
 ## [0.8.3] - Longhorn Sidewinder (2026-09-07)
 
 - ([#23](https://github.com/Joon-Klaps/rapidtrees/issues/23)) - **Input formats:** `--input` now accepts plain Newick files as well as NEXUS.

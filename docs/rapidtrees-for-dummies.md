@@ -336,7 +336,7 @@ The Bitsets still exist in the global table — but there's only **one copy of e
 
 ## Step 8 — Why interning pays off: the sorted merge
 
-> **Conceptual step.** This is the easiest way to see what interning buys, but it is not a code path any more — `rapidtrees` ships only the bulk backends in Step 9, which replace the merge with popcounts and dense row sweeps. There is no single-pair entry point: to compare exactly two trees, build a two-tree `Snapshots` and read the one off-diagonal cell.
+> **This is a shipped code path.** `rapidtrees` keeps both kernels and chooses per call: the dense row sweeps of Step 9 when the collection's distinct-split count `U` is small relative to a tree's size, and this merge when it is not. `--backend dense|sparse` forces one. There is still no single-pair entry point: to compare exactly two trees, build a two-tree `Snapshots` and read the one off-diagonal cell.
 
 Exactly the same two-pointer merge as Step 5, but now each comparison is **one integer vs one integer**:
 
@@ -358,7 +358,9 @@ The comparison `1 vs 1` is a **single CPU instruction** instead of comparing 32 
 
 The same merge would accumulate branch-length differences for WRF (`|lenᵢ − lenⱼ|`) or squared differences for KF (`(lenᵢ − lenⱼ)²`) instead of counting shared IDs. The branch lengths live in the parallel `lengths` vector of each `InternSnap`.
 
-Step 9 keeps this payoff — the small integer IDs — and drops the merge itself, which has a branch per split and reads two lists at once. Laying the splits out as one contiguous row per tree turns each pair into a straight-line sweep the CPU can vectorise.
+Step 9 keeps this payoff — the small integer IDs — and, when it pays, drops the merge itself: it has a branch per split and reads two lists at once, whereas laying the splits out as one contiguous row per tree turns each pair into a straight-line sweep the CPU can vectorise.
+
+Which one wins is a property of the dataset, not its size. The dense sweep costs `⌈U/64⌉` words per pair whatever the trees share; the merge costs one step per split in either row and never looks at `U` at all. On an MCMC posterior `U` collapses and dense wins by 3–5×. On a diverse collection `U` approaches `trees × (taxa − 3)`, and at 500 taxa × 2 000 fully-shuffled trees the merge is 2× faster for RF and 52× for weighted RF — and the dense weighted matrix would want gigabytes. `Backend::Auto` compares the two costs once per call, before anything is allocated, and refuses a dense matrix over 1 GB outright.
 
 ---
 

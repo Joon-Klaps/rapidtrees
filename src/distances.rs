@@ -6,12 +6,101 @@
 //! RF drops splits held by every tree, WRF/KF drop splits held by only one. Both
 //! filters are pure optimisations — disabling either changes no distance.
 //!
+//! Two kernels implement that shape, chosen per call by [`Backend::Auto`]:
+//! dense rows swept word by word, or a two-pointer merge over the sorted
+//! split-ID lists. Dense costs `⌈U/64⌉` words per pair regardless of how much
+//! the trees share, where `U` is the collection's distinct-split count — cheap
+//! on a posterior, where `U` collapses, and ruinous on a diverse set, where `U`
+//! approaches `trees × (taxa − 3)` and the presence matrix stops fitting in
+//! memory. The merge costs one step per split in either row, so it depends on
+//! tree size and not on the collection's diversity at all.
+//!
 //! There is no per-pair entry point. To compare two trees, build a two-tree
 //! `Snapshots` and read the off-diagonal cell.
 
 use crate::par::*;
 use crate::snapshot::Snapshots;
+use std::cell::Cell;
+use std::cmp::Ordering::{Equal, Greater, Less};
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Which per-pair kernel to run.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+pub enum Backend {
+    /// Choose from row density and the dense matrix's memory footprint.
+    #[default]
+    Auto,
+    /// Dense presence/length rows, swept word by word.
+    Dense,
+    /// Two-pointer merge over the sorted split-ID lists.
+    Sparse,
+}
+
+/// Refuse a dense matrix larger than this and merge instead.
+const DENSE_BUDGET_BYTES: u64 = 1 << 30;
+
+/// Bytes a dense `trees × width` matrix of 8-byte cells would take.
+///
+/// In `u64` because on wasm32 the `usize` product overflows well inside the
+/// sizes this guard exists to refuse.
+#[inline]
+fn matrix_bytes(trees: usize, width: usize) -> u64 {
+    trees as u64 * width as u64 * 8
+}
+
+thread_local! {
+    /// Backend the last pairwise call on this thread resolved to.
+    static LAST_DENSE: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Whether the most recent pairwise call *on this thread* ran the dense
+/// backend. The selector runs on the calling thread, so read it right after
+/// the call whose choice you want to report.
+pub fn last_backend_was_dense() -> bool {
+    LAST_DENSE.get()
+}
+
+/// Resolve `backend`, recording the answer for [`last_backend_was_dense`].
+///
+/// `sweep` is the dense per-pair cost in merge-step equivalents and
+/// `occupancy` is the kept tree × split incidences, so `occupancy / trees` is
+/// the mean row length the merge would walk. One decision per call, never per
+/// pair.
+fn use_dense(backend: Backend, sweep: usize, bytes: u64, occupancy: u64, trees: usize) -> bool {
+    let dense = match backend {
+        Backend::Dense => true,
+        Backend::Sparse => false,
+        Backend::Auto => bytes <= DENSE_BUDGET_BYTES && sweep as u64 * trees as u64 <= occupancy,
+    };
+    LAST_DENSE.set(dense);
+    dense
+}
+
+/// Fold the values at every split ID both ascending lists hold.
+///
+/// This two-pointer walk is what makes the sparse backends independent of the
+/// collection's distinct-split count.
+#[inline]
+fn merge_shared<T: Default + std::ops::AddAssign>(
+    a: &[u32],
+    b: &[u32],
+    mut at: impl FnMut(usize, usize) -> T,
+) -> T {
+    let (mut i, mut j, mut acc) = (0, 0, T::default());
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            Less => i += 1,
+            Greater => j += 1,
+            Equal => {
+                acc += at(i, j);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    acc
+}
 
 /// Fill a symmetric `n × n` matrix from `cell(i, j)`, one rayon task per row.
 ///
@@ -82,27 +171,36 @@ fn split_tree_counts(snaps: &Snapshots) -> Vec<u32> {
 
 /// Give every split `keep` accepts a packed column index.
 ///
-/// Returns `(column_of, n_columns)`; `column_of[id]` is `u32::MAX` if dropped.
-/// Packing the survivors together is what shrinks the per-pair sweep.
-fn assign_columns(counts: &[u32], keep: impl Fn(u32) -> bool) -> (Vec<u32>, usize) {
+/// Returns `(column_of, n_columns, occupancy)`; `column_of[id]` is `u32::MAX`
+/// if dropped and `occupancy` is the surviving tree × split incidences, which
+/// is what [`use_dense`] weighs the dense sweep against. Packing the survivors
+/// together is what shrinks the per-pair sweep.
+fn assign_columns(counts: &[u32], keep: impl Fn(u32) -> bool) -> (Vec<u32>, usize, u64) {
     let mut column_of = vec![u32::MAX; counts.len()];
-    let mut n_columns = 0u32;
+    let (mut n_columns, mut occupancy) = (0u32, 0u64);
     for (id, &count) in counts.iter().enumerate() {
         if keep(count) {
             column_of[id] = n_columns;
             n_columns += 1;
+            occupancy += u64::from(count);
         }
     }
-    (column_of, n_columns as usize)
+    (column_of, n_columns as usize, occupancy)
 }
 
 // ─── Robinson–Foulds ────────────────────────────────────────────────────────
 
-/// `RF(i, j) = aᵢ + aⱼ − 2·popcount(rowᵢ & rowⱼ)` over presence bit-rows.
+/// `RF(i, j) = aᵢ + aⱼ − 2·popcount(rowᵢ & rowⱼ)` over presence bit-rows, or the
+/// same count from a merge of the two sorted split-ID lists.
 ///
 /// Splits held by *every* tree add equally to both `a` values and to the shared
-/// count, so they cancel exactly and are dropped before packing.
-pub(crate) fn distance_rf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> Vec<u32> {
+/// count, so they cancel exactly and are dropped before packing. They cancel in
+/// the merge too, which is why it can walk the raw ID lists with no filter.
+pub(crate) fn distance_rf(
+    snaps: &Snapshots,
+    progress: Option<&AtomicUsize>,
+    backend: Backend,
+) -> Vec<u32> {
     let n = snaps.snapshots.len();
     if n == 0 {
         return Vec::new();
@@ -110,9 +208,26 @@ pub(crate) fn distance_rf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> 
 
     let counts = split_tree_counts(snaps);
     let n_splits = counts.len();
-    let (bit_slot, kept) = assign_columns(&counts, |count| count < n as u32);
+    let (bit_slot, kept, occupancy) = assign_columns(&counts, |count| count < n as u32);
     let everywhere = n_splits - kept;
     let words = kept.div_ceil(64);
+
+    // A word carries 64 columns and the merge branches per split, so dense
+    // stays ahead to ~16 words per kept split; past that the budget usually
+    // decides anyway. Both constants are measured, not derived.
+    if !use_dense(
+        backend,
+        words.div_ceil(16),
+        matrix_bytes(n, words),
+        occupancy,
+        n,
+    ) {
+        let snapshots = &snaps.snapshots;
+        return fill_symmetric(n, progress, |i, j| {
+            let (a, b) = (&snapshots[i].split_ids, &snapshots[j].split_ids);
+            (a.len() + b.len()) as u32 - 2 * merge_shared(a, b, |_, _| 1u32)
+        });
+    }
 
     // One bitmask row per tree: a set bit means "this tree has that split".
     let mut packed = vec![0u64; n * words];
@@ -153,17 +268,6 @@ pub(crate) fn distance_rf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> 
 
 // ─── weighted metrics (WRF, KF) ─────────────────────────────────────────────
 
-/// Branch lengths over the shared-candidate splits, plus each tree's `self`
-/// contribution from the splits it holds alone.
-struct SharedRows {
-    /// Flat `n × stride` matrix of lengths; 0 where a tree lacks the split.
-    rows: Vec<f64>,
-    /// Row stride — how many split columns survived the filter.
-    stride: usize,
-    /// Per tree, `Σ term(length)` over splits no other tree holds.
-    unique_self: Vec<f64>,
-}
-
 /// Lay out branch lengths over only the splits at least two trees hold.
 ///
 /// A split held by one tree alone can never be shared, so it gets no column —
@@ -171,11 +275,16 @@ struct SharedRows {
 /// sets this cuts ~48 000 splits to ~2 600 (~19×); on similar sets it is nearly
 /// a no-op. "Everywhere" splits are kept: unlike in RF, they do not cancel out
 /// of a weighted score.
-fn shared_length_rows(snaps: &Snapshots, term: impl Fn(f64) -> f64) -> SharedRows {
+///
+/// Returns the flat `n × stride` length matrix and, per tree, `Σ term(length)`
+/// over the splits no other tree holds.
+fn shared_length_rows(
+    snaps: &Snapshots,
+    column_of: &[u32],
+    stride: usize,
+    term: impl Fn(f64) -> f64,
+) -> (Vec<f64>, Vec<f64>) {
     let n = snaps.snapshots.len();
-    let counts = split_tree_counts(snaps);
-    let (column_of, stride) = assign_columns(&counts, |count| count >= 2);
-
     let mut rows = vec![0.0f64; n * stride];
     if stride > 0 {
         rows.par_chunks_mut(stride)
@@ -203,11 +312,7 @@ fn shared_length_rows(snaps: &Snapshots, term: impl Fn(f64) -> f64) -> SharedRow
         })
         .collect();
 
-    SharedRows {
-        rows,
-        stride,
-        unique_self,
-    }
+    (rows, unique_self)
 }
 
 /// `finish(selfᵢ + selfⱼ − 2·Σ overlap)` — the shape WRF and KF share.
@@ -215,12 +320,14 @@ fn shared_length_rows(snaps: &Snapshots, term: impl Fn(f64) -> f64) -> SharedRow
 /// `term` maps a length to its `self` contribution, `overlap` is the per-split
 /// shared term, `finish` is applied last.
 ///
-/// `self` is summed over each row in column order, the same order `overlap`
-/// walks, so identical trees cancel to exactly 0.0. The clamp stops rounding
-/// from handing `finish` a negative.
+/// `self` is summed in the same order `overlap` walks — column order for the
+/// dense backend, split-ID order for the merge — so identical trees cancel to
+/// exactly 0.0 either way. The clamp stops rounding from handing `finish` a
+/// negative.
 fn weighted_distances(
     snaps: &Snapshots,
     progress: Option<&AtomicUsize>,
+    backend: Backend,
     term: impl Fn(f64) -> f64 + Sync,
     overlap: impl Fn(f64, f64) -> f64 + Sync,
     finish: impl Fn(f64) -> f64 + Sync,
@@ -230,22 +337,46 @@ fn weighted_distances(
         return Vec::new();
     }
 
-    let shared = shared_length_rows(snaps, &term);
-    let (rows, stride) = (&shared.rows, shared.stride);
+    let counts = split_tree_counts(snaps);
+    let (column_of, stride, occupancy) = assign_columns(&counts, |count| count >= 2);
 
+    // A dense f64 column costs roughly a quarter of a merge step.
+    if !use_dense(
+        backend,
+        stride.div_ceil(4),
+        matrix_bytes(n, stride),
+        occupancy,
+        n,
+    ) {
+        let snapshots = &snaps.snapshots;
+        let self_total: Vec<f64> = snapshots
+            .iter()
+            .map(|snap| snap.lengths.iter().map(|&l| term(l)).sum())
+            .collect();
+
+        return fill_symmetric(n, progress, |i, j| {
+            let (a, b) = (&snapshots[i], &snapshots[j]);
+            let shared: f64 = merge_shared(&a.split_ids, &b.split_ids, |x, y| {
+                overlap(a.lengths[x], b.lengths[y])
+            });
+            finish((self_total[i] + self_total[j] - 2.0 * shared).max(0.0))
+        });
+    }
+
+    let (rows, unique_self) = shared_length_rows(snaps, &column_of, stride, &term);
     let self_total: Vec<f64> = (0..n)
         .map(|i| {
-            row_slice(rows, i, stride)
+            row_slice(&rows, i, stride)
                 .iter()
                 .map(|&l| term(l))
                 .sum::<f64>()
-                + shared.unique_self[i]
+                + unique_self[i]
         })
         .collect();
 
     fill_symmetric(n, progress, |i, j| {
-        let row_i = row_slice(rows, i, stride);
-        let row_j = row_slice(rows, j, stride);
+        let row_i = row_slice(&rows, i, stride);
+        let row_j = row_slice(&rows, j, stride);
         let shared_term: f64 = row_i.iter().zip(row_j).map(|(&a, &b)| overlap(a, b)).sum();
         finish((self_total[i] + self_total[j] - 2.0 * shared_term).max(0.0))
     })
@@ -255,14 +386,22 @@ fn weighted_distances(
 ///
 /// The `min` form follows from `|a − b| = a + b − 2·min(a, b)`. Assumes
 /// non-negative branch lengths; missing lengths parse as 0.0.
-pub(crate) fn distance_wrf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> Vec<f64> {
-    weighted_distances(snaps, progress, |l| l, f64::min, |d| d)
+pub(crate) fn distance_wrf(
+    snaps: &Snapshots,
+    progress: Option<&AtomicUsize>,
+    backend: Backend,
+) -> Vec<f64> {
+    weighted_distances(snaps, progress, backend, |l| l, f64::min, |d| d)
 }
 
 /// `KF(i, j) = sqrt(Σ lenᵢ² + Σ lenⱼ² − 2·Σ lenᵢ·lenⱼ)` — Euclidean distance in
 /// branch-length space.
-pub(crate) fn distance_kf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> Vec<f64> {
-    weighted_distances(snaps, progress, |l| l * l, |a, b| a * b, f64::sqrt)
+pub(crate) fn distance_kf(
+    snaps: &Snapshots,
+    progress: Option<&AtomicUsize>,
+    backend: Backend,
+) -> Vec<f64> {
+    weighted_distances(snaps, progress, backend, |l| l * l, |a, b| a * b, f64::sqrt)
 }
 
 /// Twelve 10-taxon trees from the PHYLIP treedist reference suite.
@@ -704,7 +843,7 @@ fn kuhner_felsenstein_treedist() {
 
 #[cfg(test)]
 mod tests {
-    use super::TREEDIST_TREES;
+    use super::{Backend, TREEDIST_TREES};
     use crate::snapshot::{InternSnap, Snapshots};
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -904,15 +1043,23 @@ mod tests {
         (rf, wrf, sum_sq.sqrt())
     }
 
-    /// Assert all three backends agree with [`reference_distances`] on `snaps`.
+    /// Assert all three metrics agree with [`reference_distances`] on `snaps`,
+    /// under both the dense and the sparse kernel.
     fn assert_matches_reference(snaps: &Snapshots, ctx: &str) {
-        let n = snaps.snapshots.len();
-        let (rf, wrf, kf) = (
-            snaps.pairwise_rf(None),
-            snaps.pairwise_wrf(None),
-            snaps.pairwise_kf(None),
-        );
+        for backend in [Backend::Dense, Backend::Sparse] {
+            let ctx = format!("{ctx}, {backend:?}");
+            assert_cells(
+                snaps,
+                &snaps.pairwise_rf_with(None, backend),
+                &snaps.pairwise_wrf_with(None, backend),
+                &snaps.pairwise_kf_with(None, backend),
+                &ctx,
+            );
+        }
+    }
 
+    fn assert_cells(snaps: &Snapshots, rf: &[u32], wrf: &[f64], kf: &[f64], ctx: &str) {
+        let n = snaps.snapshots.len();
         for i in 0..n {
             for j in 0..n {
                 let (want_rf, want_wrf, want_kf) =
@@ -1042,6 +1189,98 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The two kernels must agree cell for cell, not merely to a tolerance —
+    /// the selector switches between them silently, so a divergence would show
+    /// up as a distance that depends on the dataset's diversity.
+    ///
+    /// Covers the PHYLIP reference suite, a near-identical set (every column
+    /// universal, so the dense side packs nothing), a fully diverse set (every
+    /// column unique) and random sets at two taxon counts.
+    #[test]
+    fn dense_and_sparse_agree_cell_for_cell() {
+        let treedist: Vec<&str> = TREEDIST_TREES.to_vec();
+        let identical = vec![TREEDIST_TREES[0]; 6];
+        let diverse = DIVERSE_TREES.to_vec();
+
+        let mut random: Vec<Vec<String>> = Vec::new();
+        for &(n_taxa, n_trees, seed) in &[(9usize, 7usize, 11u64), (40, 6, 12)] {
+            let mut state = seed;
+            random.push(
+                (0..n_trees)
+                    .map(|_| random_newick(n_taxa, &mut state))
+                    .collect(),
+            );
+        }
+        let random: Vec<Vec<&str>> = random
+            .iter()
+            .map(|set| set.iter().map(String::as_str).collect())
+            .collect();
+
+        let cases = [&treedist, &identical, &diverse]
+            .into_iter()
+            .chain(random.iter());
+
+        for (case, newicks) in cases.enumerate() {
+            let snaps = Snapshots::from_newicks(newicks, false).unwrap();
+            assert_eq!(
+                snaps.pairwise_rf_with(None, Backend::Dense),
+                snaps.pairwise_rf_with(None, Backend::Sparse),
+                "RF backends disagree, case {case}"
+            );
+            for (dense, sparse) in [
+                (
+                    snaps.pairwise_wrf_with(None, Backend::Dense),
+                    snaps.pairwise_wrf_with(None, Backend::Sparse),
+                ),
+                (
+                    snaps.pairwise_kf_with(None, Backend::Dense),
+                    snaps.pairwise_kf_with(None, Backend::Sparse),
+                ),
+            ] {
+                for (k, (&d, &sp)) in dense.iter().zip(&sparse).enumerate() {
+                    assert!(
+                        (d - sp).abs() <= 1e-12 * d.abs().max(1.0),
+                        "weighted backends disagree at {k}: {d} vs {sp}, case {case}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The memory guard is what stops a diverse collection from allocating a
+    /// presence matrix larger than the machine: at 5 000 trees over 500 taxa
+    /// with every split unique the dense side wants 1.55 GB.
+    #[test]
+    fn auto_refuses_a_dense_matrix_over_budget() {
+        let (trees, words) = (5_000usize, 38_828usize);
+        let occupancy = 497 * trees as u64; // kept splits per tree × trees
+        assert!(!super::use_dense(
+            Backend::Auto,
+            0, // free by the time-based rule; only the budget may refuse it
+            super::matrix_bytes(trees, words),
+            occupancy,
+            trees,
+        ));
+        assert!(super::use_dense(
+            Backend::Auto,
+            0,
+            1 << 20,
+            occupancy,
+            trees
+        ));
+    }
+
+    /// `Auto` must report which kernel it picked through
+    /// [`super::last_backend_was_dense`].
+    #[test]
+    fn auto_reports_the_backend_it_picked() {
+        let snaps = Snapshots::from_newicks(&DIVERSE_TREES, false).unwrap();
+        snaps.pairwise_rf_with(None, Backend::Sparse);
+        assert!(!super::last_backend_was_dense());
+        snaps.pairwise_rf_with(None, Backend::Dense);
+        assert!(super::last_backend_was_dense());
     }
 
     #[test]
