@@ -641,32 +641,6 @@ impl Snapshots {
         out
     }
 
-    /// Diversity statistics: `(distinct splits, splits every tree holds, mean
-    /// splits per tree)`.
-    ///
-    /// `distinct - universal` is `U`, the RF sweep's column count, so the
-    /// per-pair word count is `(U).div_ceil(64)`. These are the
-    /// implementation-independent measures the benchmarks report alongside wall
-    /// time, and what places a tree set on the diversity axis.
-    pub fn split_stats(&self) -> (usize, usize, f64) {
-        let n = self.snapshots.len();
-        let distinct = self
-            .snapshots
-            .iter()
-            .filter_map(|s| s.split_ids.last().copied())
-            .max()
-            .map_or(0, |max_id| max_id as usize + 1);
-
-        let mut counts = vec![0u32; distinct];
-        for &id in self.snapshots.iter().flat_map(|s| &s.split_ids) {
-            counts[id as usize] += 1;
-        }
-        let universal = counts.iter().filter(|&&c| c as usize == n).count();
-        let total: usize = self.snapshots.iter().map(|s| s.split_ids.len()).sum();
-
-        (distinct, universal, total as f64 / n.max(1) as f64)
-    }
-
     /// Compute all pairwise Robinson–Foulds distances as a symmetric n×n matrix.
     ///
     /// Pass `Some(counter)` to track progress: after each row `i` finishes, the
@@ -906,29 +880,6 @@ mod tests {
             "Rooted 4-leaf binary tree should have 5 entries (4 pendant + 1 internal) after dedup, got {}",
             snap.parts.len()
         );
-    }
-
-    /// `split_stats` reports the diversity measures the benches key off.
-    ///
-    /// Three identical trees: every split is held by all of them, so `U`
-    /// (distinct − universal) collapses to 0 and the RF sweep has no columns.
-    #[test]
-    fn test_split_stats() {
-        const T: &str = "(((A:1,B:1):1,C:1):1,(D:1,E:1):1);";
-        let identical = Snapshots::from_newicks(&[T, T, T], false).unwrap();
-        let (distinct, universal, mean_row) = identical.split_stats();
-        assert_eq!(distinct, universal, "identical trees share every split");
-        assert_eq!(mean_row, distinct as f64);
-
-        // One reshuffled tree keeps only the splits both topologies hold.
-        let mixed =
-            Snapshots::from_newicks(&[T, "(((A:1,D:1):1,E:1):1,(B:1,C:1):1);"], false).unwrap();
-        let (distinct, universal, mean_row) = mixed.split_stats();
-        assert!(
-            universal < distinct,
-            "diverging trees leave non-shared splits"
-        );
-        assert_eq!(mean_row, (distinct + universal) as f64 / 2.0);
     }
 
     /// Test rooted vs unrooted mode partition counts and RF distances.

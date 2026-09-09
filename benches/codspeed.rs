@@ -1,51 +1,6 @@
 //! CodSpeed regression benches: snapshot construction + the pairwise backends
 //! (RF, WRF, KF).
 //!
-//! This file is built with `codspeed-divan-compat`, which lets CodSpeed measure
-//! every bench under two instruments from the *same* binary:
-//!   - **simulation** — deterministic instruction counts (the CPU-speed gate);
-//!   - **memory** — heap allocations tracked per bench (the memory gate that
-//!     replaces the old standalone `memory_quick` bench).
-//!
-//! A PR that makes any bench measurably slower *or* heavier than `master` is
-//! flagged. There are two bench families, so a regression is attributable:
-//!   - **`construct_*`** measure `Snapshots::from_newicks` (Newick parsing +
-//!     canonicalisation + interning) — the build is *inside* the measured region,
-//!     so under the memory instrument this is where the persistent `Snapshots`
-//!     footprint is gated.
-//!   - **`rf_* / wrf_* / kf_*`** measure only the pairwise call — the `Snapshots`
-//!     are built *outside* the timed region, so simulation isolates the compute
-//!     and memory captures just the transient result matrix.
-//!
-//! Two tree shapes are used, mirroring the target vs. adversarial regimes:
-//!   - **similar** — one topology with a few random leaf swaps per tree (the
-//!     MCMC-posterior regime rapidtrees targets, and the headline case).
-//!   - **diverse** — every tree fully reshuffled, the adversarial large-`U` case.
-//!
-//! # Sizing
-//!
-//! `SMALL` is the historical shape, kept as a cheap regression guard. It is too
-//! small to measure a kernel change: at that size most of the profile is rayon
-//! workers parked in `wait_until_cold`, and a real improvement is
-//! indistinguishable from scheduling noise. The larger cells exist so that a
-//! kernel change is visible:
-//!   - `SWEEP` — many trees at moderate taxa, where the O(t²) pair sweep
-//!     dominates;
-//!   - `WIDE` — many taxa at few trees, where the O(t·n²/64) per-tree build
-//!     dominates. The crossover sits near `trees ≈ taxa²/1000`, so the two cells
-//!     straddle it and a build-side change shows up on exactly one of them.
-//!
-//! Every large cell also has a `_st` variant pinned to a one-thread rayon pool.
-//! With the scheduler out of the picture the measurement is of the algorithm,
-//! and it is what a 1-thread-vs-1-thread comparison against other tools needs.
-//!
-//! `DIVERSE` is deliberately smaller than `SWEEP`: on a fully reshuffled set the
-//! dense sweep costs `⌈U/64⌉` words per pair with `U ≈ trees × (taxa − 3)`, so
-//! `SWEEP`'s tree count there would run for minutes.
-//!
-//! Each pairwise bench prints `U` and the resulting per-pair word count to
-//! stderr as it builds. Those are implementation-independent and explain a
-//! timing change without needing a stable machine.
 //!
 //! Build/run locally with `cargo codspeed build && cargo codspeed run` (add
 //! `-m memory` for the memory instrument), or just `cargo bench --bench codspeed`
@@ -145,19 +100,6 @@ fn snaps_from(newicks: &[String]) -> Snapshots {
     Snapshots::from_newicks(&refs, false).expect("parse failed")
 }
 
-/// Build the snapshots and report the diversity measures behind the timing.
-fn snaps_reported(label: &str, newicks: &[String]) -> Snapshots {
-    let snaps = snaps_from(newicks);
-    let (distinct, universal, mean_row) = snaps.split_stats();
-    let u = distinct - universal;
-    eprintln!(
-        "{label}: trees={} U={u} rf_words_per_pair={} mean_splits_per_tree={mean_row:.0}",
-        snaps.len(),
-        u.div_ceil(64),
-    );
-    snaps
-}
-
 /// A one-thread rayon pool: the algorithm without the scheduler.
 fn single_thread_pool() -> rayon::ThreadPool {
     rayon::ThreadPoolBuilder::new()
@@ -199,74 +141,74 @@ fn construct_similar_wide_st(bencher: divan::Bencher) {
 
 #[divan::bench]
 fn rf_similar(bencher: divan::Bencher) {
-    let snaps = snaps_reported("rf_similar", &similar_newicks(SMALL));
+    let snaps = snaps_from(&similar_newicks(SMALL));
     bencher.bench_local(|| snaps.pairwise_rf(None));
 }
 
 #[divan::bench]
 fn rf_diverse(bencher: divan::Bencher) {
-    let snaps = snaps_reported("rf_diverse", &diverse_newicks(SMALL));
+    let snaps = snaps_from(&diverse_newicks(SMALL));
     bencher.bench_local(|| snaps.pairwise_rf(None));
 }
 
 #[divan::bench]
 fn rf_similar_sweep(bencher: divan::Bencher) {
-    let snaps = snaps_reported("rf_similar_sweep", &similar_newicks(SWEEP));
+    let snaps = snaps_from(&similar_newicks(SWEEP));
     bencher.bench_local(|| snaps.pairwise_rf(None));
 }
 
 #[divan::bench]
 fn rf_similar_sweep_st(bencher: divan::Bencher) {
-    let snaps = snaps_reported("rf_similar_sweep_st", &similar_newicks(SWEEP));
+    let snaps = snaps_from(&similar_newicks(SWEEP));
     let pool = single_thread_pool();
     bencher.bench_local(|| pool.install(|| snaps.pairwise_rf(None)));
 }
 
 #[divan::bench]
 fn rf_diverse_sweep(bencher: divan::Bencher) {
-    let snaps = snaps_reported("rf_diverse_sweep", &diverse_newicks(DIVERSE));
+    let snaps = snaps_from(&diverse_newicks(DIVERSE));
     bencher.bench_local(|| snaps.pairwise_rf(None));
 }
 
 #[divan::bench]
 fn rf_diverse_sweep_st(bencher: divan::Bencher) {
-    let snaps = snaps_reported("rf_diverse_sweep_st", &diverse_newicks(DIVERSE));
+    let snaps = snaps_from(&diverse_newicks(DIVERSE));
     let pool = single_thread_pool();
     bencher.bench_local(|| pool.install(|| snaps.pairwise_rf(None)));
 }
 
 #[divan::bench]
 fn rf_similar_wide(bencher: divan::Bencher) {
-    let snaps = snaps_reported("rf_similar_wide", &similar_newicks(WIDE));
+    let snaps = snaps_from(&similar_newicks(WIDE));
     bencher.bench_local(|| snaps.pairwise_rf(None));
 }
 
 #[divan::bench]
 fn wrf_similar(bencher: divan::Bencher) {
-    let snaps = snaps_reported("wrf_similar", &similar_newicks(SMALL));
+    let snaps = snaps_from(&similar_newicks(SMALL));
     bencher.bench_local(|| snaps.pairwise_wrf(None));
 }
 
 #[divan::bench]
 fn wrf_diverse(bencher: divan::Bencher) {
-    let snaps = snaps_reported("wrf_diverse", &diverse_newicks(SMALL));
+    let snaps = snaps_from(&diverse_newicks(SMALL));
     bencher.bench_local(|| snaps.pairwise_wrf(None));
 }
 
 #[divan::bench]
 fn wrf_diverse_sweep(bencher: divan::Bencher) {
-    let snaps = snaps_reported("wrf_diverse_sweep", &diverse_newicks(DIVERSE));
+    let snaps = snaps_from(&diverse_newicks(DIVERSE));
     bencher.bench_local(|| snaps.pairwise_wrf(None));
 }
 
 #[divan::bench]
 fn kf_similar(bencher: divan::Bencher) {
-    let snaps = snaps_reported("kf_similar", &similar_newicks(SMALL));
+    let snaps = snaps_from(&similar_newicks(SMALL));
     bencher.bench_local(|| snaps.pairwise_kf(None));
 }
 
 #[divan::bench]
 fn kf_diverse(bencher: divan::Bencher) {
-    let snaps = snaps_reported("kf_diverse", &diverse_newicks(SMALL));
+    let snaps = snaps_from(&diverse_newicks(SMALL));
     bencher.bench_local(|| snaps.pairwise_kf(None));
 }

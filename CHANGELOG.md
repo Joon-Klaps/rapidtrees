@@ -10,10 +10,7 @@ This project uses release names based on random words from [codenamegenerator.co
 
 ## [Unreleased]
 
-- **Benchmarks:** The codspeed grid now has cells large enough to measure a kernel change. `rf_similar` spent 73.9% of its profile in `rayon_core`'s `wait_until_cold` — worker threads parked waiting for work that finished before they could help — so a real improvement moved the headline number by single-digit percent and was indistinguishable from scheduling noise. Added `rf_similar_sweep` (500 taxa × 1 500 trees, 28 ms vs `rf_similar`'s 208 µs), `rf_diverse_sweep`, `wrf_diverse_sweep` and the build-dominated `construct_similar_wide` / `rf_similar_wide` (4 000 taxa × 50 trees, 132 ms build against a 0.4 ms sweep). The two shapes straddle the build/sweep crossover at `trees ≈ taxa²/1000`, so a build-side change shows up on exactly one of them. Existing cells are unchanged and stay as regression guards.
-- **Benchmarks:** Every large cell also runs pinned to a one-thread rayon pool (`*_st`), which removes the scheduling floor by construction and gives the 1-thread-vs-1-thread comparison a number.
-- **Benchmarks:** Each pairwise bench now prints `U` (distinct splits after dropping the universal ones), the resulting per-pair word count, and mean splits per tree. These are implementation-independent, so a timing change can be read against the dataset rather than the machine.
-- **API (Rust):** New `Snapshots::split_stats() -> (distinct, universal, mean_splits_per_tree)`. No Python API change.
+- ([#24](https://github.com/Joon-Klaps/rapidtrees/issues/24)) - **Benchmarks:** removing rayon threading setup which took 7O% of time & added more larger tree datasets for benchmarking.
 
 ## [0.8.3] - Longhorn Sidewinder (2026-09-07)
 
