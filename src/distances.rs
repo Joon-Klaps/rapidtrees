@@ -172,14 +172,9 @@ fn split_tree_counts(snaps: &Snapshots) -> Vec<u32> {
 
 /// Give every split `keep` accepts a packed column index.
 ///
-/// Returns `(column_of, n_columns, occupancy)`; `column_of[id]` is `u32::MAX`
-/// if dropped and `occupancy` is the surviving tree × split incidences, which
-/// is what [`use_dense`] weighs the dense sweep against. Packing the survivors
-/// together is what shrinks the per-pair sweep.
-///
+/// Returns `(column_of, n_columns, occupancy)`
 /// Columns run in descending tree count, which clusters the widely-held splits
-/// into the low words, so most pairs intersect over a span of the row rather
-/// than all of it.
+/// into the low words
 fn assign_columns(counts: &[u32], keep: impl Fn(u32) -> bool) -> (Vec<u32>, usize, u64) {
     let mut kept: Vec<u32> = (0..counts.len() as u32)
         .filter(|&id| keep(counts[id as usize]))
@@ -187,10 +182,14 @@ fn assign_columns(counts: &[u32], keep: impl Fn(u32) -> bool) -> (Vec<u32>, usiz
     kept.sort_unstable_by_key(|&id| Reverse(counts[id as usize]));
 
     let mut column_of = vec![u32::MAX; counts.len()];
-    for (col, &id) in kept.iter().enumerate() {
-        column_of[id as usize] = col as u32;
-    }
-    let occupancy = kept.iter().map(|&id| u64::from(counts[id as usize])).sum();
+    let occupancy = kept
+        .iter()
+        .enumerate()
+        .map(|(col, &id)| {
+            column_of[id as usize] = col as u32;
+            u64::from(counts[id as usize])
+        })
+        .sum();
     (column_of, kept.len(), occupancy)
 }
 
