@@ -292,7 +292,7 @@ pub(crate) fn distance_rf(
         .map(|snap| (snap.split_ids.len() - everywhere) as u32)
         .collect();
 
-    fill_symmetric(n, progress, |i, j| {
+    let matrix = fill_symmetric(n, progress, |i, j| {
         let (lo, hi) = (spans[i].0.max(spans[j].0), spans[i].1.min(spans[j].1));
         let shared: u32 = if lo > hi {
             0
