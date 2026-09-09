@@ -16,6 +16,7 @@ This project uses release names based on random words from [codenamegenerator.co
   - **Validation:** the two backends must agree cell-for-cell. Checked on the PHYLIP `treedist` reference suite, a fully-identical set, a fully-diverse set, and random sets at two taxon counts; the existing randomized differential test now runs both backends against the naive oracle.
 - **CLI:** new `--backend auto|dense|sparse` forces a kernel for benchmarking, and the run log names the one that ran.
 - **API (Rust):** new `Backend` enum, `Snapshots::pairwise_{rf,wrf,kf}_with(progress, backend)`, and `last_backend_was_dense()`. The existing `pairwise_*` methods are unchanged and use `Backend::Auto`. No Python API change.
+- ([#24](https://github.com/Joon-Klaps/rapidtrees/issues/24)) - **Benchmarks:** Added more larger tree datasets for benchmarking. Added one-thread (`*_st`) variants for 1-thread-vs-1-thread comparisons.
 
 ## [0.8.3] - Longhorn Sidewinder (2026-09-07)
 
