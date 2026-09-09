@@ -1281,17 +1281,20 @@ mod tests {
     }
 
     /// The memory guard is what stops a diverse collection from allocating a
-    /// presence matrix larger than the machine: at 5 000 trees over 500 taxa
-    /// with every split unique the dense side wants 1.55 GB.
+    /// presence matrix larger than the machine. Sized off
+    /// [`super::DENSE_BUDGET_BYTES`] so raising the budget cannot silently
+    /// leave this asserting nothing.
     #[test]
     fn auto_refuses_a_dense_matrix_over_budget() {
-        let (trees, words) = (5_000usize, 38_828usize);
+        let trees = 5_000usize;
         let occupancy = 497 * trees as u64; // kept splits per tree × trees
+        // One word per tree past the budget, and the same shape well under it.
+        let over = (super::DENSE_BUDGET_BYTES / (trees as u64 * 8) + 1) as usize;
         assert_eq!(
             super::choose_kernel(
                 Backend::Auto,
                 0, // free by the time-based rule; only the budget may refuse it
-                super::matrix_bytes(trees, words),
+                super::matrix_bytes(trees, over),
                 occupancy,
                 trees,
             ),
