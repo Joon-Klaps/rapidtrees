@@ -17,7 +17,7 @@
 /// # Memory efficiency
 /// - Traditional HashSet<usize>: ~24 bytes per element + overhead
 /// - Bitset: 1 bit per possible element (8 bytes per 64 leaves)
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Bitset(pub Vec<u64>);
 
 impl Bitset {

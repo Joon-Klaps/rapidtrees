@@ -37,20 +37,6 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
 
-use std::cell::RefCell;
-
-thread_local! {
-    /// Per-thread FxHashMap reused across `Snapshot::from_tree` calls.
-    ///
-    /// Building snapshots in a tight loop (sequential or rayon-parallel) was
-    /// allocating a fresh FxHashMap per tree — at 5000 trees that's 5000
-    /// hashmap allocations + drops, plus their internal node arrays. Each
-    /// rayon worker keeps its own TLS slot, so this avoids cross-thread
-    /// synchronization while still reusing capacity across calls.
-    static BITSET_CACHE: RefCell<FxHashMap<usize, Bitset>> =
-        RefCell::new(FxHashMap::default());
-}
-
 /// One tree's bipartitions, on the way into a [`Snapshots`] collection.
 ///
 /// Short-lived: built per tree, handed straight to the interner, dropped. That
@@ -110,96 +96,73 @@ impl Snapshot {
             .map(|(idx, &(node_id, _))| (node_id, idx))
             .collect();
 
-        // Step 3: Perform DFS to build bitsets for each node.
-        // Cache is borrowed from a thread-local pool: clear (drops accumulated
-        // entries) and reserve (ensure capacity matches this tree's node count).
+        // Steps 3-4: one post-order pass builds every node's bitset and pairs it
+        // with its parent edge.
         let root_id = tree.get_root()?;
-        BITSET_CACHE.with(|cell| -> Result<Snapshot, TreeError> {
-            let mut cache = cell.borrow_mut();
-            cache.clear();
-            cache.reserve(num_leaves * 2);
-            Self::compute_bitsets(root_id, tree, &node_id_to_leaf_index, words, &mut cache)?;
+        let pairs = Self::collect_partitions(tree, root_id, &node_id_to_leaf_index, words)?;
 
-            // Step 4: Collect partitions (internal bipartitions + pendant edges)
-            let (parts, lengths) = Self::collect_partitions(tree, root_id, &cache)?;
+        // Step 5: Canonicalize partitions
+        // rooted_mode=false: bipartitions (canonicalized, deduped, trivial-filtered)
+        // rooted_mode=true:  clades (raw subtree bitsets, just sorted)
+        let (parts, lengths) = Self::canonicalize_partitions(pairs, num_leaves, rooted_mode);
 
-            // Step 5: Canonicalize partitions
-            // rooted_mode=false: bipartitions (canonicalized, deduped, trivial-filtered)
-            // rooted_mode=true:  clades (raw subtree bitsets, just sorted)
-            let (parts_canonical, lengths_canonical) =
-                Self::canonicalize_partitions(parts, lengths, words, num_leaves, rooted_mode);
-
-            Ok(Snapshot {
-                parts: parts_canonical,
-                lengths: lengths_canonical,
-                words,
-            })
+        Ok(Snapshot {
+            parts,
+            lengths,
+            words,
         })
     }
 
-    /// Recursively compute bitsets for all nodes via DFS.
+    /// Every node's subtree leaf set, paired with its parent edge length.
     ///
-    /// # Algorithm
-    /// - **Leaf node**: Create bitset with single bit set
-    /// - **Internal node**: OR together all child bitsets
+    /// One post-order pass over a flat arena indexed by node id: one bitset
+    /// allocated per node and none cloned, where the previous `FxHashMap`
+    /// cache cost roughly four allocations per node. The traversal is
+    /// iterative, so a caterpillar tree cannot overflow the stack.
     ///
-    /// Results are cached to avoid recomputation.
-    fn compute_bitsets(
-        node_id: usize,
-        tree: &PhyloTree,
-        node_id_to_leaf_index: &FxHashMap<usize, usize>,
-        words: usize,
-        cache: &mut FxHashMap<usize, Bitset>,
-    ) -> Result<Bitset, TreeError> {
-        if let Some(bitset) = cache.get(&node_id) {
-            return Ok(bitset.clone());
-        }
-
-        let node = tree.get(&node_id)?;
-
-        if node.children.is_empty() {
-            let mut bitset = Bitset::zeros(words);
-            let leaf_idx = *node_id_to_leaf_index
-                .get(&node_id)
-                .ok_or(TreeError::NodeNotFound(node_id))?;
-            bitset.set(leaf_idx);
-            cache.insert(node_id, bitset.clone());
-            return Ok(bitset);
-        }
-
-        let mut bitset = Bitset::zeros(words);
-        for &child_id in &node.children {
-            let child_bitset =
-                Self::compute_bitsets(child_id, tree, node_id_to_leaf_index, words, cache)?;
-            bitset.or_assign(&child_bitset);
-        }
-
-        cache.insert(node_id, bitset.clone());
-        Ok(bitset)
-    }
-
-    /// Collect all partitions (internal bipartitions and pendant edges) with branch lengths.
-    ///
-    /// # What we skip
-    /// - Root node (doesn't create a bipartition)
-    ///
-    /// # Branch lengths
-    /// Some trees may have missing branch lengths.
-    /// We treat missing lengths as 0.0.
+    /// The root is skipped — it creates no bipartition. Missing branch lengths
+    /// are treated as 0.0.
     fn collect_partitions(
         tree: &PhyloTree,
         root_id: usize,
-        cache: &FxHashMap<usize, Bitset>,
-    ) -> Result<(Vec<Bitset>, Vec<f64>), TreeError> {
-        cache
-            .iter()
-            .filter(|(node_id, _)| **node_id != root_id)
-            .map(|(node_id, bitset)| {
-                let length = tree.get(node_id)?.parent_edge.unwrap_or(0.0);
-                Ok((bitset.clone(), length))
+        node_id_to_leaf_index: &FxHashMap<usize, usize>,
+        words: usize,
+    ) -> Result<Vec<(Bitset, f64)>, TreeError> {
+        let mut order = Vec::with_capacity(tree.size());
+        let mut stack = vec![root_id];
+        while let Some(id) = stack.pop() {
+            order.push(id);
+            stack.extend(tree.get(&id)?.children.iter().copied());
+        }
+
+        // Children precede their parent in `order` reversed, so each parent
+        // finds its childrens' bitsets already written.
+        let mut arena = vec![Bitset::default(); tree.size()];
+        for &id in order.iter().rev() {
+            let node = tree.get(&id)?;
+            let mut bitset = Bitset::zeros(words);
+            if node.children.is_empty() {
+                bitset.set(
+                    *node_id_to_leaf_index
+                        .get(&id)
+                        .ok_or(TreeError::NodeNotFound(id))?,
+                );
+            } else {
+                for &child in &node.children {
+                    bitset.or_assign(&arena[child]);
+                }
+            }
+            arena[id] = bitset;
+        }
+
+        order
+            .into_iter()
+            .filter(|&id| id != root_id)
+            .map(|id| {
+                let length = tree.get(&id)?.parent_edge.unwrap_or(0.0);
+                Ok((std::mem::take(&mut arena[id]), length))
             })
-            .collect::<Result<Vec<_>, _>>()
-            .map(|v| v.into_iter().unzip())
+            .collect()
     }
 
     /// Canonicalize partitions to ensure consistent representation.
@@ -250,9 +213,7 @@ impl Snapshot {
     /// # Returns
     /// Returns (Vec<Bitset>, Vec<f64>) - parallel vectors, sorted by Bitset
     fn canonicalize_partitions(
-        parts: Vec<Bitset>,
-        lengths: Vec<f64>,
-        words: usize,
+        mut pairs: Vec<(Bitset, f64)>,
         num_leaves: usize,
         rooted_mode: bool,
     ) -> (Vec<Bitset>, Vec<f64>) {
@@ -260,7 +221,6 @@ impl Snapshot {
             // Rooted clade mode: use raw subtree bitsets as clades.
             // No canonicalization, no trivial filter, no dedup.
             // Both root children are distinct clades; L-1 leaf clades are valid.
-            let mut pairs: Vec<(Bitset, f64)> = parts.into_iter().zip(lengths).collect();
             pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
             return pairs.into_iter().unzip();
         }
@@ -274,30 +234,19 @@ impl Snapshot {
         //                                   filter out (the pendant itself is captured above).
         //   otherwise                     → internal bipartition: store the side that
         //                                   does NOT contain leaf 0.
-        let mut pairs: Vec<(Bitset, f64)> = parts
-            .into_iter()
-            .zip(lengths)
-            .filter_map(|(bitset, length)| {
-                let ones_before = bitset.count_ones();
-
-                if ones_before == 1 {
-                    return Some((bitset, length));
-                }
-
-                if ones_before >= num_leaves - 1 {
-                    return None;
-                }
-
-                let leaf_0_is_set = (bitset.0[0] & 1) != 0;
-                let canonical_bitset = if leaf_0_is_set {
-                    Self::compute_complement(&bitset, words, num_leaves)
-                } else {
-                    bitset
-                };
-
-                Some((canonical_bitset, length))
-            })
-            .collect();
+        pairs.retain_mut(|(bitset, _)| {
+            let ones_before = bitset.count_ones();
+            if ones_before == 1 {
+                return true;
+            }
+            if ones_before >= num_leaves - 1 {
+                return false;
+            }
+            if bitset.0[0] & 1 != 0 {
+                Self::complement_in_place(bitset, num_leaves);
+            }
+            true
+        });
 
         // CRITICAL: Sort by bitset for O(m+n) merge-based intersection
         pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -305,38 +254,32 @@ impl Snapshot {
         // Deduplicate consecutive identical bitsets (e.g. root bipartition
         // in rooted binary trees where both root children canonicalize to
         // the same split).  Merge by summing branch lengths.
-        let mut deduped: Vec<(Bitset, f64)> = Vec::with_capacity(pairs.len());
-        for (bitset, length) in pairs {
-            if let Some(last) = deduped.last_mut()
-                && last.0 == bitset
-            {
-                last.1 += length;
-                continue;
+        pairs.dedup_by(|later, kept| {
+            later.0 == kept.0 && {
+                kept.1 += later.1;
+                true
             }
-            deduped.push((bitset, length));
-        }
+        });
 
-        // Unzip into parallel vectors - indices now match!
-        let (canonical_parts, canonical_lengths): (Vec<Bitset>, Vec<f64>) =
-            deduped.into_iter().unzip();
-
-        (canonical_parts, canonical_lengths)
+        pairs.into_iter().unzip()
     }
 
-    /// Compute the bitwise complement of a partition.
+    /// Flip a partition to its complement in place.
     ///
-    /// Flips all bits up to `num_leaves` using word-level NOT, then masks the
-    /// trailing garbage bits in the final word.
+    /// Word-level NOT up to `num_leaves`, then mask the trailing garbage bits
+    /// in the final word. In place because roughly half the partitions in a
+    /// tree need flipping, and a fresh `Bitset` for each was an allocation.
     ///
     /// # Example
     /// Input:  0b0011 (4 leaves) → Output: 0b1100
-    fn compute_complement(bitset: &Bitset, words: usize, num_leaves: usize) -> Bitset {
-        let mut complement = Bitset(bitset.0.iter().map(|&w| !w).collect());
+    fn complement_in_place(bitset: &mut Bitset, num_leaves: usize) {
+        bitset.0.iter_mut().for_each(|w| *w = !*w);
         let used = num_leaves % 64;
-        if used != 0 {
-            complement.0[words - 1] &= (1u64 << used) - 1;
+        if used != 0
+            && let Some(last) = bitset.0.last_mut()
+        {
+            *last &= (1u64 << used) - 1;
         }
-        complement
     }
 }
 
@@ -875,10 +818,8 @@ mod tests {
         // parts = [{A,B} = 0b0011, {C,D} = 0b1100]
         // After canonicalization: both become 0b1100
         // After dedup: only one partition remains
-        let parts = vec![part_ab, part_cd];
-        let lengths = vec![1.0, 2.0];
-        let (canon_parts, canon_lengths) =
-            Snapshot::canonicalize_partitions(parts, lengths, 1, 4, false);
+        let pairs = vec![(part_ab, 1.0), (part_cd, 2.0)];
+        let (canon_parts, canon_lengths) = Snapshot::canonicalize_partitions(pairs, 4, false);
         assert_eq!(
             canon_parts.len(),
             1,
@@ -914,6 +855,24 @@ mod tests {
             "Rooted 4-leaf binary tree should have 5 entries (4 pendant + 1 internal) after dedup, got {}",
             snap.parts.len()
         );
+    }
+
+    /// A caterpillar tree nests as deep as it has leaves. The bitset pass is
+    /// iterative so depth costs heap, not stack.
+    #[test]
+    fn test_deep_caterpillar_tree() {
+        const LEAVES: usize = 3000;
+        let mut newick = format!("l{}:0.1", LEAVES - 1);
+        for i in (0..LEAVES - 1).rev() {
+            newick = format!("(l{i}:0.1,{newick}):0.1");
+        }
+        newick.push(';');
+
+        let snaps = Snapshots::from_newicks(&[&newick, &newick], false).unwrap();
+        assert_eq!(snaps.leaf_names.len(), LEAVES);
+        // LEAVES pendant edges + LEAVES-3 internal bipartitions.
+        assert_eq!(snaps.snapshots[0].split_ids.len(), 2 * LEAVES - 3);
+        assert_eq!(snaps.pairwise_rf(None)[1], 0, "a tree against itself");
     }
 
     /// Test rooted vs unrooted mode partition counts and RF distances.
