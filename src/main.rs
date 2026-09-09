@@ -235,6 +235,8 @@ fn log_collision_bound(quiet: bool, distinct_splits: usize) {
         quiet,
         format!("Distinct splits e = {distinct_splits}; collision bound e²/2¹²⁹ = {bound:.2e}"),
     );
+}
+
 /// Name the kernel that ran, so `auto`'s choice is in the run log.
 fn log_backend(quiet: bool, requested: Backend, chosen: Kernel) {
     let requested = format!("{requested:?}").to_lowercase();
