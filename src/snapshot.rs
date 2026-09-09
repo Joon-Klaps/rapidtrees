@@ -29,6 +29,7 @@
 //! analysis typically fits in L2 cache instead of requiring DRAM.
 
 use crate::bitset::Bitset;
+use crate::distances::{Backend, Distances};
 use crate::par::*;
 use hashbrown::HashTable;
 use phylotree::tree::{Tree as PhyloTree, TreeError};
@@ -647,21 +648,54 @@ impl Snapshots {
     /// counter is bumped by `n - i - 1`, reaching `n*(n-1)/2` when done. Pass
     /// `None` to skip the (negligible) counter work entirely.
     pub fn pairwise_rf(&self, progress: Option<&std::sync::atomic::AtomicUsize>) -> Vec<u32> {
-        crate::distances::distance_rf(self, progress)
+        self.pairwise_rf_with(progress, Backend::Auto).matrix
     }
 
     /// Compute all pairwise Weighted Robinson–Foulds distances as a symmetric n×n matrix.
     ///
     /// See [`Self::pairwise_rf`] for the `progress` argument.
     pub fn pairwise_wrf(&self, progress: Option<&std::sync::atomic::AtomicUsize>) -> Vec<f64> {
-        crate::distances::distance_wrf(self, progress)
+        self.pairwise_wrf_with(progress, Backend::Auto).matrix
     }
 
     /// Compute all pairwise Kuhner–Felsenstein distances as a symmetric n×n matrix.
     ///
     /// See [`Self::pairwise_rf`] for the `progress` argument.
     pub fn pairwise_kf(&self, progress: Option<&std::sync::atomic::AtomicUsize>) -> Vec<f64> {
-        crate::distances::distance_kf(self, progress)
+        self.pairwise_kf_with(progress, Backend::Auto).matrix
+    }
+
+    /// [`Self::pairwise_rf`] with the backend forced, reporting the kernel that
+    /// ran.
+    ///
+    /// [`Backend::Auto`] is what the plain entry points use and what any caller
+    /// should want; the explicit variants exist so a benchmark can pin one, and
+    /// the returned [`Distances::kernel`] is how a caller logs `Auto`'s choice.
+    /// Both backends return identical matrices.
+    pub fn pairwise_rf_with(
+        &self,
+        progress: Option<&std::sync::atomic::AtomicUsize>,
+        backend: Backend,
+    ) -> Distances<u32> {
+        crate::distances::distance_rf(self, progress, backend)
+    }
+
+    /// [`Self::pairwise_wrf`] with the backend forced. See [`Self::pairwise_rf_with`].
+    pub fn pairwise_wrf_with(
+        &self,
+        progress: Option<&std::sync::atomic::AtomicUsize>,
+        backend: Backend,
+    ) -> Distances<f64> {
+        crate::distances::distance_wrf(self, progress, backend)
+    }
+
+    /// [`Self::pairwise_kf`] with the backend forced. See [`Self::pairwise_rf_with`].
+    pub fn pairwise_kf_with(
+        &self,
+        progress: Option<&std::sync::atomic::AtomicUsize>,
+        backend: Backend,
+    ) -> Distances<f64> {
+        crate::distances::distance_kf(self, progress, backend)
     }
 
     fn empty() -> Self {
