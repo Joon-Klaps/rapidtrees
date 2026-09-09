@@ -10,11 +10,10 @@ This project uses release names based on random words from [codenamegenerator.co
 
 ## [Unreleased]
 
-- **Speed & memory (snapshot construction):** Building one tree's bipartitions ran through a thread-local `FxHashMap<usize, Bitset>` keyed by node id, costing roughly four allocations per node — one for the bitset, one for the clone inserted into the map, one for the clone `collect_partitions` took back out, and one more for every partition that needed complementing. It is now a flat arena indexed by node id, drained by move, with the complement applied in place and the duplicate-split merge done via `dedup_by` instead of into a second vector. 4 000 taxa × 50 trees **138 → 83 ms (1.66×)**, 2 000 × 200 **132 → 98 ms (1.35×)**, 500 × 100 **12.1 → 10.8 ms**. The win scales with taxa, since the allocation count follows the node count. No distance changes.
-- **Robustness:** The bitset pass is now an iterative post-order rather than recursive, so a caterpillar tree costs heap instead of stack. Covered by a 3 000-leaf fully-nested test.
 - ([#24](https://github.com/Joon-Klaps/rapidtrees/issues/24)) - **Benchmarks:** Larger tree datasets, plus one-thread (`*_st`) variants for 1-thread-vs-1-thread comparisons.
 - ([#25](https://github.com/Joon-Klaps/rapidtrees/issues/25)) - **Speed & memory (diverse tree sets):** The split between a matrix kernel (`dense`) and a sorted-list comparison (`sparse`) is back. `auto` picks whichever suits the observed number of unique bifurcations, and only refuses a dense matrix over the 5 GB memory limit.
 - ([#26](https://github.com/Joon-Klaps/rapidtrees/issues/26)) - **Speed & memory:** Sort columns in dense matrix by occurence, index first and last occurence for faster sweeping.
+- ([#27](https://github.com/Joon-Klaps/rapidtrees/issues/27)) - **Speed & memory (snapshot construction):** Building one tree's bipartitions ran through a thread-local `FxHashMap<usize, Bitset>` keyed by node id, costing roughly four allocations per node. It is now a flat arena indexed by node id.
 
 ## [0.8.3] - Longhorn Sidewinder (2026-09-07)
 
