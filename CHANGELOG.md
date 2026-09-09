@@ -17,6 +17,7 @@ This project uses release names based on random words from [codenamegenerator.co
 - **Speed (RF, dense path):** Presence-matrix columns are now assigned in descending tree-count order rather than first-encounter order, and each row records the first and last word it has a bit in. Widely-held splits cluster into the low words, so most pairs intersect over a span rather than the whole row. 500 taxa × 3 000 near-identical trees **204 → 94 ms (2.2×)**, × 1 500 **30.1 → 12.3 ms (2.5×)**, 200 taxa × 800 shuffled trees **16.3 → 9.0 ms (1.8×)**, 500 × 400 **0.95 → 0.62 ms**. The span is tracked while the row is built, so it costs nothing per pair; the ordering adds one `O(U log U)` sort per call, which is why a 100-tree set pays a fixed 0.03 ms and everything larger wins.
 - **CLI:** new `--backend auto|dense|sparse` forces a kernel for benchmarking, and the run log names the one that ran.
 - **API (Rust):** new `Backend` enum, `Snapshots::pairwise_{rf,wrf,kf}_with(progress, backend)`, and `last_backend_was_dense()`. The existing `pairwise_*` methods are unchanged and use `Backend::Auto`. No Python API change.
+- ([#24](https://github.com/Joon-Klaps/rapidtrees/issues/24)) - **Benchmarks:** Added more larger tree datasets for benchmarking. Added one-thread (`*_st`) variants for 1-thread-vs-1-thread comparisons.
 
 ## [0.8.3] - Longhorn Sidewinder (2026-09-07)
 
