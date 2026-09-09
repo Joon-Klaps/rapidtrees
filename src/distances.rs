@@ -18,6 +18,7 @@
 use crate::par::*;
 use crate::snapshot::Snapshots;
 use std::cmp::Ordering::{Equal, Greater, Less};
+use std::cmp::Reverse;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Which per-pair kernel to run.
@@ -190,21 +191,25 @@ fn split_tree_counts(snaps: &Snapshots) -> Vec<u32> {
 
 /// Give every split `keep` accepts a packed column index.
 ///
-/// Returns `(column_of, n_columns, occupancy)`; `column_of[id]` is `u32::MAX`
-/// if dropped and `occupancy` is the surviving tree × split incidences, which
-/// is what [`choose_kernel`] weighs the dense sweep against. Packing the survivors
-/// together is what shrinks the per-pair sweep.
+/// Returns `(column_of, n_columns, occupancy)`
+/// Columns run in descending tree count, which clusters the widely-held splits
+/// into the low words
 fn assign_columns(counts: &[u32], keep: impl Fn(u32) -> bool) -> (Vec<u32>, usize, u64) {
+    let mut kept: Vec<u32> = (0..counts.len() as u32)
+        .filter(|&id| keep(counts[id as usize]))
+        .collect();
+    kept.sort_unstable_by_key(|&id| Reverse(counts[id as usize]));
+
     let mut column_of = vec![u32::MAX; counts.len()];
-    let (mut n_columns, mut occupancy) = (0u32, 0u64);
-    for (id, &count) in counts.iter().enumerate() {
-        if keep(count) {
-            column_of[id] = n_columns;
-            n_columns += 1;
-            occupancy += u64::from(count);
-        }
-    }
-    (column_of, n_columns as usize, occupancy)
+    let occupancy = kept
+        .iter()
+        .enumerate()
+        .map(|(col, &id)| {
+            column_of[id as usize] = col as u32;
+            u64::from(counts[id as usize])
+        })
+        .sum();
+    (column_of, kept.len(), occupancy)
 }
 
 // ─── Robinson–Foulds ────────────────────────────────────────────────────────
@@ -254,18 +259,27 @@ pub(crate) fn distance_rf(
     }
 
     // One bitmask row per tree: a set bit means "this tree has that split".
+    // `spans[i]` is the first and last non-zero word of row `i`, empty as
+    // `(1, 0)`. Tracked while the row is built, so it costs nothing extra.
     let mut packed = vec![0u64; n * words];
+    let mut spans = vec![(1usize, 0usize); n];
     if words > 0 {
         packed
             .par_chunks_mut(words)
+            .zip(spans.par_chunks_mut(1))
             .zip(&snaps.snapshots)
-            .for_each(|(row, snap)| {
+            .for_each(|((row, span), snap)| {
+                let (mut lo, mut hi) = (usize::MAX, 0usize);
                 for &id in &snap.split_ids {
                     let slot = bit_slot[id as usize];
                     if slot != u32::MAX {
-                        let slot = slot as usize;
-                        row[slot >> 6] |= 1u64 << (slot & 63);
+                        let word = slot as usize >> 6;
+                        row[word] |= 1u64 << (slot & 63);
+                        (lo, hi) = (lo.min(word), hi.max(word));
                     }
+                }
+                if lo != usize::MAX {
+                    span[0] = (lo, hi);
                 }
             });
     }
@@ -279,13 +293,16 @@ pub(crate) fn distance_rf(
         .collect();
 
     let matrix = fill_symmetric(n, progress, |i, j| {
-        let row_i = row_slice(&packed, i, words);
-        let row_j = row_slice(&packed, j, words);
-        let shared: u32 = row_i
-            .iter()
-            .zip(row_j)
-            .map(|(&x, &y)| (x & y).count_ones())
-            .sum();
+        let (lo, hi) = (spans[i].0.max(spans[j].0), spans[i].1.min(spans[j].1));
+        let shared: u32 = if lo > hi {
+            0
+        } else {
+            row_slice(&packed, i, words)[lo..=hi]
+                .iter()
+                .zip(&row_slice(&packed, j, words)[lo..=hi])
+                .map(|(&x, &y)| (x & y).count_ones())
+                .sum()
+        };
         kept_per_tree[i] + kept_per_tree[j] - 2 * shared
     });
     Distances { matrix, kernel }
