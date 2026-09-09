@@ -228,6 +228,8 @@ A **tree snapshot** is a compact bitset representation of a phylogenetic tree. E
 
 > **Note:** Snapshots are not human-readable and are not intended for general interchange. They are an internal format optimized for fast distance calculations and cannot be convert to it's original newick-style format.
 
+> **Splits are identified by a 128-bit fingerprint,** not by comparing leaf sets — that is what keeps building a tree linear in its taxon count rather than quadratic. Two distinct splits are merged if their fingerprints collide, with probability about `e²/2¹²⁹` for `e` distinct splits in the run: `1.5 × 10⁻²³` at a hundred million splits, some nineteen orders of magnitude below the rate at which the machine's own RAM flips a bit unnoticed. Every run prints its own `e` and bound. Build with `--features verify` to check each match against the leaf set it stands for and fail loudly instead; CI runs the full suite that way.
+
 ### File layout
 
 A `.snap` file is a **gzip-compressed** binary stream with the following sections in order:

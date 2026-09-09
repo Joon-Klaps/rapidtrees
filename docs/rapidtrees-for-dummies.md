@@ -112,7 +112,9 @@ For 7 taxa, one 64-bit integer is enough. For 2 000 taxa, you need 32 integers p
 
 ## Step 2 — Building bitsets via DFS
 
-`rapidtrees` uses a **depth-first search (DFS)** — it walks the tree from the leaves upward, computing each internal node's bitset by OR-ing together its children's bitsets.
+`rapidtrees` uses a **depth-first search (DFS)** — it walks the tree from the leaves upward, computing each internal node's leaf set from its children's.
+
+The picture below ORs bitsets together, which is the clearest way to see what a node's leaf set *is*. That is not what the code actually carries up the tree, because a bitset is `⌈n/64⌉` words wide and there are `Θ(n)` nodes, making the walk `Θ(n²/64)` per tree — at 10 000 taxa, 157 words merged 20 000 times. Instead each node carries a **128-bit XOR fingerprint** plus a leaf count, both one machine operation, so the walk is `Θ(n)`. The bitsets below are exactly what those fingerprints stand for, and the real one is built later — once per *distinct* split in the whole run, not once per node per tree. [Step 3](#step-3--canonicalization-making-splits-comparable) explains why XOR in particular.
 
 **Tree 1: `(((A,B),(C,D)),(E,(F,G)));`**
 
@@ -166,6 +168,8 @@ Bitset 112  =  0b1110000  → bit 0 not set → keep →  112
 ```
 
 > 💡 **Root-split deduplication:** Bitsets 15 and 112 are the two sides of the same root split — `{A,B,C,D} | {E,F,G}`. They canonicalize to the same value (both → 112). One copy is dropped. This is expected: a rooted binary tree has the same number of unique bipartitions (N − 2 = 5) as its unrooted equivalent, because the root placement does not add a new bipartition.
+
+> 💡 **Why XOR, and what it costs.** The flip above needs the whole bitset. Fingerprints get it for free: XOR is its own inverse, so a set and its complement satisfy `fingerprint(A′) = total ^ fingerprint(A)`, and the canonical form is just `min(h, h ^ total)` — one comparison, no leaf set touched. (OR has no such shortcut, which is why the fingerprint is an XOR and not a hash of the bitset.) The price is that two *different* splits can in principle land on the same 128-bit value. The chance is about `e² / 2¹²⁹` for `e` distinct splits in the run: at a hundred million splits, `1.5 × 10⁻²³` — about nineteen orders of magnitude below the rate at which the machine's own RAM flips a bit without telling you. Every run prints its own `e` and bound. Build with `--features verify` to check each match against the leaf set it stands for and turn a collision into a panic instead of a silently merged split; CI runs the whole suite that way.
 
 Canonical bipartitions for Tree 1: **`{12, 96, 112, 124}`**
 

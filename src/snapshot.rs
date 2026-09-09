@@ -36,6 +36,62 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
 
+/// A 128-bit XOR fingerprint of a leaf set.
+///
+/// Each taxon draws one random 128-bit label at the start of a run; a subtree's
+/// fingerprint is the XOR of its leaves' labels, so a node costs `O(1)` to fold
+/// instead of `⌈n/64⌉` words. XOR is what makes the complement free —
+/// `label(A′) = total ^ label(A)` — so a bipartition's canonical form is
+/// `min(h, h ^ total)`, computed without touching either leaf set.
+///
+/// Two distinct splits share a fingerprint with probability about `e² / 2¹²⁹`,
+/// where `e` is the number of distinct splits the run sees. At `e = 10⁸` that
+/// is `1.5 × 10⁻²³` — some nineteen orders of magnitude below the rate at which
+/// the machine's own memory flips a bit unnoticed. The `verify` feature turns
+/// the assumption into a checked one; see [`Interner::push`].
+type Fingerprint = u128;
+
+/// One random 128-bit label per taxon, drawn once and shared by every tree.
+///
+/// The seed is fixed: the same input must produce the same split IDs on every
+/// run and every machine.
+fn taxon_labels(num_leaves: usize) -> Vec<Fingerprint> {
+    // splitmix64, seeded from the digits of pi.
+    let mut state = 0x243F_6A88_85A3_08D3u64;
+    let mut next = move || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    (0..num_leaves)
+        .map(|_| Fingerprint::from(next()) << 64 | Fingerprint::from(next()))
+        .collect()
+}
+
+/// One edge of a tree, identified by a fingerprint instead of a leaf set.
+///
+/// `first`/`size` locate the subtree's leaves as a contiguous run of
+/// [`Snapshot::leaf_order`], which is what lets the canonical [`Bitset`] be
+/// rebuilt later — once per *unique* split — with the tree already dropped.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Part {
+    /// Canonical fingerprint: `min(h, h ^ total)` for an internal bipartition,
+    /// so both of its sides give the same value — that is what replaces
+    /// canonicalising the bitset. Pendant edges and rooted clades keep the raw
+    /// subtree fingerprint.
+    key: Fingerprint,
+    /// Where this subtree's leaves start in [`Snapshot::leaf_order`].
+    first: u32,
+    /// Leaves in the subtree, before canonicalisation. Load-bearing: it stands
+    /// in for `count_ones()` in the pendant and near-full filters, which would
+    /// otherwise put the full-width popcount back.
+    size: u32,
+    /// Length of the edge above the node.
+    length: f64,
+}
+
 /// One tree's bipartitions, on the way into a [`Snapshots`] collection.
 ///
 /// Short-lived: built per tree, handed straight to the interner, dropped. That
@@ -43,16 +99,19 @@ use std::hash::BuildHasher;
 /// Taxon names live once on [`Snapshots`], not per tree.
 ///
 /// # Canonicalization
-/// Each internal bipartition has two complementary bitsets; we always store the
-/// side without leaf 0, so identical splits get identical representations.
-/// Pendant edges are stored as-is.
+/// Each internal bipartition has two complementary sides. The fingerprint
+/// canonicalises them for free by taking `min(h, h ^ total)`; the `Bitset` the
+/// interner materialises is still the side without leaf 0, so the public
+/// bipartition table is unchanged. Pendant edges are stored as-is.
 #[derive(Debug, Clone)]
 pub(crate) struct Snapshot {
-    /// All edges (internal bipartitions + pendant edges), canonicalized and sorted ascending.
-    pub(crate) parts: Vec<Bitset>,
+    /// All edges (internal bipartitions + pendant edges), filtered and sorted
+    /// by fingerprint.
+    pub(crate) parts: Vec<Part>,
 
-    /// Branch lengths, parallel to `parts`.
-    pub(crate) lengths: Vec<f64>,
+    /// Leaf bit indices in traversal order. Every subtree occupies a
+    /// contiguous run, so `leaf_order[first..first + size]` is a part's leaves.
+    pub(crate) leaf_order: Vec<u32>,
 
     /// Number of u64 words per bitset.
     pub(crate) words: usize,
@@ -64,14 +123,22 @@ impl Snapshot {
     /// # Algorithm
     /// 1. Extract leaf names and sort them alphabetically for consistency
     /// 2. Map each leaf name to a compact index [0..n)
-    /// 3. DFS (Depth-First Search) from root, building bitsets bottom-up
-    /// 4. For each internal node, merge child bitsets with OR
-    /// 5. Collect partitions excluding trivial single-leaf splits
-    /// 6. Canonicalize partitions (always store side without leaf with index 0)
+    /// 3. One DFS from the root, folding a 128-bit fingerprint and a leaf count
+    ///    per node — `O(1)` each, so the tree costs `Θ(n)` rather than `Θ(n²/64)`
+    /// 4. Drop the trivial splits and canonicalize by fingerprint
+    /// 5. Sort by fingerprint, merging any duplicate
+    ///
+    /// `labels` must hold one entry per taxon, indexed by the same alphabetical
+    /// bit index, and must be the *same* labels for every tree in a run — see
+    /// [`taxon_labels`].
     ///
     /// # Errors
     /// Returns `TreeError` if the tree is empty, malformed, or has unnamed leaves.
-    pub(crate) fn from_tree(tree: &PhyloTree, rooted_mode: bool) -> Result<Self, TreeError> {
+    pub(crate) fn from_tree(
+        tree: &PhyloTree,
+        rooted_mode: bool,
+        labels: &[Fingerprint],
+    ) -> Result<Self, TreeError> {
         // Step 1: Extract leaf names and sort them alphabetically
         let mut leaf_id_names: Vec<(usize, String)> = tree
             .get_leaves()
@@ -95,29 +162,33 @@ impl Snapshot {
             .map(|(idx, &(node_id, _))| (node_id, idx))
             .collect();
 
-        // Steps 3-4: one post-order pass builds every node's bitset and pairs it
-        // with its parent edge.
+        // Step 3: fingerprint every node
         let root_id = tree.get_root()?;
-        let pairs = Self::collect_partitions(tree, root_id, &node_id_to_leaf_index, words)?;
+        let (leaf_order, parts) =
+            Self::collect_partitions(tree, root_id, &node_id_to_leaf_index, labels, rooted_mode)?;
 
-        // Step 5: Canonicalize partitions
+        // Steps 4-5
         // rooted_mode=false: bipartitions (canonicalized, deduped, trivial-filtered)
-        // rooted_mode=true:  clades (raw subtree bitsets, just sorted)
-        let (parts, lengths) = Self::canonicalize_partitions(pairs, num_leaves, rooted_mode);
+        // rooted_mode=true:  clades (raw subtree fingerprints, just sorted)
+        let parts = Self::canonicalize_partitions(parts, num_leaves, rooted_mode);
 
         Ok(Snapshot {
             parts,
-            lengths,
+            leaf_order,
             words,
         })
     }
 
-    /// Every node's subtree leaf set, paired with its parent edge length.
+    /// Every node's subtree fingerprint and leaf run, paired with its edge.
     ///
-    /// One post-order pass over a flat arena indexed by node id: one bitset
-    /// allocated per node and none cloned, where the previous `FxHashMap`
-    /// cache cost roughly four allocations per node. The traversal is
-    /// iterative, so a caterpillar tree cannot overflow the stack.
+    /// Two iterative passes over one flat arena indexed by node id. The
+    /// accumulator is a 128-bit XOR plus a `u32` count, both `O(1)`, where a
+    /// bitset accumulator cost `⌈n/64⌉` words per node and `Θ(n)` allocations
+    /// per tree.
+    ///
+    /// Leaves are numbered in traversal order, so every subtree's leaves land
+    /// in a contiguous run of `leaf_order`. That run is how a canonical
+    /// `Bitset` is rebuilt later without keeping the tree alive.
     ///
     /// The root is skipped — it creates no bipartition. Missing branch lengths
     /// are treated as 0.0.
@@ -125,8 +196,9 @@ impl Snapshot {
         tree: &PhyloTree,
         root_id: usize,
         node_id_to_leaf_index: &FxHashMap<usize, usize>,
-        words: usize,
-    ) -> Result<Vec<(Bitset, f64)>, TreeError> {
+        labels: &[Fingerprint],
+        rooted_mode: bool,
+    ) -> Result<(Vec<u32>, Vec<Part>), TreeError> {
         let mut order = Vec::with_capacity(tree.size());
         let mut stack = vec![root_id];
         while let Some(id) = stack.pop() {
@@ -134,140 +206,130 @@ impl Snapshot {
             stack.extend(tree.get(&id)?.children.iter().copied());
         }
 
-        // Children precede their parent in `order` reversed, so each parent
-        // finds its childrens' bitsets already written.
-        let mut arena = vec![Bitset::default(); tree.size()];
-        for &id in order.iter().rev() {
-            let node = tree.get(&id)?;
-            let mut bitset = Bitset::zeros(words);
-            if node.children.is_empty() {
-                bitset.set(
-                    *node_id_to_leaf_index
-                        .get(&id)
-                        .ok_or(TreeError::NodeNotFound(id))?,
-                );
-            } else {
-                for &child in &node.children {
-                    bitset.or_assign(&arena[child]);
-                }
+        let mut acc = vec![Acc::default(); tree.size()];
+        let mut leaf_order = Vec::with_capacity(node_id_to_leaf_index.len());
+
+        // Pre-order: each leaf takes the next slot, which is what keeps a
+        // subtree's leaves adjacent.
+        for &id in &order {
+            if tree.get(&id)?.children.is_empty() {
+                let bit = *node_id_to_leaf_index
+                    .get(&id)
+                    .ok_or(TreeError::NodeNotFound(id))?;
+                acc[id] = Acc {
+                    fp: labels[bit],
+                    first: leaf_order.len() as u32,
+                    size: 1,
+                };
+                leaf_order.push(bit as u32);
             }
-            arena[id] = bitset;
         }
 
-        order
+        // Post-order: an internal node is the XOR of its children.
+        for &id in order.iter().rev() {
+            let node = tree.get(&id)?;
+            if node.children.is_empty() {
+                continue;
+            }
+            let folded = node.children.iter().fold(Acc::empty(), |a, &c| Acc {
+                fp: a.fp ^ acc[c].fp,
+                first: a.first.min(acc[c].first),
+                size: a.size + acc[c].size,
+            });
+            acc[id] = folded;
+        }
+
+        let total = acc[root_id].fp;
+        let parts = order
             .into_iter()
             .filter(|&id| id != root_id)
             .map(|id| {
-                let length = tree.get(&id)?.parent_edge.unwrap_or(0.0);
-                Ok((std::mem::take(&mut arena[id]), length))
+                let Acc { fp, first, size } = acc[id];
+                Ok(Part {
+                    // A pendant keeps its raw fingerprint: its complement is
+                    // filtered out below, so nothing else can claim the key,
+                    // and at two taxa `min(h, h ^ total)` would collapse the
+                    // two pendants onto each other.
+                    key: if rooted_mode || size == 1 {
+                        fp
+                    } else {
+                        fp.min(fp ^ total)
+                    },
+                    first,
+                    size,
+                    length: tree.get(&id)?.parent_edge.unwrap_or(0.0),
+                })
             })
-            .collect()
+            .collect::<Result<_, TreeError>>()?;
+
+        Ok((leaf_order, parts))
     }
 
-    /// Canonicalize partitions to ensure consistent representation.
+    /// Drop the trivial parts, then sort by fingerprint and merge duplicates.
     ///
-    /// # Problem
-    /// A bipartition {A,B}|{C,D}:
+    /// Three cases, decided by the raw subtree size — which the DFS already
+    /// accumulated, so no popcount is needed:
+    ///   size == 1              → pendant edge, kept as-is.
+    ///   size >= num_leaves - 1 → the complement of a pendant; dropped, since
+    ///                            the pendant itself is kept above.
+    ///   otherwise              → internal bipartition. `key` already carries
+    ///                            `min(h, h ^ total)`, so both sides of a split
+    ///                            arrive equal and there is nothing to flip.
     ///
-    /// A --\                   /-- C
-    ///     node1 - (root) - node2
-    /// D --/                   \-- B
-    ///
-    /// Can be represented as:
-    ///        (root)
-    ///        /   \
-    ///    node1    node2
-    ///    /   \    /   \
-    ///   A     D  B     C
-    /// bitset: [{node1}: 0b0011, {node2}: 0b1100]
-    ///
-    /// Or as (not drawn accuratly to scale):
-    ///        node1
-    ///        /   \
-    ///    (root)    D
-    ///    /   \
-    ///   A     \
-    ///        node2
-    ///        /   \
-    ///       B     C
-    /// bitset: [{root}: 0b1101, {node2}: 0b1100]
-    ///
-    ///
-    /// Without canonicalization, identical trees might produce different bitsets!
-    ///
-    ///
-    ///
-    /// __Consider it as rooting the tree to the same leaf.__
-    ///
-    /// # Solution
-    /// Always store the side that does NOT contain leaf 0 (the first leaf alphabetically).
-    /// - If leaf 0 is set: flip to complement
-    /// - If leaf 0 is not set: keep as-is
-    ///
-    /// # Example
-    /// Leaves: A=0, B=1, C=2, D=3
-    /// Partition {A,B}: bitset 0b0011 (leaf 0 SET) → flip to {C,D}: 0b1100
-    /// Partition {C,D}: bitset 0b1100 (leaf 0 NOT set) → keep as 0b1100
-    ///
-    /// # Returns
-    /// Returns (Vec<Bitset>, Vec<f64>) - parallel vectors, sorted by Bitset
+    /// Sorting a 16-byte key replaces sorting `⌈n/64⌉`-word bitsets: at 2 000
+    /// taxa, a 16-byte compare rather than a 256-byte one.
     fn canonicalize_partitions(
-        mut pairs: Vec<(Bitset, f64)>,
+        mut parts: Vec<Part>,
         num_leaves: usize,
         rooted_mode: bool,
-    ) -> (Vec<Bitset>, Vec<f64>) {
+    ) -> Vec<Part> {
         if rooted_mode {
-            // Rooted clade mode: use raw subtree bitsets as clades.
+            // Rooted clade mode: raw subtree fingerprints as clades.
             // No canonicalization, no trivial filter, no dedup.
             // Both root children are distinct clades; L-1 leaf clades are valid.
-            pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-            return pairs.into_iter().unzip();
+            parts.sort_unstable_by_key(|p| p.key);
+            return parts;
         }
 
-        // Unrooted bipartition mode: canonicalize, filter trivials, dedup.
-        //
-        // Three cases, decided by ones_before (count before any flip):
-        //   ones_before == 1              → pendant edge: keep as single-bit bitset,
-        //                                   no canonicalization needed.
-        //   ones_before >= num_leaves - 1 → near-full complement of a pendant edge;
-        //                                   filter out (the pendant itself is captured above).
-        //   otherwise                     → internal bipartition: store the side that
-        //                                   does NOT contain leaf 0.
-        pairs.retain_mut(|(bitset, _)| {
-            let ones_before = bitset.count_ones();
-            if ones_before == 1 {
-                return true;
-            }
-            if ones_before >= num_leaves - 1 {
-                return false;
-            }
-            if bitset.0[0] & 1 != 0 {
-                Self::complement_in_place(bitset, num_leaves);
-            }
-            true
-        });
+        parts.retain(|p| p.size == 1 || (p.size as usize) < num_leaves - 1);
+        parts.sort_unstable_by_key(|p| p.key);
 
-        // CRITICAL: Sort by bitset for O(m+n) merge-based intersection
-        pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-
-        // Deduplicate consecutive identical bitsets (e.g. root bipartition
-        // in rooted binary trees where both root children canonicalize to
-        // the same split).  Merge by summing branch lengths.
-        pairs.dedup_by(|later, kept| {
-            later.0 == kept.0 && {
-                kept.1 += later.1;
+        // Deduplicate identical fingerprints (e.g. the root bipartition in a
+        // rooted binary tree, where both root children canonicalize to the same
+        // split). Merge by summing branch lengths.
+        parts.dedup_by(|later, kept| {
+            later.key == kept.key && {
+                kept.length += later.length;
                 true
             }
         });
 
-        pairs.into_iter().unzip()
+        parts
+    }
+
+    /// Rebuild one part's canonical `Bitset` from its leaf run.
+    ///
+    /// `O(subtree size)` and run once per *unique* split rather than once per
+    /// occurrence — which is what the fingerprint build buys. The result is the
+    /// side without leaf 0, exactly the representation the bitset-accumulator
+    /// path produced, so [`Snapshots::bipartitions`] is byte-identical.
+    fn materialise(&self, part: &Part, num_leaves: usize, rooted_mode: bool) -> Bitset {
+        let mut bitset = Bitset::zeros(self.words);
+        for &bit in &self.leaf_order[part.first as usize..][..part.size as usize] {
+            bitset.set(bit as usize);
+        }
+        // A pendant edge is kept as-is, leaf 0 or not; its complement was
+        // filtered, so no other occurrence can disagree.
+        if !rooted_mode && part.size > 1 && bitset.0[0] & 1 != 0 {
+            Self::complement_in_place(&mut bitset, num_leaves);
+        }
+        bitset
     }
 
     /// Flip a partition to its complement in place.
     ///
     /// Word-level NOT up to `num_leaves`, then mask the trailing garbage bits
-    /// in the final word. In place because roughly half the partitions in a
-    /// tree need flipping, and a fresh `Bitset` for each was an allocation.
+    /// in the final word.
     ///
     /// # Example
     /// Input:  0b0011 (4 leaves) → Output: 0b1100
@@ -278,6 +340,26 @@ impl Snapshot {
             && let Some(last) = bitset.0.last_mut()
         {
             *last &= (1u64 << used) - 1;
+        }
+    }
+}
+
+/// Per-node DFS accumulator: a fingerprint and the subtree's leaf run.
+#[derive(Debug, Clone, Copy, Default)]
+struct Acc {
+    fp: Fingerprint,
+    first: u32,
+    size: u32,
+}
+
+impl Acc {
+    /// Identity for the children fold: XOR's zero, and a `first` that any real
+    /// child wins the `min` against.
+    fn empty() -> Self {
+        Acc {
+            fp: 0,
+            first: u32::MAX,
+            size: 0,
         }
     }
 }
@@ -369,7 +451,11 @@ impl Snapshots {
         sorted_leaf_names.dedup();
         let reference_leaves: HashSet<String> = sorted_leaf_names.iter().cloned().collect();
 
-        let first_snap = Snapshot::from_tree(&first_tree, rooted)
+        // One label set for the whole run: fingerprints are only comparable
+        // across trees if every tree draws from the same table.
+        let labels = taxon_labels(sorted_leaf_names.len());
+
+        let first_snap = Snapshot::from_tree(&first_tree, rooted, &labels)
             .map_err(|e| format!("Failed to snapshot tree at index 0: {e}"))?;
         drop(first_tree);
 
@@ -381,10 +467,17 @@ impl Snapshots {
         // to ~`CHUNK_TARGET_BYTES`, and fold each chunk into the interner — freeing
         // its bitsets — before parsing the next.
         const CHUNK_TARGET_BYTES: usize = 256 * 1024 * 1024;
-        let per_snap_bytes = first_snap.parts.len().max(1) * first_snap.words.max(1) * 8;
+        let per_snap_bytes = first_snap.parts.len() * size_of::<Part>()
+            + first_snap.leaf_order.len() * size_of::<u32>();
         let chunk = (CHUNK_TARGET_BYTES / per_snap_bytes.max(1)).clamp(1, 4096);
 
-        let mut interner = Interner::new(entries.len(), first_snap.words, store_lengths);
+        let mut interner = Interner::new(
+            entries.len(),
+            first_snap.words,
+            sorted_leaf_names.len(),
+            rooted,
+            store_lengths,
+        );
         interner.push(first_snap);
 
         let mut base = 1usize; // tree 0 is already interned
@@ -407,7 +500,7 @@ impl Snapshots {
                             "Tree {i} has a different leaf set than tree 0. All trees must share the same taxa."
                         ));
                     }
-                    Snapshot::from_tree(&tree, rooted)
+                    Snapshot::from_tree(&tree, rooted, &labels)
                         .map_err(|e| format!("Failed to snapshot tree at index {i}: {e}"))
                 })
                 .collect::<Result<_, _>>()?;
@@ -647,53 +740,88 @@ fn parse_and_rename(
 struct Interner {
     hasher: FxBuildHasher,
     table: HashTable<u32>,
+    /// `(canonical fingerprint, smaller side's cardinality)` per split ID —
+    /// what a candidate is matched against.
+    keys: Vec<(Fingerprint, u32)>,
     bipartitions: Vec<Bitset>,
     snapshots: Vec<InternSnap>,
     words: usize,
+    num_leaves: usize,
+    rooted: bool,
     store_lengths: bool,
 }
 
 impl Interner {
-    fn new(n_trees: usize, words: usize, store_lengths: bool) -> Self {
+    fn new(
+        n_trees: usize,
+        words: usize,
+        num_leaves: usize,
+        rooted: bool,
+        store_lengths: bool,
+    ) -> Self {
         Self {
             hasher: FxBuildHasher,
             table: HashTable::new(),
+            keys: Vec::new(),
             bipartitions: Vec::new(),
             snapshots: Vec::with_capacity(n_trees),
             words,
+            num_leaves,
+            rooted,
             store_lengths,
         }
     }
 
-    /// Intern one raw snapshot, consuming its bitsets. When `store_lengths` is
-    /// `false`, branch lengths are dropped (RF-only paths never read them).
+    /// Intern one raw snapshot. When `store_lengths` is `false`, branch lengths
+    /// are dropped (RF-only paths never read them).
+    ///
+    /// A split is matched on its 128-bit fingerprint *and* the cardinality of
+    /// its smaller side, which is equal for both sides of a bipartition and
+    /// rules out a slice of the collision space for one integer compare. Only a
+    /// fingerprint the table has never seen materialises a `Bitset`, so that
+    /// `O(subtree)` walk runs once per unique split rather than once per
+    /// occurrence.
+    ///
+    /// With the `verify` feature on, every *match* is checked against the
+    /// stored bitset and a collision panics rather than silently merging two
+    /// distinct splits. CI runs the suite both ways.
     fn push(&mut self, snap: Snapshot) {
         // Bind disjoint fields to locals so the closures below can borrow the
-        // table mutably while reading `bipartitions`/`hasher`.
+        // table mutably while reading `keys`/`hasher`.
         let hasher = &self.hasher;
         let table = &mut self.table;
+        let keys = &mut self.keys;
         let bipartitions = &mut self.bipartitions;
+        let (num_leaves, rooted) = (self.num_leaves, self.rooted);
 
         let mut paired: Vec<(u32, f64)> = snap
             .parts
-            .into_iter()
-            .zip(snap.lengths)
-            .map(|(b, length)| {
-                let hash = hasher.hash_one(&b);
-                // Check if this bipartition already has an assigned ID.
-                let id = match table.find(hash, |&id| bipartitions[id as usize] == b) {
-                    Some(&id) => id,
+            .iter()
+            .map(|part| {
+                let candidate = (part.key, part.size.min(num_leaves as u32 - part.size));
+                let hash = hasher.hash_one(part.key);
+                let id = match table.find(hash, |&id| keys[id as usize] == candidate) {
+                    Some(&id) => {
+                        #[cfg(feature = "verify")]
+                        assert_eq!(
+                            snap.materialise(part, num_leaves, rooted),
+                            bipartitions[id as usize],
+                            "128-bit fingerprint collision: two distinct splits share a key"
+                        );
+                        id
+                    }
                     None => {
-                        let new_id = bipartitions.len() as u32;
-                        bipartitions.push(b);
+                        let new_id = keys.len() as u32;
+                        keys.push(candidate);
+                        bipartitions.push(snap.materialise(part, num_leaves, rooted));
                         // register the new ID in the hash table
                         table.insert_unique(hash, new_id, |&id| {
-                            hasher.hash_one(&bipartitions[id as usize])
+                            hasher.hash_one(keys[id as usize].0)
                         });
                         new_id
                     }
                 };
-                (id, length)
+                (id, part.length)
             })
             .collect();
 
@@ -733,6 +861,14 @@ mod tests {
             .collect()
     }
 
+    /// Build one snapshot with a fresh label table — the interner is not
+    /// involved, so any consistent labels will do.
+    fn snapshot_of(newick: &str, rooted: bool) -> Snapshot {
+        let tree = PhyloTree::from_newick(newick).unwrap();
+        let labels = taxon_labels(tree.get_leaves().len());
+        Snapshot::from_tree(&tree, rooted, &labels).unwrap()
+    }
+
     /// A symmetric 4-leaf tree produces a single bipartition after canonicalization.
     ///
     /// ```text
@@ -745,57 +881,44 @@ mod tests {
     ///
     /// Leaves sorted: A=0, B=1, C=2, D=3.
     ///
-    /// node1's subtree = {A,B} = 0b0011 — contains A (bit 0), so flip to {C,D} = 0b1100.
-    /// node2's subtree = {C,D} = 0b1100 — no A, keep as-is.
-    ///
-    /// Both sides of the root bipartition canonicalize to the same bitset because they
-    /// represent the **same split** viewed from either side. `canonicalize_partitions`
-    /// deduplicates them into one entry and sums the branch lengths.
+    /// node1's subtree = {A,B}, node2's = {C,D}. They are the two sides of the
+    /// **same split**, so `min(h, h ^ total)` gives both the same fingerprint —
+    /// XOR canonicalises them without touching either leaf set. Dedup collapses
+    /// them into one entry and sums the branch lengths.
     #[test]
     fn test_depth3_tree_partitions() {
-        // This test reveals a conceptual issue...
-        // Let me think about this more carefully
+        let snap = snapshot_of("((A:1,B:2):1,(C:1,D:1):2);", false);
 
-        // Tree:     root
-        //          /    \
-        //      node1    node2
-        //      /   \    /   \
-        //     A     B  C     D
+        // 4 pendant edges + 1 internal bipartition.
+        assert_eq!(snap.parts.len(), 5);
 
-        // The partitions are:
-        // 1. node1 splits: {A,B} vs {C,D}
-        // 2. node2 splits: {C,D} vs {A,B}
-
-        // These are the SAME bipartition from different directions!
-        // So they SHOULD canonicalize to the same thing!
-
-        let mut part_ab = Bitset::zeros(1);
-        part_ab.set(0); // A
-        part_ab.set(1); // B
-
-        let mut part_cd = Bitset::zeros(1);
-        part_cd.set(2); // C
-        part_cd.set(3); // D
-
-        // Both represent the same split, so after canonicalization
-        // they'll be identical - that's CORRECT behavior!
-
-        // Verify that canonicalize_partitions deduplicates the root bipartition:
-        // parts = [{A,B} = 0b0011, {C,D} = 0b1100]
-        // After canonicalization: both become 0b1100
-        // After dedup: only one partition remains
-        let pairs = vec![(part_ab, 1.0), (part_cd, 2.0)];
-        let (canon_parts, canon_lengths) = Snapshot::canonicalize_partitions(pairs, 4, false);
+        let internal: Vec<&Part> = snap.parts.iter().filter(|p| p.size > 1).collect();
         assert_eq!(
-            canon_parts.len(),
+            internal.len(),
             1,
-            "Root bipartition should be deduplicated to 1 partition, got {}",
-            canon_parts.len()
+            "both sides of the root split must share one fingerprint"
         );
         assert_eq!(
-            canon_lengths[0], 3.0,
-            "Deduplicated lengths should sum: 1.0 + 2.0 = 3.0"
+            internal[0].length, 3.0,
+            "deduplicated lengths should sum: 1.0 + 2.0 = 3.0"
         );
+    }
+
+    /// Both sides of a bipartition must materialise to the same `Bitset` — the
+    /// side without leaf 0 — whichever occurrence the interner happened to see
+    /// first. That is what keeps the public bipartition table unchanged by the
+    /// switch to fingerprints.
+    #[test]
+    fn test_materialised_side_excludes_leaf_zero() {
+        let snaps = Snapshots::from_newicks(&["((A:1,B:1):1,(C:1,D:1):1);"], false).unwrap();
+        let internal: Vec<&Bitset> = snaps
+            .bipartitions
+            .iter()
+            .filter(|b| b.count_ones() > 1)
+            .collect();
+        assert_eq!(internal.len(), 1);
+        assert!(!internal[0].get(0), "canonical side must exclude leaf 0");
+        assert_eq!(internal[0].0[0], 0b1100, "the {{C,D}} side");
     }
 
     /// Test that from_tree deduplicates root bipartitions in rooted binary trees.
@@ -806,12 +929,9 @@ mod tests {
     /// (e.g. R's phangorn RF.dist with rooted=FALSE).
     #[test]
     fn test_root_bipartition_dedup() {
-        use phylotree::tree::Tree as PhyloTree;
-
         // Tree: ((A:1,B:1):1,(C:1,D:1):1);
         // Root has two internal children - classic root bipartition duplication case
-        let tree = PhyloTree::from_newick("((A:1,B:1):1,(C:1,D:1):1);").unwrap();
-        let snap = Snapshot::from_tree(&tree, false).unwrap();
+        let snap = snapshot_of("((A:1,B:1):1,(C:1,D:1):1);", false);
 
         // For 4 leaves: 4 pendant edges + 1 internal bipartition = 5 entries.
         // With dedup, the duplicated root bipartition collapses to 1 internal entry.
@@ -821,6 +941,48 @@ mod tests {
             "Rooted 4-leaf binary tree should have 5 entries (4 pendant + 1 internal) after dedup, got {}",
             snap.parts.len()
         );
+    }
+
+    /// Split IDs must not depend on when the process started: the label table
+    /// is seeded from a constant, so two runs agree bit for bit.
+    #[test]
+    fn test_taxon_labels_are_deterministic_and_distinct() {
+        let a = taxon_labels(64);
+        assert_eq!(a, taxon_labels(64), "labels must not vary between runs");
+        assert_eq!(
+            a.iter().collect::<HashSet<_>>().len(),
+            64,
+            "labels must be distinct"
+        );
+        assert_eq!(&a[..8], &taxon_labels(8)[..], "a prefix is a prefix");
+    }
+
+    /// Interning is by fingerprint, so a run over the same trees must produce
+    /// the same bipartition table and the same split IDs every time.
+    #[test]
+    fn test_interning_is_reproducible() {
+        let trees = [
+            "(((A:1,B:1):1,C:1):1,(D:1,E:1):1);",
+            "(((A:1,D:1):1,E:1):1,(B:1,C:1):1);",
+        ];
+        let (first, second) = (
+            Snapshots::from_newicks(&trees, false).unwrap(),
+            Snapshots::from_newicks(&trees, false).unwrap(),
+        );
+        assert_eq!(first.bipartitions, second.bipartitions);
+        for (a, b) in first.snapshots.iter().zip(&second.snapshots) {
+            assert_eq!(a.split_ids, b.split_ids);
+        }
+    }
+
+    /// Two taxa is the degenerate case where a pendant edge's complement is
+    /// the *other* pendant edge, so `min(h, h ^ total)` would merge them. They
+    /// must stay two distinct splits.
+    #[test]
+    fn test_two_taxa_pendants_stay_distinct() {
+        let snaps = Snapshots::from_newicks(&["(A:1,B:2);", "(A:3,B:4);"], false).unwrap();
+        assert_eq!(snaps.bipartitions.len(), 2);
+        assert_eq!(snaps.snapshots[0].split_ids, vec![0, 1]);
     }
 
     /// A caterpillar tree nests as deep as it has leaves. The bitset pass is
@@ -844,8 +1006,6 @@ mod tests {
     /// Test rooted vs unrooted mode partition counts and RF distances.
     #[test]
     fn test_rooted_vs_unrooted_partitions() {
-        use phylotree::tree::Tree as PhyloTree;
-
         // Two trees means a two-tree `Snapshots`, read at the off-diagonal cell.
         let rf_pair = |a: &str, b: &str, rooted: bool| -> u32 {
             Snapshots::from_newicks(&[a, b], rooted)
@@ -857,12 +1017,9 @@ mod tests {
         const TREE2: &str = "((A:1,C:1):1,(B:1,D:1):1);";
         const TREE1B: &str = "((B:2,A:2):2,(D:2,C:2):2);";
 
-        let tree1 = PhyloTree::from_newick(TREE1).unwrap();
-        let tree2 = PhyloTree::from_newick(TREE2).unwrap();
-
         // Unrooted mode: 4 pendant edges + 1 internal bipartition = 5 entries per tree.
-        let snap1_u = Snapshot::from_tree(&tree1, false).unwrap();
-        let snap2_u = Snapshot::from_tree(&tree2, false).unwrap();
+        let snap1_u = snapshot_of(TREE1, false);
+        let snap2_u = snapshot_of(TREE2, false);
         assert_eq!(
             snap1_u.parts.len(),
             5,
@@ -872,8 +1029,8 @@ mod tests {
         assert_eq!(rf_pair(TREE1, TREE2, false), 2, "Unrooted RF = 2");
 
         // Rooted mode: 4 pendant edges + 2 internal clades = 6 entries per tree.
-        let snap1_r = Snapshot::from_tree(&tree1, true).unwrap();
-        let snap2_r = Snapshot::from_tree(&tree2, true).unwrap();
+        let snap1_r = snapshot_of(TREE1, true);
+        let snap2_r = snapshot_of(TREE2, true);
         assert_eq!(
             snap1_r.parts.len(),
             6,

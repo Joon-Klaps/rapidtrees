@@ -63,6 +63,9 @@ jobs:
                   DYLD_FALLBACK_LIBRARY_PATH: ${{ github.workspace }}/.pixi/envs/default/lib:/usr/local/lib:/usr/lib
               run: cargo test --verbose --lib --features python
 
+            - name: Run tests against the exact split representation
+              run: cargo test --verbose --lib --features verify
+
     python-test:
         name: Python API Tests (${{ matrix.os }}, ${{ matrix.environment }})
         runs-on: ${{ matrix.os }}

@@ -36,6 +36,10 @@ cli = ["clap", "flate2"]
 # Rayon-backed parallelism (`par.rs`). On by default; off for wasm32.
 parallel = ["rayon"]
 python = ["pyo3", "parallel"]
+# Check every fingerprint match against the leaf set it stands for. Off by
+# default (it re-materialises a bitset per occurrence); CI runs the suite with
+# it on, so the fast path is continuously checked against the exact one.
+verify = []
 extension-module = ["python", "pyo3/extension-module"]
 
 # Until https://github.com/lucblassel/phylotree-rs/pull/18 lands, take

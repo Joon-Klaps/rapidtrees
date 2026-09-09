@@ -114,6 +114,8 @@ fn main() {
         std::process::exit(2);
     }
 
+    log_collision_bound(quiet, interned.bipartitions.len());
+
     if let Some(snap_path) = args.export_snap {
         let t = Instant::now();
         if let Err(e) = write_snap(&snap_path, &names, &interned) {
@@ -211,6 +213,21 @@ fn metric_label(metric: MetricArg) -> &'static str {
         MetricArg::Weighted => "Weighted RF",
         MetricArg::Kf => "KF",
     }
+}
+
+/// State the run's own correctness guarantee.
+///
+/// Splits are interned on a 128-bit fingerprint, so two distinct splits are
+/// merged with probability about `e² / 2¹²⁹` for `e` distinct splits. Printing
+/// `e` and the bound puts a checkable number in the log rather than a claim.
+fn log_collision_bound(quiet: bool, distinct_splits: usize) {
+    let e = distinct_splits as f64;
+    // 2¹²⁹ overflows nothing here, but stays clearer written as a power.
+    let bound = e * e / 2f64.powi(129);
+    log_if(
+        quiet,
+        format!("Distinct splits e = {distinct_splits}; collision bound e²/2¹²⁹ = {bound:.2e}"),
+    );
 }
 
 fn log_if(quiet: bool, msg: String) {
