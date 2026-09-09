@@ -1,5 +1,6 @@
 use clap::{Parser, ValueEnum};
 use rapidtrees::io::{load_beast_trees, load_snapshots, write_matrix_tsv, write_snap};
+use rapidtrees::{Backend, Kernel};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -56,6 +57,10 @@ struct Args {
     /// Compute rooted distances (compare clades) instead of unrooted (compare bipartitions)
     #[arg(long = "rooted", default_value_t = false)]
     rooted: bool,
+
+    /// Per-pair kernel: auto | dense | sparse. `auto` picks from tree diversity
+    #[arg(long = "backend", value_enum, default_value_t = Backend::Auto)]
+    backend: Backend,
 
     /// Quiet mode: suppresses progress messages on stdout
     #[arg(short = 'q', long = "quiet", default_value_t = false)]
@@ -150,27 +155,33 @@ fn main() {
     // Each arm keeps its own element type all the way to the writer.
     let write_result = match args.metric {
         MetricArg::Rf => {
-            let mat = run_with_progress(n_pairs, show_progress, |counter| {
-                interned.pairwise_rf(Some(counter))
+            let dist = run_with_progress(n_pairs, show_progress, |counter| {
+                interned.pairwise_rf_with(Some(counter), args.backend)
             });
+            log_backend(quiet, args.backend, dist.kernel);
+            let mat = dist.matrix;
             log_computed(quiet, metric_label, &t);
             let t = Instant::now();
             let r = write_matrix_tsv(output_path, &names, &mat, interned.len());
             (r, t)
         }
         MetricArg::Weighted => {
-            let mat = run_with_progress(n_pairs, show_progress, |counter| {
-                interned.pairwise_wrf(Some(counter))
+            let dist = run_with_progress(n_pairs, show_progress, |counter| {
+                interned.pairwise_wrf_with(Some(counter), args.backend)
             });
+            log_backend(quiet, args.backend, dist.kernel);
+            let mat = dist.matrix;
             log_computed(quiet, metric_label, &t);
             let t = Instant::now();
             let r = write_matrix_tsv(output_path, &names, &mat, interned.len());
             (r, t)
         }
         MetricArg::Kf => {
-            let mat = run_with_progress(n_pairs, show_progress, |counter| {
-                interned.pairwise_kf(Some(counter))
+            let dist = run_with_progress(n_pairs, show_progress, |counter| {
+                interned.pairwise_kf_with(Some(counter), args.backend)
             });
+            log_backend(quiet, args.backend, dist.kernel);
+            let mat = dist.matrix;
             log_computed(quiet, metric_label, &t);
             let t = Instant::now();
             let r = write_matrix_tsv(output_path, &names, &mat, interned.len());
@@ -216,10 +227,6 @@ fn metric_label(metric: MetricArg) -> &'static str {
 }
 
 /// State the run's own correctness guarantee.
-///
-/// Splits are interned on a 128-bit fingerprint, so two distinct splits are
-/// merged with probability about `e² / 2¹²⁹` for `e` distinct splits. Printing
-/// `e` and the bound puts a checkable number in the log rather than a claim.
 fn log_collision_bound(quiet: bool, distinct_splits: usize) {
     let e = distinct_splits as f64;
     // 2¹²⁹ overflows nothing here, but stays clearer written as a power.
@@ -228,6 +235,10 @@ fn log_collision_bound(quiet: bool, distinct_splits: usize) {
         quiet,
         format!("Distinct splits e = {distinct_splits}; collision bound e²/2¹²⁹ = {bound:.2e}"),
     );
+/// Name the kernel that ran, so `auto`'s choice is in the run log.
+fn log_backend(quiet: bool, requested: Backend, chosen: Kernel) {
+    let requested = format!("{requested:?}").to_lowercase();
+    log_if(quiet, format!("Backend: {chosen} (--backend {requested})"));
 }
 
 fn log_if(quiet: bool, msg: String) {
@@ -242,10 +253,9 @@ fn log_if(quiet: bool, msg: String) {
 /// When `show_progress` is `false` the function reduces to `work(&counter)`
 /// without spawning a monitor thread, so piped/redirected runs and `--quiet`
 /// retain their original zero-overhead behaviour.
-fn run_with_progress<T, F>(n_pairs: usize, show_progress: bool, work: F) -> Vec<T>
+fn run_with_progress<R, F>(n_pairs: usize, show_progress: bool, work: F) -> R
 where
-    T: Send,
-    F: FnOnce(&AtomicUsize) -> Vec<T>,
+    F: FnOnce(&AtomicUsize) -> R,
 {
     if !show_progress {
         let counter = AtomicUsize::new(0);

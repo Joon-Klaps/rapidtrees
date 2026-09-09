@@ -21,6 +21,7 @@ pub mod api;
 pub(crate) mod progress;
 
 pub use bitset::Bitset;
+pub use distances::{Backend, Distances, Kernel};
 #[cfg(feature = "cli")]
 pub use io::write_matrix_tsv;
 pub use snapshot::Snapshots;

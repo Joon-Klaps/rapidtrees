@@ -55,6 +55,7 @@ cpu-time = "1.0.0"
 memory-stats = "1.0.0"
 tempfile = "3"
 divan = { package = "codspeed-divan-compat", version = "5.0.1" }
+rayon = "1"
 
 [[bench]]
 name = "memory_time_benchmark"
