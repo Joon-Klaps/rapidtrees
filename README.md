@@ -108,6 +108,7 @@ rapidtrees \
   [--burnin-states <STATE>] \
   [--use-real-taxa] \
   [--metric rf|weighted|kf] \
+  [--backend auto|dense|sparse] \
   [-q|--quiet]
 ```
 
@@ -120,6 +121,7 @@ rapidtrees \
 | `-s, --burnin-states <STATE>` | Keep only trees with `STATE > STATE` (default: `0`)                |
 | `--use-real-taxa`             | Map numeric taxon IDs via the TRANSLATE block                      |
 | `--metric <rf\|weighted\|kf>` | Distance metric (default: `rf`)                                    |
+| `--backend <auto\|dense\|sparse>` | Per-pair kernel (default: `auto`). Both give identical results |
 | `-q, --quiet`                 | Suppress progress messages (errors still go to stderr)             |
 
 **Input formats.** `--input` takes either a NEXUS/BEAST trees file or a plain Newick file with one tree per line; the format is sniffed from the contents, not the extension. Newick files name nothing, carry no `TRANSLATE` block and no `STATE_` labels, so their trees are named after the line they start on, and `--burnin-states` / `--use-real-taxa` have nothing to act on (`--burnin-trees` still works).
