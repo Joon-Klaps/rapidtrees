@@ -8,6 +8,11 @@ This project uses release names based on random words from [codenamegenerator.co
     - PREFIX: Microsoft Corperation
     - DICTIONARY: Snakes
 
+## [Unreleased]
+
+- **Speed & memory (snapshot construction):** Building one tree's bipartitions ran through a thread-local `FxHashMap<usize, Bitset>` keyed by node id, costing roughly four allocations per node — one for the bitset, one for the clone inserted into the map, one for the clone `collect_partitions` took back out, and one more for every partition that needed complementing. It is now a flat arena indexed by node id, drained by move, with the complement applied in place and the duplicate-split merge done via `dedup_by` instead of into a second vector. 4 000 taxa × 50 trees **138 → 83 ms (1.66×)**, 2 000 × 200 **132 → 98 ms (1.35×)**, 500 × 100 **12.1 → 10.8 ms**. The win scales with taxa, since the allocation count follows the node count. No distance changes.
+- **Robustness:** The bitset pass is now an iterative post-order rather than recursive, so a caterpillar tree costs heap instead of stack. Covered by a 3 000-leaf fully-nested test.
+
 ## [0.8.3] - Longhorn Sidewinder (2026-09-07)
 
 - ([#23](https://github.com/Joon-Klaps/rapidtrees/issues/23)) - **Input formats:** `--input` now accepts plain Newick files as well as NEXUS.
