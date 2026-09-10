@@ -825,6 +825,100 @@ mod py_integration_tests {
         });
     }
 
+    /// A parse/leaf-set failure has to surface as `ValueError` from *every*
+    /// entry point, not just the RF one — each reaches
+    /// `collect_snapshots_from_iter` through a different helper.
+    #[test]
+    fn bad_trees_raise_value_error_from_every_entry_point() {
+        ensure_python();
+        Python::attach(|py| {
+            let m = py.import("rapidtrees").unwrap();
+            // Same leaf count, different taxa: tree 1 has `Z` where tree 0 has `C`.
+            let trees = PyList::new(py, ["(A:1,(B:1,C:1):1);", "(A:1,(B:1,Z:1):1);"]).unwrap();
+            let names = PyList::new(py, ["t0", "t1"]).unwrap();
+
+            for func_name in [
+                "pairwise_rf_from_newick_iter",
+                "pairwise_wrf_from_newick_iter",
+                "pairwise_kf_from_newick_iter",
+                "pairwise_rf_with_snapshots_from_newick_iter",
+                "pairwise_wrf_with_snapshots_from_newick_iter",
+                "pairwise_kf_with_snapshots_from_newick_iter",
+            ] {
+                let err = m
+                    .getattr(func_name)
+                    .unwrap()
+                    .call1((
+                        names.clone(),
+                        trees.clone().try_iter().unwrap(),
+                        PyList::new(py, [PyDict::new(py)]).unwrap(),
+                        PyList::new(py, [0i64, 0]).unwrap(),
+                    ))
+                    .expect_err(&format!("{func_name} accepted mismatched leaf sets"));
+                assert!(
+                    err.is_instance_of::<pyo3::exceptions::PyValueError>(py),
+                    "{func_name} raised something other than ValueError"
+                );
+            }
+        });
+    }
+
+    /// `validate_iter_args` counts `names`, but the newick iterator is lazy and
+    /// may yield fewer — so the tree count is re-checked after draining it.
+    #[test]
+    fn short_iterator_raises_value_error() {
+        ensure_python();
+        Python::attach(|py| {
+            let m = py.import("rapidtrees").unwrap();
+            let func = m.getattr("pairwise_rf_from_newick_iter").unwrap();
+            // Two names promised, one tree delivered.
+            let err = func
+                .call1((
+                    PyList::new(py, ["t0", "t1"]).unwrap(),
+                    PyList::new(py, ["(A:1,B:1);"]).unwrap().try_iter().unwrap(),
+                    PyList::new(py, [PyDict::new(py)]).unwrap(),
+                    PyList::new(py, [0i64, 0]).unwrap(),
+                ))
+                .expect_err("expected ValueError when the iterator is shorter than names");
+            assert!(err.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+        });
+    }
+
+    /// Argument validation rejects a `map_indices` entry pointing past the end
+    /// of `translate_maps`, and a `names` length that disagrees with it.
+    #[test]
+    fn argument_shape_mismatches_raise_value_error() {
+        ensure_python();
+        Python::attach(|py| {
+            let m = py.import("rapidtrees").unwrap();
+            let func = m.getattr("pairwise_rf_from_newick_iter").unwrap();
+            let trees = PyList::new(py, ["(A:1,B:1);", "(A:1,B:1);"]).unwrap();
+            let names = PyList::new(py, ["t0", "t1"]).unwrap();
+
+            // map_indices shorter than names.
+            let err = func
+                .call1((
+                    names.clone(),
+                    trees.clone().try_iter().unwrap(),
+                    PyList::new(py, [PyDict::new(py)]).unwrap(),
+                    PyList::new(py, [0i64]).unwrap(),
+                ))
+                .expect_err("expected ValueError for a names/map_indices length mismatch");
+            assert!(err.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+
+            // map_indices pointing past the end of translate_maps.
+            let err = func
+                .call1((
+                    names,
+                    trees.try_iter().unwrap(),
+                    PyList::new(py, [PyDict::new(py)]).unwrap(),
+                    PyList::new(py, [0i64, 7]).unwrap(),
+                ))
+                .expect_err("expected ValueError for an out-of-bounds map index");
+            assert!(err.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+        });
+    }
+
     #[test]
     fn invalid_args_raise_value_error() {
         ensure_python();

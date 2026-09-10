@@ -5,6 +5,7 @@
 //! `snapshot_of` / `snaps_opts` helpers.
 
 use super::*;
+use std::collections::HashSet;
 
 /// Decode a native-endian `f64` matrix emitted by `build_branch_length_matrix`.
 fn decode_f64(bytes: &[u8]) -> Vec<f64> {
@@ -770,4 +771,61 @@ fn leaf_set_mismatches_are_rejected() {
         duplicated.is_err(),
         "a name repeated within one tree must be rejected"
     );
+}
+
+/// Tree 0 defines the run's taxa, so its own leaf names get checked separately
+/// from every later tree.
+///
+/// The guard this replaces deduplicated `get_leaves()`, which returns *node
+/// ids* — unique by construction — so it never fired: a lone tree with a
+/// repeated taxon was accepted, silently yielding one taxon fewer than it had
+/// leaves.
+#[test]
+fn tree_zero_leaf_names_are_validated() {
+    let duplicated = Snapshots::from_newicks(&["((A:1,A:1):1,(B:1,C:1):1);"], false);
+    assert!(
+        duplicated.is_err(),
+        "a lone tree repeating a taxon must be rejected, not silently reduced"
+    );
+
+    let unnamed = Snapshots::from_newicks(&["((A:1,B:1):1,(:1,C:1):1);"], false);
+    assert!(unnamed.is_err(), "a lone tree with an unnamed leaf");
+
+    // The same two faults in a *later* tree go through `check_leaf_set`.
+    const REF: &str = "((A:1,B:1):1,(C:1,D:1):1);";
+    assert!(
+        Snapshots::from_newicks(&[REF, "((A:1,B:1):1,(:1,C:1):1);"], false).is_err(),
+        "an unnamed leaf in a later tree"
+    );
+}
+
+/// An empty collection still has to answer every query without panicking —
+/// the export builders take a separate early-return path when there are no
+/// splits to lay out.
+#[test]
+fn empty_collection_is_queryable() {
+    let snaps = Snapshots::from_newicks(&[], false).unwrap();
+
+    assert!(snaps.is_empty());
+    assert_eq!(snaps.len(), 0);
+    assert_eq!(snaps.n_distinct_splits(), 0);
+    assert!(snaps.leaf_names.is_empty());
+
+    let (presence, cols) = snaps.build_presence_matrix();
+    assert!(presence.is_empty());
+    assert!(cols.is_empty());
+
+    let (lengths, cols_bl) = snaps.build_branch_length_matrix();
+    assert!(lengths.is_empty());
+    assert_eq!(cols_bl, cols);
+
+    assert!(snaps.build_bipartition_bytes(&cols).is_empty());
+}
+
+/// A non-empty collection is not empty — the other side of [`Snapshots::is_empty`].
+#[test]
+fn populated_collection_is_not_empty() {
+    let snaps = Snapshots::from_newicks(&["(A:1,(B:1,C:1):1);"], false).unwrap();
+    assert!(!snaps.is_empty());
+    assert_eq!(snaps.len(), 1);
 }

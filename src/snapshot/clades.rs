@@ -84,22 +84,9 @@ pub(crate) fn cmp_packed(a: &[u32], b: &[u32]) -> Ordering {
     let (lo, hi) = (word << 6, (word + 1) << 6);
     let (wa, wb) = (slice_in(a, lo, hi), slice_in(b, lo, hi));
 
-    // Within the word, the highest bit only one side has decides.
-    let (mut i, mut j) = (wa.len(), wb.len());
-    loop {
-        match (i, j) {
-            (0, 0) => return Ordering::Equal,
-            (0, _) => return Ordering::Less,
-            (_, 0) => return Ordering::Greater,
-            _ => match wa[i - 1].cmp(&wb[j - 1]) {
-                Ordering::Equal => {
-                    i -= 1;
-                    j -= 1;
-                }
-                other => return other,
-            },
-        }
-    }
+    // Within the word, the highest bit only one side has decides — which is
+    // what comparing the two runs from the top down gives.
+    wa.iter().rev().cmp(wb.iter().rev())
 }
 
 /// The smallest leaf index present in exactly one of two ascending runs.
@@ -148,6 +135,13 @@ mod tests {
     #[test]
     fn empty_table_has_no_clades() {
         assert_eq!(CladeTable::new().len(), 0);
+    }
+
+    /// `Default` is hand-written because the derived one would leave `starts`
+    /// empty, and `len()` subtracts one from it.
+    #[test]
+    fn default_is_an_empty_table_not_an_underflow() {
+        assert_eq!(CladeTable::default().len(), 0);
     }
 
     /// Within one word, the highest bit only one side holds decides — so `{2}`

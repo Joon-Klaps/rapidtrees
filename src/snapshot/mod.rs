@@ -44,7 +44,7 @@ use crate::par::*;
 use clades::CladeTable;
 use phylotree::tree::Tree as PhyloTree;
 use rustc_hash::FxHashMap;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// A bulk collection of tree snapshots in an interned split-ID representation.
 ///
@@ -131,20 +131,25 @@ impl Snapshots {
         let (first_newick, first_translate) = entries[0];
         let first_tree = parse_and_rename(first_newick, first_translate, 0)?;
 
-        //sanity check: ensure all leaf names are unique within the first tree
+        // Tree 0 defines the run's taxa, so it is checked here rather than by
+        // `check_leaf_set` — which needs the very table tree 0 is about to
+        // build. Both counts are against `first_leaves`, so an unnamed leaf and
+        // a repeated one are told apart.
         let first_leaves = first_tree.get_leaves();
-        if first_leaves.len() != first_leaves.iter().collect::<HashSet<_>>().len() {
-            return Err(
-                "Trees have duplicate leaf names. All leaf names must be unique.".to_string(),
-            );
-        }
-
         let mut sorted_leaf_names: Vec<String> = first_leaves
             .iter()
             .filter_map(|&id| first_tree.get(&id).ok()?.name.clone())
             .collect();
+        if sorted_leaf_names.len() != first_leaves.len() {
+            return Err("Tree 0 has an unnamed leaf. All leaves must be named.".to_string());
+        }
         sorted_leaf_names.sort_unstable();
         sorted_leaf_names.dedup();
+        if sorted_leaf_names.len() != first_leaves.len() {
+            return Err(
+                "Tree 0 has duplicate leaf names. All leaf names must be unique.".to_string(),
+            );
+        }
 
         // One label set and one name → bit table for the whole run: fingerprints
         // are only comparable across trees if every tree draws from the same
