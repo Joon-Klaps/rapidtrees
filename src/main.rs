@@ -1,5 +1,5 @@
 use clap::{Parser, ValueEnum};
-use rapidtrees::io::{load_beast_trees, load_snapshots, write_matrix_tsv, write_snap};
+use rapidtrees::io::{load_beast_trees, write_matrix_tsv};
 use rapidtrees::{Backend, Kernel};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -15,21 +15,8 @@ use std::time::{Duration, Instant};
 )]
 struct Args {
     /// Path to a tree file: BEAST/NEXUS .trees or plain Newick (format is auto-detected)
-    #[arg(
-        short = 'i',
-        long = "input",
-        required_unless_present = "snap_input",
-        conflicts_with = "snap_input"
-    )]
-    input: Option<PathBuf>,
-
-    /// Path to compressed .snap file
-    #[arg(
-        long = "snap-input",
-        required_unless_present = "input",
-        conflicts_with = "input"
-    )]
-    snap_input: Option<PathBuf>,
+    #[arg(short = 'i', long = "input")]
+    input: PathBuf,
 
     /// Burn-in by number of trees (drop first N trees)
     #[arg(short = 't', long = "burnin-trees", default_value_t = 0)]
@@ -40,11 +27,8 @@ struct Args {
     burnin_states: usize,
 
     /// Output path for TSV distance matrix
-    #[arg(short = 'o', long = "output", required_unless_present = "export_snap")]
-    output: Option<PathBuf>,
-
-    #[arg(long = "export-snap")]
-    export_snap: Option<PathBuf>,
+    #[arg(short = 'o', long = "output")]
+    output: PathBuf,
 
     /// Use TRANSLATE block to map taxon IDs to labels when available
     #[arg(long = "use-real-taxa", default_value_t = false)]
@@ -77,33 +61,17 @@ enum MetricArg {
 fn main() {
     let args = Args::parse();
 
-    if args.snap_input.is_some() && args.export_snap.is_some() {
-        eprintln!("--export-snap cannot be used together with --snap-input");
-        std::process::exit(7);
-    }
-
-    if args.snap_input.is_some() && (args.metric != MetricArg::Rf) {
-        eprintln!("--snap-input only supports RF distances.");
-        std::process::exit(8);
-    }
-
     let quiet = args.quiet;
     let t_total = Instant::now();
     let t = Instant::now();
 
-    let (names, interned) = match &args.snap_input {
-        Some(path) => load_snapshots(path).unwrap_or_else(|e| {
-            eprintln!("Failed to load trees: {e}");
-            std::process::exit(1);
-        }),
-        None => load_beast_trees(
-            args.input.as_ref().unwrap(),
-            args.burnin_trees,
-            args.burnin_states,
-            args.use_real_taxa,
-            args.rooted,
-        ),
-    };
+    let (names, interned) = load_beast_trees(
+        &args.input,
+        args.burnin_trees,
+        args.burnin_states,
+        args.use_real_taxa,
+        args.rooted,
+    );
 
     log_if(
         quiet,
@@ -119,21 +87,7 @@ fn main() {
         std::process::exit(2);
     }
 
-    if let Some(snap_path) = args.export_snap {
-        let t = Instant::now();
-        if let Err(e) = write_snap(&snap_path, &names, &interned) {
-            eprintln!("Failed to write snap {snap_path:?}: {e}");
-            std::process::exit(5);
-        }
-        log_if(
-            quiet,
-            format!(
-                "Exported snapshots to {snap_path:?} in {:.3}s",
-                t.elapsed().as_secs_f64()
-            ),
-        );
-        return;
-    }
+    log_collision_bound(quiet, interned.n_distinct_splits());
 
     let n_pairs = names.len() * (names.len() - 1) / 2;
     let metric_label = metric_label(args.metric);
@@ -145,48 +99,30 @@ fn main() {
     let t = Instant::now();
     let show_progress = !quiet && std::io::stderr().is_terminal();
 
-    let output_path = args
-        .output
-        .as_deref()
-        .expect("output is required when not exporting snap");
+    let output_path = args.output.as_path();
 
-    // Each arm keeps its own element type all the way to the writer.
-    let write_result = match args.metric {
-        MetricArg::Rf => {
+    // A macro rather than a generic fn: each metric keeps its own element type
+    // (`u32` for RF, `f64` for the weighted pair) all the way to the writer, and
+    // threading that through a function would need ten parameters to say what
+    // three tokens say here.
+    macro_rules! compute_and_write {
+        ($metric:ident) => {{
             let dist = run_with_progress(n_pairs, show_progress, |counter| {
-                interned.pairwise_rf_with(Some(counter), args.backend)
+                interned.$metric(Some(counter), args.backend)
             });
             log_backend(quiet, args.backend, dist.kernel);
-            let mat = dist.matrix;
             log_computed(quiet, metric_label, &t);
             let t = Instant::now();
-            let r = write_matrix_tsv(output_path, &names, &mat, interned.len());
+            let r = write_matrix_tsv(output_path, &names, &dist.matrix, interned.len());
             (r, t)
-        }
-        MetricArg::Weighted => {
-            let dist = run_with_progress(n_pairs, show_progress, |counter| {
-                interned.pairwise_wrf_with(Some(counter), args.backend)
-            });
-            log_backend(quiet, args.backend, dist.kernel);
-            let mat = dist.matrix;
-            log_computed(quiet, metric_label, &t);
-            let t = Instant::now();
-            let r = write_matrix_tsv(output_path, &names, &mat, interned.len());
-            (r, t)
-        }
-        MetricArg::Kf => {
-            let dist = run_with_progress(n_pairs, show_progress, |counter| {
-                interned.pairwise_kf_with(Some(counter), args.backend)
-            });
-            log_backend(quiet, args.backend, dist.kernel);
-            let mat = dist.matrix;
-            log_computed(quiet, metric_label, &t);
-            let t = Instant::now();
-            let r = write_matrix_tsv(output_path, &names, &mat, interned.len());
-            (r, t)
-        }
+        }};
+    }
+
+    let (write_result, t) = match args.metric {
+        MetricArg::Rf => compute_and_write!(pairwise_rf_with),
+        MetricArg::Weighted => compute_and_write!(pairwise_wrf_with),
+        MetricArg::Kf => compute_and_write!(pairwise_kf_with),
     };
-    let (write_result, t) = write_result;
     if let Err(e) = write_result {
         eprintln!("Failed to write output {}: {e}", output_path.display());
         std::process::exit(4);
@@ -222,6 +158,17 @@ fn metric_label(metric: MetricArg) -> &'static str {
         MetricArg::Weighted => "Weighted RF",
         MetricArg::Kf => "KF",
     }
+}
+
+/// State the run's own correctness guarantee.
+fn log_collision_bound(quiet: bool, distinct_splits: usize) {
+    let e = distinct_splits as f64;
+    // 2¹²⁹ overflows nothing here, but stays clearer written as a power.
+    let bound = e * e / 2f64.powi(129);
+    log_if(
+        quiet,
+        format!("Distinct splits e = {distinct_splits}; collision bound e²/2¹²⁹ = {bound:.2e}"),
+    );
 }
 
 /// Name the kernel that ran, so `auto`'s choice is in the run log.

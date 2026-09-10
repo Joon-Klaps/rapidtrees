@@ -6,17 +6,11 @@ use std::fs;
 use std::path::Path;
 
 #[cfg(feature = "cli")]
-use crate::bitset::Bitset;
-#[cfg(feature = "cli")]
-use crate::snapshot::InternSnap;
-#[cfg(feature = "cli")]
-use flate2::{Compression, read::GzDecoder, write::GzEncoder};
-#[cfg(feature = "cli")]
-use std::fs::File;
+use flate2::{Compression, write::GzEncoder};
 #[cfg(feature = "cli")]
 use std::io;
 #[cfg(feature = "cli")]
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::Write;
 
 /// Strip BEAST `[&...]` annotations from a Newick string.
 pub fn strip_beast_annotations(newick: &str) -> String {
@@ -65,7 +59,7 @@ pub enum TreeFormat {
 /// Sniff whether `content` is a NEXUS trees file or a plain Newick file.
 ///
 /// NEXUS is anything opening with `#NEXUS`, or holding at least one
-/// `tree ... = ...` line that [`nexus_tree_lines`] recognises; everything else
+/// `tree ... = ...` line that the NEXUS tree-line scanner recognises; everything else
 /// reads as Newick. Keeping the header check means a NEXUS file whose trees
 /// block is empty still reports as NEXUS, so its loader can say so instead of
 /// handing the content to the Newick parser.
@@ -246,162 +240,6 @@ pub fn write_matrix_tsv<P: AsRef<Path>, T: std::fmt::Display>(
 
     out.flush()?;
     Ok(())
-}
-
-// ── Snap file I/O ─────────────────────────────────────────────────────────────
-//
-// The `.snap` format stores only bipartition presence (no branch lengths).
-// Branch lengths are zeroed on load — snap files are RF-only.
-
-/// Write tree snapshots to a gzip-compressed binary `.snap` file.
-///
-/// # File layout (inside gzip stream)
-/// ```text
-/// HEADER     4 B  magic "SNAP"
-///            1 B  version (2)
-///            8 B  n_trees  u64 LE
-///            8 B  n_taxa   u64 LE
-///            8 B  n_bip    u64 LE
-///            8 B  words    u64 LE
-/// NAMES      for each taxon then each tree: 4 B len u32 LE + N B UTF-8
-/// BIPARTS    n_bip × words × 8 bytes (sorted ascending by Bitset)
-/// PRESENCE   n_trees × n_bip bytes, row-major uint8
-/// ```
-///
-/// **Note:** branch lengths are not stored. A snap file loaded back via
-/// [`load_snapshots`] will have zero branch lengths (RF-only).
-#[cfg(feature = "cli")]
-pub fn write_snap<P: AsRef<Path>>(
-    path: P,
-    tree_names: &[String],
-    snaps: &Snapshots,
-) -> io::Result<()> {
-    let mut bip_order: Vec<usize> = (0..snaps.bipartitions.len()).collect();
-    bip_order.sort_unstable_by(|&a, &b| snaps.bipartitions[a].cmp(&snaps.bipartitions[b]));
-
-    let n_trees = snaps.snapshots.len();
-    let n_taxa = snaps.leaf_names.len();
-    let n_bip = snaps.bipartitions.len();
-    let words = snaps.words_per_bitset.max(1);
-
-    let (presence, _) = snaps.build_presence_matrix();
-
-    let mut w = BufWriter::new(GzEncoder::new(File::create(path)?, Compression::default()));
-    w.write_all(b"SNAP")?;
-    w.write_all(&[2u8])?;
-    w.write_all(&(n_trees as u64).to_le_bytes())?;
-    w.write_all(&(n_taxa as u64).to_le_bytes())?;
-    w.write_all(&(n_bip as u64).to_le_bytes())?;
-    w.write_all(&(words as u64).to_le_bytes())?;
-
-    for name in snaps.leaf_names.iter().chain(tree_names.iter()) {
-        let b = name.as_bytes();
-        w.write_all(&(b.len() as u32).to_le_bytes())?;
-        w.write_all(b)?;
-    }
-
-    for &orig_id in &bip_order {
-        for word in &snaps.bipartitions[orig_id].0 {
-            w.write_all(&word.to_le_bytes())?;
-        }
-    }
-
-    w.write_all(&presence)?;
-    w.flush()?;
-    Ok(())
-}
-
-/// Read a `.snap` file produced by [`write_snap`].
-///
-/// Returns `(tree_names, Snapshots)`.
-///
-/// **Note:** branch lengths are zeroed on load — snap files store only split
-/// presence. Use the returned `Snapshots` for RF distances only.
-#[cfg(feature = "cli")]
-pub fn load_snapshots<P: AsRef<Path>>(path: P) -> io::Result<(Vec<String>, Snapshots)> {
-    let file = File::open(path.as_ref())?;
-    let mut r = BufReader::new(GzDecoder::new(file));
-
-    let mut magic = [0u8; 4];
-    r.read_exact(&mut magic)?;
-    if &magic != b"SNAP" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid snap magic: expected SNAP, got {magic:?}"),
-        ));
-    }
-
-    let mut version = [0u8; 1];
-    r.read_exact(&mut version)?;
-    if version[0] != 2 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unsupported snap version: {}", version[0]),
-        ));
-    }
-
-    let n_trees = snap_read_u64(&mut r)? as usize;
-    let n_taxa = snap_read_u64(&mut r)? as usize;
-    let n_bip = snap_read_u64(&mut r)? as usize;
-    let words = snap_read_u64(&mut r)? as usize;
-
-    let taxa_names = snap_read_strings(&mut r, n_taxa)?;
-    let tree_names = snap_read_strings(&mut r, n_trees)?;
-
-    let all_bips: Vec<Bitset> = (0..n_bip)
-        .map(|_| {
-            (0..words)
-                .map(|_| snap_read_u64(&mut r))
-                .collect::<io::Result<Vec<u64>>>()
-                .map(Bitset)
-        })
-        .collect::<io::Result<_>>()?;
-
-    let mut presence = vec![0u8; n_trees * n_bip];
-    r.read_exact(&mut presence)?;
-
-    let interned_snaps: Vec<InternSnap> = presence
-        .chunks_exact(n_bip)
-        .take(n_trees)
-        .map(|row| {
-            let split_ids: Vec<u32> = (0..n_bip)
-                .filter(|&i| row[i] != 0)
-                .map(|i| i as u32)
-                .collect();
-            let lengths = vec![0.0f64; split_ids.len()];
-            InternSnap { split_ids, lengths }
-        })
-        .collect();
-
-    let snaps = Snapshots {
-        snapshots: interned_snaps,
-        bipartitions: all_bips,
-        words_per_bitset: words,
-        leaf_names: taxa_names,
-    };
-
-    Ok((tree_names, snaps))
-}
-
-// ── Private helpers ────────────────────────────────────────────────────────────
-#[cfg(feature = "cli")]
-fn snap_read_u64<R: io::Read>(r: &mut R) -> io::Result<u64> {
-    let mut buf = [0u8; 8];
-    r.read_exact(&mut buf)?;
-    Ok(u64::from_le_bytes(buf))
-}
-
-#[cfg(feature = "cli")]
-fn snap_read_strings<R: io::Read>(r: &mut R, n: usize) -> io::Result<Vec<String>> {
-    (0..n)
-        .map(|_| {
-            let mut buf = [0u8; 4];
-            r.read_exact(&mut buf)?;
-            let mut bytes = vec![0u8; u32::from_le_bytes(buf) as usize];
-            r.read_exact(&mut bytes)?;
-            String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-        })
-        .collect()
 }
 
 /// Split a NEXUS tree header into `(tree_name, state_number)`.
@@ -991,53 +829,5 @@ mod load_tests {
             newick_snaps.pairwise_rf(None),
             nexus_snaps.pairwise_rf(None)
         );
-    }
-}
-
-#[cfg(all(test, feature = "cli"))]
-mod tests {
-    use super::*;
-    use crate::snapshot::Snapshots;
-
-    fn make_snapshots() -> (Vec<String>, Snapshots) {
-        let trees = [
-            "((A:1,B:1):1,(C:1,D:1):1);",
-            "((A:1,C:1):1,(B:1,D:1):1);",
-            "((A:1,D:1):1,(B:1,C:1):1);",
-        ];
-        let snaps = Snapshots::from_newicks(&trees, false).unwrap();
-        let tree_names = vec!["t1".to_string(), "t2".to_string(), "t3".to_string()];
-        (tree_names, snaps)
-    }
-
-    #[test]
-    fn test_snap_roundtrip_preserves_rf_distances() {
-        let (tree_names, snaps) = make_snapshots();
-        let rf_before = snaps.pairwise_rf(None);
-
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        write_snap(tmp.path(), &tree_names, &snaps).unwrap();
-
-        let (loaded_names, loaded_snaps) = load_snapshots(tmp.path()).unwrap();
-
-        assert_eq!(
-            loaded_names, tree_names,
-            "tree names must survive roundtrip"
-        );
-        assert_eq!(loaded_snaps.snapshots.len(), snaps.snapshots.len());
-
-        let rf_after = loaded_snaps.pairwise_rf(None);
-        assert_eq!(
-            rf_before, rf_after,
-            "RF distances must be identical after snap roundtrip"
-        );
-    }
-
-    #[test]
-    fn test_snap_wrong_magic_returns_error() {
-        use std::io::Write;
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        tmp.write_all(b"NOPE").unwrap();
-        assert!(load_snapshots(tmp.path()).is_err());
     }
 }

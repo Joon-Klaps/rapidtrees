@@ -8,12 +8,14 @@ This project uses release names based on random words from [codenamegenerator.co
     - PREFIX: Microsoft Corperation
     - DICTIONARY: Snakes
 
-## [Unreleased]
+## [0.9.0] - Whistler Taipan (2026-09-10)
 
 - ([#24](https://github.com/Joon-Klaps/rapidtrees/issues/24)) - **Benchmarks:** Larger tree datasets, plus one-thread (`*_st`) variants for 1-thread-vs-1-thread comparisons.
 - ([#25](https://github.com/Joon-Klaps/rapidtrees/issues/25)) - **Speed & memory (diverse tree sets):** The split between a matrix kernel (`dense`) and a sorted-list comparison (`sparse`) is back. `auto` picks whichever suits the observed number of unique bifurcations, and only refuses a dense matrix over the 5 GB memory limit.
 - ([#26](https://github.com/Joon-Klaps/rapidtrees/issues/26)) - **Speed & memory:** Sort columns in dense matrix by occurence, index first and last occurence for faster sweeping.
 - ([#27](https://github.com/Joon-Klaps/rapidtrees/issues/27)) - **Speed & memory (snapshot construction):** Building one tree's bipartitions ran through a thread-local `FxHashMap<usize, Bitset>` keyed by node id, costing roughly four allocations per node. It is now a flat arena indexed by node id.
+- ([#28](https://github.com/Joon-Klaps/rapidtrees/issues/28)) - **Speed (snapshot construction, large taxon counts):** Splits are identified by a 128-bit XOR fingerprint instead of by their leaf set, so building a tree costs `Θ(n)` rather than `Θ(n²/64)` (10 000 taxa × 20 trees **385 → 47 ms**), at the cost of an `e²/2¹²⁹` chance that two distinct splits collide and merge.
+- ([#28](https://github.com/Joon-Klaps/rapidtrees/issues/28)) - **Refactor & breaking API changes:** `snapshot.rs` is split into a `snapshot/` module, and the `.snap` format, `Bitset` and the public `Snapshots::bipartitions` are gone — replaced by an internal clade table and `Snapshots::n_distinct_splits()`, with every Python function and exported byte unchanged.
 
 ## [0.8.3] - Longhorn Sidewinder (2026-09-07)
 
