@@ -8,7 +8,7 @@ This project uses release names based on random words from [codenamegenerator.co
     - PREFIX: Microsoft Corperation
     - DICTIONARY: Snakes
 
-## [Unreleased]
+## [0.9.0] - Whistler Taipan (2026-09-10)
 
 - ([#24](https://github.com/Joon-Klaps/rapidtrees/issues/24)) - **Benchmarks:** Larger tree datasets, plus one-thread (`*_st`) variants for 1-thread-vs-1-thread comparisons.
 - ([#25](https://github.com/Joon-Klaps/rapidtrees/issues/25)) - **Speed & memory (diverse tree sets):** The split between a matrix kernel (`dense`) and a sorted-list comparison (`sparse`) is back. `auto` picks whichever suits the observed number of unique bifurcations, and only refuses a dense matrix over the 5 GB memory limit.
