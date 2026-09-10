@@ -158,20 +158,6 @@ where
     matrix
 }
 
-/// Number of distinct splits across all trees.
-///
-/// Read from `split_ids` (dense from 0, sorted per tree) rather than the bitset
-/// table, so it still works on paths that free the bitsets.
-fn n_distinct_splits(snaps: &Snapshots) -> usize {
-    snaps
-        .snapshots
-        .iter()
-        .filter_map(|s| s.split_ids.last().copied())
-        .max()
-        .map(|max_id| max_id as usize + 1)
-        .unwrap_or(0)
-}
-
 /// Borrow row `i` of a flat, row-major matrix whose rows are `stride` wide.
 #[inline]
 fn row_slice<T>(flat: &[T], i: usize, stride: usize) -> &[T] {
@@ -180,7 +166,7 @@ fn row_slice<T>(flat: &[T], i: usize, stride: usize) -> &[T] {
 
 /// How many trees hold each split, indexed by split ID.
 fn split_tree_counts(snaps: &Snapshots) -> Vec<u32> {
-    let mut counts = vec![0u32; n_distinct_splits(snaps)];
+    let mut counts = vec![0u32; snaps.n_distinct_splits()];
     for snap in &snaps.snapshots {
         for &id in &snap.split_ids {
             counts[id as usize] += 1;

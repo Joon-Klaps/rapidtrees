@@ -17,7 +17,7 @@
   <a href="#-installing">Installing</a> •
   <a href="#-usage">Usage</a> •
   <a href="#-python-api">Python API</a> •
-  <a href="#-snap-format">Snap Format</a> •
+  <a href="#-presence-matrix">Presence Matrix</a> •
   <a href="#%EF%B8%8F-benchmarks">Benchmarks</a>
 </p>
 
@@ -25,7 +25,7 @@
 
 ## 🗺️ Overview
 
-`rapidtrees` computes pairwise tree distances from [BEAST](https://beast.community/)/NEXUS `.trees` files, plain multi-tree Newick files, or precomputed `.snap` files, and writes a labeled distance matrix. Three metrics are supported:
+`rapidtrees` computes pairwise tree distances from [BEAST](https://beast.community/)/NEXUS `.trees` files or plain multi-tree Newick files, and writes a labeled distance matrix. Three metrics are supported:
 
 | Metric             | Flag                | Output  | Description                                   |
 | ------------------ | ------------------- | ------- | --------------------------------------------- |
@@ -35,7 +35,7 @@
 
 ### ✨ Why `rapidtrees`?
 
-- 🦀 **Rust core** — zero-overhead bitset operations with a cache-friendly memory layout
+- 🦀 **Rust core** — splits as 128-bit fingerprints, compared as `u32` IDs in a cache-friendly layout
 - 🔀 **Parallel by default** — powered by [`rayon`](https://github.com/rayon-rs/rayon), automatically scales across all cores
 - 🐍 **Python bindings** — drop into any Python/NumPy workflow via [`PyO3`](https://pyo3.rs/)
 - 📦 **No Rust toolchain required** — pre-built wheels on PyPI for Linux, macOS, and Windows
@@ -102,7 +102,7 @@ pixi run test-rust
 
 ```bash
 rapidtrees \
-  (--input <path/to/file.trees> | --snap-input <path/to/file.snap>) \
+  --input <path/to/file.trees> \
   --output <path/to/output.tsv[.gz]> \
   [--burnin-trees <N>] \
   [--burnin-states <STATE>] \
@@ -115,7 +115,6 @@ rapidtrees \
 | Flag                          | Description                                                        |
 | ----------------------------- | ------------------------------------------------------------------ |
 | `-i, --input <INPUT>`         | Path to a NEXUS `.trees` or plain Newick file (auto-detected)      |
-| `--snap-input <SNAP_INPUT>`   | Path to `.snap` file (currently supports only `--metric rf`)       |
 | `-o, --output <OUTPUT>`       | Output path. Use `.gz` suffix for gzip compression; `-` for stdout |
 | `-t, --burnin-trees <N>`      | Drop the first N trees (default: `0`)                              |
 | `-s, --burnin-states <STATE>` | Keep only trees with `STATE > STATE` (default: `0`)                |
@@ -168,22 +167,6 @@ rapidtrees \
 
 </details>
 
-<details>
-<summary><strong>Compute RF matrix directly from a snapshot file</strong></summary>
-
-```bash
-rapidtrees \
-  --snap-input out/hiv1.snap \
-  -o out/hiv1_rf_from_snap.tsv.gz \
-  --metric rf
-
-# Read snap with 21 trees and 2193 bipartitions in 0.001s
-# Determined distances using RF in 0.000s
-# Writing to out/hiv1_rf_from_snap.tsv.gz in 0.000s
-```
-
-</details>
-
 ---
 
 ## 🐍 Python API
@@ -220,48 +203,11 @@ For BEAST `.trees` files, translate maps, the snapshot API, and multi-file usage
 
 ---
 
-## 📦 Snap Format
+## 📦 Presence Matrix
 
-`rapidtrees` can export tree snapshots to a compressed binary `.snap` file for downstream analyses (ESS computation, ASDSF, convergence diagnostics) on HPC clusters without re-parsing the original `.trees` files. The CLI can also compute RF distance matrices directly from `.snap` files via `--snap-input`.
+Alongside a distance matrix, `rapidtrees` can hand back the **presence matrix**: which bipartition appears in which tree. That is everything the convergence diagnostics need (ESS, ASDSF, split frequencies), and it comes out of the same single parse as the distances.
 
-### What is a snapshot?
-
-A **tree snapshot** is a compact bitset representation of a phylogenetic tree. Each bipartition (split) is encoded as a bitset over leaf indices. The full set of snapshots for a tree collection captures everything needed for RF-family distance computations and convergence diagnostics — without storing the original Newick strings.
-
-> **Note:** Snapshots are not human-readable and are not intended for general interchange. They are an internal format optimized for fast distance calculations and cannot be convert to it's original newick-style format.
-
-> **Splits are identified by a 128-bit fingerprint,** not by comparing leaf sets — that is what keeps building a tree linear in its taxon count rather than quadratic. Two distinct splits are merged if their fingerprints collide, with probability about `e²/2¹²⁹` for `e` distinct splits in the run: `1.5 × 10⁻²³` at a hundred million splits, some nineteen orders of magnitude below the rate at which the machine's own RAM flips a bit unnoticed. Every run prints its own `e` and bound. Build with `--features verify` to check each match against the leaf set it stands for and fail loudly instead; CI runs the full suite that way.
-
-### File layout
-
-A `.snap` file is a **gzip-compressed** binary stream with the following sections in order:
-
-```
-┌─────────────────────────────────────────────────────┐
-│  HEADER                                              │
-│  4 bytes  magic        "SNAP" (0x534E4150)          │
-│  1 byte   version      format version (currently 2) │
-│  8 bytes  n_trees      u64 LE — number of trees     │
-│  8 bytes  n_taxa       u64 LE — number of leaf taxa │
-│  8 bytes  n_bip        u64 LE — number of unique    │
-│                         bipartitions across all trees│
-├─────────────────────────────────────────────────────┤
-│  TAXA NAMES                                          │
-│  For each of n_taxa:                                 │
-│    4 bytes  length     u32 LE — byte length of name │
-│    N bytes  name       UTF-8 string                  │
-├─────────────────────────────────────────────────────┤
-│  TREE NAMES                                          │
-│  For each of n_trees:                                │
-│    4 bytes  length     u32 LE — byte length of name │
-│    N bytes  name       UTF-8 string                  │
-├─────────────────────────────────────────────────────┤
-│  PRESENCE MATRIX                                     │
-│  n_trees × n_bip bytes, row-major uint8             │
-│  presence[i][j] = 1 if bipartition j is in tree i  │
-│                   0 otherwise                        │
-└─────────────────────────────────────────────────────┘
-```
+> **Splits are identified by a 128-bit fingerprint,** not by comparing leaf sets — that is what keeps building a tree linear in its taxon count rather than quadratic. Two distinct splits are merged if their fingerprints collide, with probability about `e²/2¹²⁹` for `e` distinct splits in the run: `1.5 × 10⁻²³` at a hundred million splits, some nineteen orders of magnitude below the rate at which the machine's own RAM flips a bit unnoticed. Every run prints its own `e` and bound.
 
 Bipartition column order is **deterministic**: columns are sorted in ascending `Bitset` order (lexicographic over `u64` words, i.e. by leaf-index bit pattern), so the same tree set always produces the same column indices regardless of parse order.
 
@@ -280,9 +226,9 @@ Note: `sum(presence[i] XOR presence[j]) == RF(tree_i, tree_j)` exactly.
 
 ### Presence matrix from Python
 
-Snap files are written and read by the CLI only. From Python, use
-`pairwise_rf_with_snapshots_from_newick_iter` to obtain the same presence
-matrix in memory without writing a file — see the [Python API section](#-python-api) above.
+Use `pairwise_rf_with_snapshots_from_newick_iter` to get the presence matrix
+alongside the RF distances, from one parse — see the
+[Python API section](#-python-api) above.
 
 ```python
 import rapidtrees as rtd
@@ -319,7 +265,7 @@ df = pd.DataFrame(presence, index=tree_names, columns=col_labels)
 
 ## ⏱️ Benchmarks
 
-Benchmarks were run on a MacBook Pro M1. Trees are parsed **once** and bitset snapshots are reused across all pairwise comparisons. Parallelism is provided by [`rayon`](https://github.com/rayon-rs/rayon) — no manual thread management needed.
+Benchmarks were run on a MacBook Pro M1. Trees are parsed **once** and their interned split IDs are reused across all pairwise comparisons. Parallelism is provided by [`rayon`](https://github.com/rayon-rs/rayon) — no manual thread management needed.
 
 <details>
 <summary><strong>Show full benchmark table</strong></summary>

@@ -1,6 +1,6 @@
 [package]
 name = "rapidtrees"
-version = "0.8.3"
+version = "0.9.0"
 edition = "2024"
 description = "Fast pairwise tree distance calculations (Robinson-Foulds, Weighted RF, Kuhner-Felsenstein) for phylogenetic trees"
 license = "MIT"
@@ -36,8 +36,6 @@ cli = ["clap", "flate2"]
 # Rayon-backed parallelism (`par.rs`). On by default; off for wasm32.
 parallel = ["rayon"]
 python = ["pyo3", "parallel"]
-# Check every fingerprint match against the leaf set it stands for.
-verify = []
 extension-module = ["python", "pyo3/extension-module"]
 
 # Until https://github.com/lucblassel/phylotree-rs/pull/18 lands, take

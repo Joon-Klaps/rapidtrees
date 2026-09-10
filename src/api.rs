@@ -8,9 +8,10 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyIterator};
 use std::collections::HashMap;
+use std::sync::atomic::AtomicUsize;
 
 use crate::progress::{ProgressCounter, with_counter};
-use crate::snapshot::Snapshots;
+use crate::snapshot::{Retain, Snapshots};
 
 /// Number of upper-triangle pairs for `n` trees — what a [`ProgressCounter`]
 /// counts up to as "100% done".
@@ -28,19 +29,25 @@ type PyRfSnapshotResult = (
     Py<PyAny>,
 );
 
+/// The tree source as handed in from Python: the newicks, how to rename their
+/// taxa, and whether to compare clades or bipartitions.
+///
+/// Every entry point takes these four together and does nothing with them but
+/// forward them, so they travel as one value.
+struct IterInput<'py, 'a> {
+    newick_iter: Bound<'py, PyIterator>,
+    translate_maps: &'a [HashMap<String, String>],
+    map_indices: &'a [usize],
+    rooted: bool,
+}
+
 /// Collect tree snapshots from a lazy Python iterator of newick strings.
 ///
-/// `store_lengths` controls whether branch lengths are retained: weighted metrics
-/// (WRF/KF) need them, RF-only paths pass `false` to skip the per-tree `lengths`
-/// allocation.
-fn collect_snapshots_from_iter(
-    newick_iter: Bound<'_, PyIterator>,
-    translate_maps: &[HashMap<String, String>],
-    map_indices: &[usize],
-    rooted: bool,
-    store_lengths: bool,
-) -> PyResult<Snapshots> {
-    let newicks: Vec<String> = newick_iter
+/// `retain` says what to build beyond the split IDs — see [`Retain`]. Each entry
+/// point asks only for what it actually returns.
+fn collect_snapshots_from_iter(input: IterInput<'_, '_>, retain: Retain) -> PyResult<Snapshots> {
+    let newicks: Vec<String> = input
+        .newick_iter
         .map(|item| item?.extract::<String>())
         .collect::<PyResult<_>>()?;
 
@@ -52,9 +59,67 @@ fn collect_snapshots_from_iter(
 
     let entries = newicks
         .iter()
-        .zip(map_indices.iter())
-        .map(|(n, &idx)| (n.as_str(), &translate_maps[idx]));
-    Snapshots::from_newick_iter_opts(entries, rooted, store_lengths).map_err(PyValueError::new_err)
+        .zip(input.map_indices.iter())
+        .map(|(n, &idx)| (n.as_str(), &input.translate_maps[idx]));
+    Snapshots::from_newick_iter_opts(entries, input.rooted, retain).map_err(PyValueError::new_err)
+}
+
+/// A pairwise weighted metric, as a plain function pointer so WRF and KF can
+/// share one body.
+type WeightedMetric = fn(&Snapshots, Option<&AtomicUsize>) -> Vec<f64>;
+
+/// Shared body of the plain WRF and KF entry points.
+///
+/// These paths export nothing and the dense kernels read only `split_ids` +
+/// `lengths`, so the bipartition table is never built in the first place.
+fn weighted_pairwise(
+    py: Python<'_>,
+    input: IterInput<'_, '_>,
+    progress: Option<Py<ProgressCounter>>,
+    metric: WeightedMetric,
+) -> PyResult<Vec<f64>> {
+    let snaps = collect_snapshots_from_iter(
+        input,
+        Retain {
+            lengths: true,
+            bipartitions: false,
+        },
+    )?;
+
+    let total = n_pairs(snaps.len());
+    with_counter(py, progress, total, |counter| metric(&snaps, Some(counter)))
+}
+
+/// Shared body of the WRF and KF snapshot-exporting entry points.
+///
+/// The branch-length matrix is metric-agnostic, so the two differ only in which
+/// distance fills the first buffer.
+fn weighted_pairwise_with_snapshots(
+    py: Python<'_>,
+    names: Vec<String>,
+    input: IterInput<'_, '_>,
+    progress: Option<Py<ProgressCounter>>,
+    metric: WeightedMetric,
+) -> PyResult<PyRfSnapshotResult> {
+    let snaps = collect_snapshots_from_iter(input, Retain::everything())?;
+
+    let total = n_pairs(snaps.len());
+    let matrix = with_counter(py, progress, total, |counter| metric(&snaps, Some(counter)))?;
+    let matrix_bytes: Vec<u8> = matrix.iter().flat_map(|&v| v.to_ne_bytes()).collect();
+
+    let n_bip = snaps.n_distinct_splits();
+    let leaf_names = snaps.leaf_names.clone();
+    let (bl_bytes, col_to_bip_id) = snaps.build_branch_length_matrix();
+    let bip_bytes = snaps.build_bipartition_bytes(&col_to_bip_id);
+
+    Ok((
+        names,
+        PyBytes::new(py, &matrix_bytes).into(),
+        leaf_names,
+        n_bip,
+        PyBytes::new(py, &bl_bytes).into(),
+        PyBytes::new(py, &bip_bytes).into(),
+    ))
 }
 
 /// Validate argument consistency for iterator-based functions.
@@ -126,14 +191,24 @@ fn pairwise_rf_from_newick_iter(
 ) -> PyResult<(Vec<String>, Py<PyAny>)> {
     validate_iter_args(&names, &map_indices, &translate_maps)?;
 
-    let mut snaps =
-        collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted, false)?;
+    let input = IterInput {
+        newick_iter,
+        translate_maps: &translate_maps,
+        map_indices: &map_indices,
+        rooted,
+    };
 
-    // This path never exports snapshots, and the dense RF computation reads
-    // only `split_ids` — release the bipartition bitsets before the O(n²) loop.
-    snaps.bipartitions = Vec::new();
+    // This path exports nothing and the dense RF kernel reads only `split_ids`,
+    // so neither lengths nor bipartitions are built.
+    let snaps = collect_snapshots_from_iter(
+        input,
+        Retain {
+            lengths: false,
+            bipartitions: false,
+        },
+    )?;
 
-    let n = snaps.snapshots.len();
+    let n = snaps.len();
     let rf_matrix = with_counter(py, progress, n_pairs(n), |counter| {
         snaps.pairwise_rf(Some(counter))
     })?;
@@ -155,8 +230,7 @@ fn pairwise_rf_from_newick_iter(
 /// # Presence matrix format
 ///
 /// Shape `(n_trees, n_bipartitions)`, encoded as a flat row-major `uint8` byte buffer.
-/// Column ordering is deterministic (ascending `Bitset` order) and stable across
-/// calls on the same tree set. Reconstruct on the Python side:
+/// Column ordering is deterministic and stable across calls on the same tree set. Reconstruct on the Python side:
 /// ```python
 /// presence = np.frombuffer(pres_bytes, dtype=np.uint8).reshape(n_trees, n_bip).copy()
 /// ```
@@ -167,7 +241,7 @@ fn pairwise_rf_from_newick_iter(
 /// membership of every bipartition. Shape: `(n_bipartitions, ceil(n_leaves / 8))`,
 /// row-major. Bit `i` of row `j` — **little-endian bit order within each byte** — is `1`
 /// if `leaf_names[i]` is on the canonical side of bipartition `j`. Column order matches
-/// the presence matrix (ascending `Bitset` order, stable across calls).
+/// the presence matrix, and is stable across calls.
 ///
 /// For unrooted trees the canonical side is the half that does **not** contain the first
 /// leaf alphabetically, so bit 0 of every row is always `0`.
@@ -218,8 +292,20 @@ fn pairwise_rf_with_snapshots_from_newick_iter(
 ) -> PyResult<PyRfSnapshotResult> {
     validate_iter_args(&names, &map_indices, &translate_maps)?;
 
-    let snaps =
-        collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted, false)?;
+    let input = IterInput {
+        newick_iter,
+        translate_maps: &translate_maps,
+        map_indices: &map_indices,
+        rooted,
+    };
+
+    let snaps = collect_snapshots_from_iter(
+        input,
+        Retain {
+            lengths: false,
+            bipartitions: true,
+        },
+    )?;
 
     let n = snaps.snapshots.len();
     let rf_matrix = with_counter(py, progress, n_pairs(n), |counter| {
@@ -230,7 +316,7 @@ fn pairwise_rf_with_snapshots_from_newick_iter(
         .flat_map(|row| row.iter().flat_map(|&v: &u32| v.to_ne_bytes()))
         .collect();
 
-    let n_bipartitions = snaps.bipartitions.len();
+    let n_bipartitions = snaps.n_distinct_splits();
     let (presence_vec, col_to_bip_id) = snaps.build_presence_matrix();
     let leaf_names = snaps.leaf_names.clone();
     let bip_clade_bytes = snaps.build_bipartition_bytes(&col_to_bip_id);
@@ -258,7 +344,7 @@ fn pairwise_rf_with_snapshots_from_newick_iter(
 /// Shape `(n_trees, n_bip)`, encoded as a flat row-major `float64` byte buffer.
 /// `branch_length_bytes[i, j]` is the branch length of edge `j` in tree `i`, or `0.0`
 /// if that edge is absent. Pendant (leaf) edges are always present in every tree.
-/// Column order matches `bipartition_clade_bytes` (ascending `Bitset` order, stable).
+/// Column order matches `bipartition_clade_bytes`, and is stable across calls.
 ///
 /// Reconstruct and compute Fréchet traces on the Python side:
 /// ```python
@@ -297,32 +383,13 @@ fn pairwise_wrf_with_snapshots_from_newick_iter(
     progress: Option<Py<ProgressCounter>>,
 ) -> PyResult<PyRfSnapshotResult> {
     validate_iter_args(&names, &map_indices, &translate_maps)?;
-
-    let snaps =
-        collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted, true)?;
-
-    let n = snaps.snapshots.len();
-    let wrf_matrix = with_counter(py, progress, n_pairs(n), |counter| {
-        snaps.pairwise_wrf(Some(counter))
-    })?;
-    let wrf_bytes: Vec<u8> = wrf_matrix.iter().flat_map(|&v| v.to_ne_bytes()).collect();
-
-    let n_bip = snaps.bipartitions.len();
-    let leaf_names = snaps.leaf_names.clone();
-    let (bl_bytes, col_to_bip_id) = snaps.build_branch_length_matrix();
-    let bip_bytes = snaps.build_bipartition_bytes(&col_to_bip_id);
-
-    let py_wrf = PyBytes::new(py, &wrf_bytes);
-    let py_bl = PyBytes::new(py, &bl_bytes);
-    let py_bip = PyBytes::new(py, &bip_bytes);
-    Ok((
-        names,
-        py_wrf.into(),
-        leaf_names,
-        n_bip,
-        py_bl.into(),
-        py_bip.into(),
-    ))
+    let input = IterInput {
+        newick_iter,
+        translate_maps: &translate_maps,
+        map_indices: &map_indices,
+        rooted,
+    };
+    weighted_pairwise_with_snapshots(py, names, input, progress, Snapshots::pairwise_wrf)
 }
 
 /// Compute pairwise KF distances and export a branch-length matrix in a single pass.
@@ -361,32 +428,13 @@ fn pairwise_kf_with_snapshots_from_newick_iter(
     progress: Option<Py<ProgressCounter>>,
 ) -> PyResult<PyRfSnapshotResult> {
     validate_iter_args(&names, &map_indices, &translate_maps)?;
-
-    let snaps =
-        collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted, true)?;
-
-    let n = snaps.snapshots.len();
-    let kf_matrix = with_counter(py, progress, n_pairs(n), |counter| {
-        snaps.pairwise_kf(Some(counter))
-    })?;
-    let kf_bytes: Vec<u8> = kf_matrix.iter().flat_map(|&v| v.to_ne_bytes()).collect();
-
-    let n_bip = snaps.bipartitions.len();
-    let leaf_names = snaps.leaf_names.clone();
-    let (bl_bytes, col_to_bip_id) = snaps.build_branch_length_matrix();
-    let bip_bytes = snaps.build_bipartition_bytes(&col_to_bip_id);
-
-    let py_kf = PyBytes::new(py, &kf_bytes);
-    let py_bl = PyBytes::new(py, &bl_bytes);
-    let py_bip = PyBytes::new(py, &bip_bytes);
-    Ok((
-        names,
-        py_kf.into(),
-        leaf_names,
-        n_bip,
-        py_bl.into(),
-        py_bip.into(),
-    ))
+    let input = IterInput {
+        newick_iter,
+        translate_maps: &translate_maps,
+        map_indices: &map_indices,
+        rooted,
+    };
+    weighted_pairwise_with_snapshots(py, names, input, progress, Snapshots::pairwise_kf)
 }
 
 /// Compute pairwise Weighted Robinson-Foulds distances from a lazy Python iterator.
@@ -419,18 +467,13 @@ fn pairwise_wrf_from_newick_iter(
     progress: Option<Py<ProgressCounter>>,
 ) -> PyResult<(Vec<String>, Vec<f64>)> {
     validate_iter_args(&names, &map_indices, &translate_maps)?;
-
-    let mut snaps =
-        collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted, true)?;
-
-    // This path never exports snapshots, and the dense WRF computation reads
-    // only `split_ids` + `lengths` — release the bipartition bitsets first.
-    snaps.bipartitions = Vec::new();
-
-    let n = snaps.snapshots.len();
-    let matrix = with_counter(py, progress, n_pairs(n), |counter| {
-        snaps.pairwise_wrf(Some(counter))
-    })?;
+    let input = IterInput {
+        newick_iter,
+        translate_maps: &translate_maps,
+        map_indices: &map_indices,
+        rooted,
+    };
+    let matrix = weighted_pairwise(py, input, progress, Snapshots::pairwise_wrf)?;
     Ok((names, matrix))
 }
 
@@ -464,18 +507,13 @@ fn pairwise_kf_from_newick_iter(
     progress: Option<Py<ProgressCounter>>,
 ) -> PyResult<(Vec<String>, Vec<f64>)> {
     validate_iter_args(&names, &map_indices, &translate_maps)?;
-
-    let mut snaps =
-        collect_snapshots_from_iter(newick_iter, &translate_maps, &map_indices, rooted, true)?;
-
-    // This path never exports snapshots, and the dense KF computation reads
-    // only `split_ids` + `lengths` — release the bipartition bitsets first.
-    snaps.bipartitions = Vec::new();
-
-    let n = snaps.snapshots.len();
-    let matrix = with_counter(py, progress, n_pairs(n), |counter| {
-        snaps.pairwise_kf(Some(counter))
-    })?;
+    let input = IterInput {
+        newick_iter,
+        translate_maps: &translate_maps,
+        map_indices: &map_indices,
+        rooted,
+    };
+    let matrix = weighted_pairwise(py, input, progress, Snapshots::pairwise_kf)?;
     Ok((names, matrix))
 }
 
