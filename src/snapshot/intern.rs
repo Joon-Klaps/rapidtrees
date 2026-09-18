@@ -11,7 +11,7 @@ use super::build::Snapshot;
 use super::clades::CladeTable;
 use super::fingerprint::Fingerprint;
 use super::rooted_facts::{
-    InternedRootedFacts, ROOT_ID, RawCladeRef, RawRootedFacts, RootedFactsStore,
+    InternedRootedFacts, ROOT_ID, RawCladeRef, RawRootedFacts, RootedFactsBuilder,
 };
 use hashbrown::HashTable;
 use rustc_hash::FxBuildHasher;
@@ -50,7 +50,7 @@ pub(super) struct Interner {
     counts: Vec<u32>,
     clades: CladeTable,
     snapshots: Vec<InternSnap>,
-    rooted_facts: Option<RootedFactsStore>,
+    rooted_facts: Option<RootedFactsBuilder>,
     words: usize,
     num_leaves: usize,
     rooted: bool,
@@ -74,7 +74,7 @@ impl Interner {
             snapshots: Vec::with_capacity(n_trees),
             rooted_facts: retain
                 .rooted_facts
-                .then(|| RootedFactsStore::with_capacity(n_trees)),
+                .then(|| RootedFactsBuilder::with_capacity(n_trees)),
             words,
             num_leaves,
             rooted,
@@ -198,14 +198,26 @@ impl Interner {
             Ok(id)
         };
 
-        let mut node_ids = Vec::with_capacity(nodes.len());
-        let mut node_heights = Vec::with_capacity(nodes.len());
+        let mut resolved_nodes = Vec::with_capacity(nodes.len());
         for node in nodes {
-            node_ids.push(resolve_in_tree(node.clade)?);
-            node_heights.push(node.height);
+            resolved_nodes.push((resolve_in_tree(node.clade)?, node.height));
         }
+        resolved_nodes.sort_unstable_by_key(|&(id, _)| id);
+        if resolved_nodes
+            .iter()
+            .map(|&(id, _)| id)
+            .ne(tree_split_ids.iter().copied())
+        {
+            return Err(format!(
+                "rooted facts do not contain exactly the snapshot clades for row {sidecar_rows}"
+            ));
+        }
+        let node_heights = resolved_nodes
+            .into_iter()
+            .map(|(_, height)| height)
+            .collect();
 
-        let mut interned_splits = Vec::with_capacity(splits.len());
+        let mut resolved_splits = Vec::with_capacity(splits.len());
         for split in splits {
             let parent = match split.parent {
                 Some(parent) => resolve_in_tree(parent)?,
@@ -216,18 +228,27 @@ impl Interner {
                 resolve_in_tree(split.children[1])?,
             ];
             children.sort_unstable();
-            interned_splits.push([parent, children[0], children[1]]);
+            resolved_splits.push([parent, children[0], children[1]]);
         }
 
-        let store = self
+        let builder = self
             .rooted_facts
             .as_mut()
             .ok_or_else(|| "rooted-facts retention was disabled during interning".to_string())?;
-        store.push(InternedRootedFacts {
-            node_ids,
+        let mut split_ids = Vec::with_capacity(resolved_splits.len());
+        for split in resolved_splits {
+            split_ids.push(builder.intern_split(split)?);
+        }
+        split_ids.sort_unstable();
+        if split_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(format!(
+                "rooted facts contain a duplicate observed split in row {sidecar_rows}"
+            ));
+        }
+        builder.push(InternedRootedFacts {
             node_heights,
             root_height,
-            splits: interned_splits,
+            split_ids,
         });
         Ok(())
     }
@@ -263,13 +284,14 @@ impl Interner {
                 .is_none_or(|facts| facts.len() == self.snapshots.len()),
             "rooted facts must stay aligned with snapshot rows"
         );
+        let rooted_facts = self.rooted_facts.map(RootedFactsBuilder::finish);
         Snapshots {
             snapshots: self.snapshots,
             clades: self.clades,
             split_counts: self.counts,
             words_per_bitset: self.words,
             leaf_names,
-            rooted_facts: self.rooted_facts,
+            rooted_facts,
         }
     }
 }

@@ -28,10 +28,12 @@ FACT_KEYS = {
     "root_column",
     "nodes_per_tree",
     "splits_per_tree",
-    "node_columns",
+    "n_observed_splits",
+    "clade_columns",
     "node_heights",
     "root_heights",
-    "split_columns",
+    "split_ids",
+    "split_table",
 }
 
 
@@ -57,18 +59,17 @@ def _call(
 def _decode(result):
     """Decode the complete public wire format and assert its scalar contract."""
     assert isinstance(result, tuple)
-    assert len(result) == 7
-    tree_names, rf_bytes, leaf_names, n_clades, presence_bytes, clade_bytes, facts = result
+    assert len(result) == 6
+    tree_names, rf_bytes, leaf_names, n_clades, clade_bytes, facts = result
 
     assert isinstance(tree_names, list)
     assert isinstance(rf_bytes, bytes)
     assert isinstance(leaf_names, list)
     assert isinstance(n_clades, int)
-    assert isinstance(presence_bytes, bytes)
     assert isinstance(clade_bytes, bytes)
     assert isinstance(facts, dict)
     assert set(facts) == FACT_KEYS
-    assert facts["format_version"] == 1
+    assert facts["format_version"] == 2
     assert facts["root_column"] == n_clades
 
     n_trees = len(tree_names)
@@ -78,21 +79,32 @@ def _decode(result):
     assert facts["nodes_per_tree"] == nodes_per_tree
     assert facts["splits_per_tree"] == splits_per_tree
 
-    for key in ("node_columns", "node_heights", "root_heights", "split_columns"):
+    for key in (
+        "clade_columns",
+        "node_heights",
+        "root_heights",
+        "split_ids",
+        "split_table",
+    ):
         assert isinstance(facts[key], bytes)
 
     rf = np.frombuffer(rf_bytes, dtype=np.uint32).reshape(n_trees, n_trees)
-    presence = np.frombuffer(presence_bytes, dtype=np.uint8).reshape(n_trees, n_clades)
-    node_columns = np.frombuffer(facts["node_columns"], dtype=np.uint32).reshape(
+    clade_columns = np.frombuffer(facts["clade_columns"], dtype=np.uint32).reshape(
         n_trees, nodes_per_tree
     )
     node_heights = np.frombuffer(facts["node_heights"], dtype=np.float64).reshape(
         n_trees, nodes_per_tree
     )
     root_heights = np.frombuffer(facts["root_heights"], dtype=np.float64).reshape(n_trees)
-    split_columns = np.frombuffer(facts["split_columns"], dtype=np.uint32).reshape(
-        n_trees, splits_per_tree, 3
+    split_ids = np.frombuffer(facts["split_ids"], dtype=np.uint32).reshape(
+        n_trees, splits_per_tree
     )
+    split_table = np.frombuffer(facts["split_table"], dtype=np.uint32).reshape(
+        facts["n_observed_splits"], 3
+    )
+    split_columns = split_table[split_ids]
+    presence = np.zeros((n_trees, n_clades), dtype=np.uint8)
+    np.put_along_axis(presence, clade_columns.astype(np.intp, copy=False), 1, axis=1)
 
     bytes_per_clade = (n_leaves + 7) // 8
     packed_clades = np.frombuffer(clade_bytes, dtype=np.uint8).reshape(
@@ -104,16 +116,20 @@ def _decode(result):
 
     assert rf.dtype == np.dtype(np.uint32)
     assert presence.dtype == np.dtype(np.uint8)
-    assert node_columns.dtype == np.dtype(np.uint32)
+    assert clade_columns.dtype == np.dtype(np.uint32)
     assert node_heights.dtype == np.dtype(np.float64)
     assert root_heights.dtype == np.dtype(np.float64)
+    assert split_ids.dtype == np.dtype(np.uint32)
+    assert split_table.dtype == np.dtype(np.uint32)
     assert split_columns.dtype == np.dtype(np.uint32)
     assert clades.dtype == np.dtype(np.bool_)
     assert rf.shape == (n_trees, n_trees)
     assert presence.shape == (n_trees, n_clades)
-    assert node_columns.shape == (n_trees, nodes_per_tree)
+    assert clade_columns.shape == (n_trees, nodes_per_tree)
     assert node_heights.shape == (n_trees, nodes_per_tree)
     assert root_heights.shape == (n_trees,)
+    assert split_ids.shape == (n_trees, splits_per_tree)
+    assert split_table.shape == (facts["n_observed_splits"], 3)
     assert split_columns.shape == (n_trees, splits_per_tree, 3)
     assert clades.shape == (n_clades, n_leaves)
 
@@ -124,12 +140,15 @@ def _decode(result):
         "root_column": facts["root_column"],
         "nodes_per_tree": nodes_per_tree,
         "splits_per_tree": splits_per_tree,
+        "n_observed_splits": facts["n_observed_splits"],
         "rf": rf,
         "presence": presence,
         "clades": clades,
-        "node_columns": node_columns,
+        "clade_columns": clade_columns,
         "node_heights": node_heights,
         "root_heights": root_heights,
+        "split_ids": split_ids,
+        "split_table": split_table,
         "split_columns": split_columns,
     }
 
@@ -138,7 +157,7 @@ def _height_map(decoded, tree_index):
     """Index one exported height row by public taxon-name clade."""
     mapping = {}
     for column, height in zip(
-        decoded["node_columns"][tree_index],
+        decoded["clade_columns"][tree_index],
         decoded["node_heights"][tree_index],
         strict=True,
     ):
@@ -162,9 +181,10 @@ def test_exact_types_dtypes_and_shapes():
     assert decoded["root_column"] == 10
     assert decoded["nodes_per_tree"] == 6
     assert decoded["splits_per_tree"] == 3
+    assert decoded["n_observed_splits"] == 9
 
 
-def test_first_six_outputs_match_existing_rooted_endpoint_byte_for_byte():
+def test_shared_outputs_match_existing_rooted_endpoint_byte_for_byte():
     rooted_facts_result = _call()
     established_result = rtd.pairwise_rf_with_snapshots_from_newick_iter(
         list(SOURCE_NAMES),
@@ -174,7 +194,9 @@ def test_first_six_outputs_match_existing_rooted_endpoint_byte_for_byte():
         rooted=True,
     )
 
-    assert rooted_facts_result[:6] == established_result
+    assert rooted_facts_result[:4] == established_result[:4]
+    assert rooted_facts_result[4] == established_result[5]
+    assert _decode(rooted_facts_result)["presence"].tobytes() == established_result[4]
 
 
 def test_nodes_and_observed_splits_reference_public_clade_columns():
@@ -183,12 +205,18 @@ def test_nodes_and_observed_splits_reference_public_clade_columns():
     clades = decoded["clades"]
     root_column = decoded["root_column"]
     all_taxa = np.ones(len(decoded["leaf_names"]), dtype=np.bool_)
+    split_table_rows = [tuple(map(int, row)) for row in decoded["split_table"]]
+    assert split_table_rows == sorted(set(split_table_rows))
 
     for tree_index in range(len(decoded["tree_names"])):
-        node_columns = decoded["node_columns"][tree_index]
+        clade_columns = decoded["clade_columns"][tree_index]
         present_columns = np.flatnonzero(presence[tree_index])
-        assert set(node_columns.tolist()) == set(present_columns.tolist())
-        assert len(set(node_columns.tolist())) == decoded["nodes_per_tree"]
+        np.testing.assert_array_equal(clade_columns, present_columns)
+        assert np.all(clade_columns[:-1] < clade_columns[1:])
+
+        tree_split_ids = decoded["split_ids"][tree_index]
+        assert np.all(tree_split_ids[:-1] < tree_split_ids[1:])
+        assert np.all(tree_split_ids < decoded["n_observed_splits"])
 
         root_splits = 0
         for parent, left, right in decoded["split_columns"][tree_index]:

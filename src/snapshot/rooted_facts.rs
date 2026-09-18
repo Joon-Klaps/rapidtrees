@@ -61,28 +61,46 @@ pub(super) struct RawRootedFacts {
 /// Rooted facts after every non-root clade has been resolved by the existing
 /// global interner.
 ///
-/// `node_ids` and `node_heights` are parallel arrays.  Keeping them separate
-/// uses twelve bytes per fact instead of the padding a `(u32, f64)` tuple would
-/// require.  Split triples are `(parent, child_a, child_b)`, with [`ROOT_ID`]
-/// as the parent of the root split.
+/// Heights are aligned with the owning [`super::InternSnap::split_ids`], so the
+/// same clade IDs are not retained twice. `split_ids` indexes the run-wide
+/// observed-split table on [`RootedFactsStore`].
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct InternedRootedFacts {
-    pub(super) node_ids: Vec<u32>,
     pub(super) node_heights: Vec<f64>,
     pub(super) root_height: f64,
-    pub(super) splits: Vec<[u32; 3]>,
+    pub(super) split_ids: Vec<u32>,
 }
 
 /// Optional tree-aligned sidecar owned by a completed snapshot collection.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub(super) struct RootedFactsStore {
     pub(super) trees: Vec<InternedRootedFacts>,
+    /// Unique `(parent, child_a, child_b)` triples on internal clade IDs.
+    pub(super) split_table: Vec<[u32; 3]>,
 }
 
 impl RootedFactsStore {
+    pub(super) fn len(&self) -> usize {
+        self.trees.len()
+    }
+}
+
+/// Construction-only split interner. The lookup table is discarded before
+/// snapshots are returned, leaving only compact per-tree IDs and one split
+/// table in the retained sidecar.
+#[derive(Debug, Default)]
+pub(super) struct RootedFactsBuilder {
+    trees: Vec<InternedRootedFacts>,
+    split_table: Vec<[u32; 3]>,
+    split_lookup: FxHashMap<[u32; 3], u32>,
+}
+
+impl RootedFactsBuilder {
     pub(super) fn with_capacity(n_trees: usize) -> Self {
         Self {
             trees: Vec::with_capacity(n_trees),
+            split_table: Vec::new(),
+            split_lookup: FxHashMap::default(),
         }
     }
 
@@ -90,8 +108,26 @@ impl RootedFactsStore {
         self.trees.len()
     }
 
+    pub(super) fn intern_split(&mut self, split: [u32; 3]) -> Result<u32, String> {
+        if let Some(&id) = self.split_lookup.get(&split) {
+            return Ok(id);
+        }
+        let id = u32::try_from(self.split_table.len())
+            .map_err(|_| "rooted facts contain more than u32::MAX observed splits".to_string())?;
+        self.split_table.push(split);
+        self.split_lookup.insert(split, id);
+        Ok(id)
+    }
+
     pub(super) fn push(&mut self, facts: InternedRootedFacts) {
         self.trees.push(facts);
+    }
+
+    pub(super) fn finish(self) -> RootedFactsStore {
+        RootedFactsStore {
+            trees: self.trees,
+            split_table: self.split_table,
+        }
     }
 }
 

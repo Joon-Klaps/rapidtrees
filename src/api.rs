@@ -36,7 +36,6 @@ type PyRootedFactResult = (
     usize,
     Py<PyAny>,
     Py<PyAny>,
-    Py<PyAny>,
 );
 
 /// The tree source as handed in from Python: the newicks, how to rename their
@@ -347,37 +346,41 @@ fn pairwise_rf_with_snapshots_from_newick_iter(
     ))
 }
 
-/// Compute rooted RF distances and export clades plus MrHIPSTR source-tree facts.
+/// Compute rooted RF distances and export compact MrHIPSTR source-tree facts.
 ///
 /// This endpoint is rooted by definition and therefore has no ``rooted`` argument.
-/// Each Newick string is parsed once. The first six return values have the same
-/// types, byte layouts, and deterministic clade-column order as
-/// ``pairwise_rf_with_snapshots_from_newick_iter(..., rooted=True)``. The seventh
-/// value contains exact-clade node heights and only the binary child splits
-/// directly observed in each source tree.
+/// Each Newick string is parsed once. RF distances and clade bitmasks retain the
+/// byte layouts and deterministic clade-column order of
+/// ``pairwise_rf_with_snapshots_from_newick_iter(..., rooted=True)``. Dense
+/// presence bytes are intentionally omitted: ``clade_columns`` is their compact
+/// fixed-width sparse equivalent for strictly binary rooted trees.
 ///
 /// Let ``T`` be the number of trees, ``L`` the shared number of taxa, and ``C``
-/// the number of distinct exported non-root clades. ``rooted_facts`` is a dict:
+/// the number of distinct exported non-root clades. Let ``S`` be the number of
+/// distinct directly observed binary splits. ``rooted_facts`` is a dict:
 ///
 /// ```python
 /// {
-///     "format_version": 1,
+///     "format_version": 2,
 ///     "root_column": C,
 ///     "nodes_per_tree": 2 * L - 2,
 ///     "splits_per_tree": L - 1,
-///     "node_columns": bytes,   # native-endian uint32[T, 2L-2]
+///     "n_observed_splits": S,
+///     "clade_columns": bytes,  # native-endian uint32[T, 2L-2]
 ///     "node_heights": bytes,   # native-endian float64[T, 2L-2]
 ///     "root_heights": bytes,   # native-endian float64[T]
-///     "split_columns": bytes,  # native-endian uint32[T, L-1, 3]
+///     "split_ids": bytes,      # native-endian uint32[T, L-1]
+///     "split_table": bytes,    # native-endian uint32[S, 3]
 /// }
 /// ```
 ///
-/// Every non-root value in ``node_columns`` and ``split_columns`` is a direct
-/// column index into ``presence_bytes`` and ``clade_bytes``. ``root_column == C``
-/// is reserved for the implicit all-taxa root, appears only as a split parent,
-/// and is absent from the clade catalog. Split triples are
-/// ``(parent, left_child, right_child)`` with children ordered by exported
-/// column. Triple order itself has no algorithmic meaning.
+/// Each ``clade_columns`` row is sorted, unique, and lists exactly the non-root
+/// clades present in that tree. ``node_heights`` is aligned element-for-element.
+/// It is therefore both a sparse presence row and the height-to-clade mapping.
+/// ``split_ids`` rows are sorted IDs into the lexicographically sorted
+/// ``split_table``. Table triples are ``(parent, left_child, right_child)`` with
+/// children ordered by exported clade column. ``root_column == C`` is reserved
+/// for the implicit all-taxa root and appears only as a split parent.
 ///
 /// Heights follow:
 ///
@@ -402,8 +405,8 @@ fn pairwise_rf_with_snapshots_from_newick_iter(
 ///         ``pairwise_rf_from_newick_iter`` for details.
 ///
 /// Returns:
-///     7-tuple ``(tree_names, rf_matrix_bytes, leaf_names, n_clades,
-///     presence_bytes, clade_bytes, rooted_facts)``.
+///     6-tuple ``(tree_names, rf_matrix_bytes, leaf_names, n_clades,
+///     clade_bytes, rooted_facts)``.
 ///
 /// Raises:
 ///     ValueError: If argument lengths or leaf sets differ; fewer than two
@@ -445,32 +448,55 @@ fn pairwise_rf_with_rooted_facts_from_newick_iter(
         .chunks(n)
         .flat_map(|row| row.iter().flat_map(|&value| value.to_ne_bytes()))
         .collect();
+    drop(rf_matrix);
 
     let n_clades = snaps.n_distinct_splits();
-    let (presence_bytes, col_to_bip_id) = snaps.build_presence_matrix();
+    let (_, col_to_bip_id) = snaps.column_order();
     let leaf_names = snaps.leaf_names.clone();
     let clade_bytes = snaps.build_bipartition_bytes(&col_to_bip_id);
     let rooted = snaps
         .build_rooted_fact_buffers(&col_to_bip_id)
         .map_err(PyValueError::new_err)?;
+    drop(snaps);
+
+    let root_column = rooted.root_column;
+    let nodes_per_tree = rooted.nodes_per_tree;
+    let splits_per_tree = rooted.splits_per_tree;
+    let n_observed_splits = rooted.n_observed_splits;
+    let clade_columns = rooted.clade_columns;
+    let node_heights = rooted.node_heights;
+    let root_heights = rooted.root_heights;
+    let split_ids = rooted.split_ids;
+    let split_table = rooted.split_table;
 
     let facts = PyDict::new(py);
-    facts.set_item("format_version", 1u8)?;
-    facts.set_item("root_column", rooted.root_column)?;
-    facts.set_item("nodes_per_tree", rooted.nodes_per_tree)?;
-    facts.set_item("splits_per_tree", rooted.splits_per_tree)?;
-    facts.set_item("node_columns", PyBytes::new(py, &rooted.node_columns))?;
-    facts.set_item("node_heights", PyBytes::new(py, &rooted.node_heights))?;
-    facts.set_item("root_heights", PyBytes::new(py, &rooted.root_heights))?;
-    facts.set_item("split_columns", PyBytes::new(py, &rooted.split_columns))?;
+    facts.set_item("format_version", 2u8)?;
+    facts.set_item("root_column", root_column)?;
+    facts.set_item("nodes_per_tree", nodes_per_tree)?;
+    facts.set_item("splits_per_tree", splits_per_tree)?;
+    facts.set_item("n_observed_splits", n_observed_splits)?;
+    facts.set_item("clade_columns", PyBytes::new(py, &clade_columns))?;
+    drop(clade_columns);
+    facts.set_item("node_heights", PyBytes::new(py, &node_heights))?;
+    drop(node_heights);
+    facts.set_item("root_heights", PyBytes::new(py, &root_heights))?;
+    drop(root_heights);
+    facts.set_item("split_ids", PyBytes::new(py, &split_ids))?;
+    drop(split_ids);
+    facts.set_item("split_table", PyBytes::new(py, &split_table))?;
+    drop(split_table);
+
+    let py_rf: Py<PyAny> = PyBytes::new(py, &rf_bytes).into();
+    drop(rf_bytes);
+    let py_clades: Py<PyAny> = PyBytes::new(py, &clade_bytes).into();
+    drop(clade_bytes);
 
     Ok((
         names,
-        PyBytes::new(py, &rf_bytes).into(),
+        py_rf,
         leaf_names,
         n_clades,
-        PyBytes::new(py, &presence_bytes).into(),
-        PyBytes::new(py, &clade_bytes).into(),
+        py_clades,
         facts.into_any().unbind(),
     ))
 }

@@ -10,11 +10,13 @@ use super::clades::cmp_packed;
 use super::rooted_facts::ROOT_ID;
 use crate::par::*;
 
-/// Fixed-width, tree-major buffers for the optional rooted-tree facts.
+/// Compact tree-major buffers for the optional rooted-tree facts.
 ///
-/// Every non-root clade value is a column in the existing presence matrix.
-/// `root_column` is the reserved value immediately after the last real clade
-/// column and appears only as the parent of a root split.
+/// `clade_columns` is the sparse form of the rooted presence matrix: every row
+/// contains exactly the non-root clades present in that tree, sorted by public
+/// clade column. Heights are aligned element-for-element with those columns.
+/// Observed split triples are deduplicated into `split_table`; each tree keeps
+/// only a row of IDs into that table.
 ///
 /// This is consumed by the dedicated rooted-facts Python endpoint.
 #[cfg_attr(not(feature = "python"), allow(dead_code))]
@@ -23,10 +25,12 @@ pub(crate) struct RootedFactBuffers {
     pub(crate) root_column: u32,
     pub(crate) nodes_per_tree: usize,
     pub(crate) splits_per_tree: usize,
-    pub(crate) node_columns: Vec<u8>,
+    pub(crate) n_observed_splits: usize,
+    pub(crate) clade_columns: Vec<u8>,
     pub(crate) node_heights: Vec<u8>,
     pub(crate) root_heights: Vec<u8>,
-    pub(crate) split_columns: Vec<u8>,
+    pub(crate) split_ids: Vec<u8>,
+    pub(crate) split_table: Vec<u8>,
 }
 
 impl Snapshots {
@@ -37,7 +41,7 @@ impl Snapshots {
     /// Columns ascend by packed leaf set, which is what makes the order stable across
     /// calls on the same tree set — and therefore safe to hand to Python as a
     /// column index.
-    fn column_order(&self) -> (Vec<usize>, Vec<usize>) {
+    pub(crate) fn column_order(&self) -> (Vec<usize>, Vec<usize>) {
         let n = self.clades.len();
         let mut col_to_bip_id: Vec<usize> = (0..n).collect();
         col_to_bip_id.sort_unstable_by(|&a, &b| cmp_packed(self.clades.get(a), self.clades.get(b)));
@@ -83,23 +87,26 @@ impl Snapshots {
         (presence, col_to_bip_id)
     }
 
-    /// Export the optional rooted-tree sidecar on existing presence columns.
+    /// Export the optional rooted-tree sidecar on stable public clade columns.
     ///
     /// `col_to_bip_id` must be the complete column mapping returned by
-    /// [`Snapshots::build_presence_matrix`]. It is inverted once here rather
-    /// than deriving column order again, so every exported clade value indexes
-    /// the accompanying presence matrix and clade table directly.
+    /// [`Snapshots::column_order`]. It is inverted once here rather than
+    /// deriving column order again, so every exported clade value indexes the
+    /// accompanying clade table directly.
     ///
     /// The buffers are native-endian and tree-major:
     ///
-    /// - `node_columns`: `u32[T, 2L - 2]`
+    /// - `clade_columns`: `u32[T, 2L - 2]`
     /// - `node_heights`: `f64[T, 2L - 2]`
     /// - `root_heights`: `f64[T]`
-    /// - `split_columns`: `u32[T, L - 1, 3]`
+    /// - `split_ids`: `u32[T, L - 1]`
+    /// - `split_table`: `u32[S, 3]`
     ///
-    /// Split triples are `(parent, child_a, child_b)`. The children are sorted
-    /// after ID-to-column conversion, and the implicit root is represented by
-    /// `root_column == C`, where `C` is the number of exported clades.
+    /// Split-table triples are `(parent, child_a, child_b)`, sorted
+    /// lexicographically after ID-to-column conversion. Children are sorted
+    /// within each triple, and the implicit root is represented by
+    /// `root_column == C`, where `C` is the number of exported clades. Per-tree
+    /// split IDs are also sorted, making the complete wire format deterministic.
     #[cfg_attr(not(feature = "python"), allow(dead_code))]
     pub(crate) fn build_rooted_fact_buffers(
         &self,
@@ -160,29 +167,73 @@ impl Snapshots {
         let splits_per_tree = n_leaves.saturating_sub(1);
         let node_values = checked_product(n_trees, nodes_per_tree, "node")?;
         let split_values = checked_product(n_trees, splits_per_tree, "split")?;
-        let split_scalars = checked_product(split_values, 3, "split scalar")?;
 
-        let mut node_columns =
-            vec![0; checked_bytes(node_values, size_of::<u32>(), "node column")?];
+        let mut exported_split_rows = Vec::with_capacity(store.split_table.len());
+        for (internal_split_id, &[parent, child_a, child_b]) in store.split_table.iter().enumerate()
+        {
+            let parent_column = if parent == ROOT_ID {
+                root_column
+            } else {
+                exported_column(parent, &id_to_col, internal_split_id, "split parent")?
+            };
+            let mut children = [
+                exported_column(child_a, &id_to_col, internal_split_id, "split child")?,
+                exported_column(child_b, &id_to_col, internal_split_id, "split child")?,
+            ];
+            children.sort_unstable();
+            if children[0] == children[1] {
+                return Err(format!(
+                    "rooted-fact split {internal_split_id} has identical child columns {}",
+                    children[0]
+                ));
+            }
+            exported_split_rows
+                .push(([parent_column, children[0], children[1]], internal_split_id));
+        }
+        exported_split_rows.sort_unstable_by_key(|&(triple, _)| triple);
+        if exported_split_rows
+            .windows(2)
+            .any(|pair| pair[0].0 == pair[1].0)
+        {
+            return Err("rooted-fact split table contains duplicate triples".to_string());
+        }
+
+        let n_observed_splits = exported_split_rows.len();
+        let split_table_scalars = checked_product(n_observed_splits, 3, "split-table scalar")?;
+        let mut internal_to_exported_split = vec![u32::MAX; n_observed_splits];
+        let mut split_table =
+            vec![0; checked_bytes(split_table_scalars, size_of::<u32>(), "split table")?];
+        for (row, &(triple, internal_id)) in exported_split_rows.iter().enumerate() {
+            let exported_id = u32::try_from(row).map_err(|_| {
+                "rooted-fact split-table row cannot be represented as uint32".to_string()
+            })?;
+            internal_to_exported_split[internal_id] = exported_id;
+            for (offset, value) in triple.into_iter().enumerate() {
+                write_u32(&mut split_table, row * 3 + offset, value);
+            }
+        }
+
+        let mut clade_columns =
+            vec![0; checked_bytes(node_values, size_of::<u32>(), "clade column")?];
         let mut node_heights =
             vec![0; checked_bytes(node_values, size_of::<f64>(), "node height")?];
         let mut root_heights = vec![0; checked_bytes(n_trees, size_of::<f64>(), "root height")?];
-        let mut split_columns =
-            vec![0; checked_bytes(split_scalars, size_of::<u32>(), "split column")?];
+        let mut split_ids = vec![0; checked_bytes(split_values, size_of::<u32>(), "split ID")?];
 
-        for (tree_index, facts) in store.trees.iter().enumerate() {
-            if facts.node_ids.len() != nodes_per_tree || facts.node_heights.len() != nodes_per_tree
+        for (tree_index, (snapshot, facts)) in self.snapshots.iter().zip(&store.trees).enumerate() {
+            if snapshot.split_ids.len() != nodes_per_tree
+                || facts.node_heights.len() != nodes_per_tree
             {
                 return Err(format!(
-                    "rooted-fact row {tree_index} has {} node IDs and {} node heights; expected {nodes_per_tree} of each",
-                    facts.node_ids.len(),
+                    "rooted-fact row {tree_index} has {} snapshot clades and {} node heights; expected {nodes_per_tree} of each",
+                    snapshot.split_ids.len(),
                     facts.node_heights.len()
                 ));
             }
-            if facts.splits.len() != splits_per_tree {
+            if facts.split_ids.len() != splits_per_tree {
                 return Err(format!(
                     "rooted-fact row {tree_index} has {} splits; expected {splits_per_tree}",
-                    facts.splits.len()
+                    facts.split_ids.len()
                 ));
             }
             if !facts.root_height.is_finite() {
@@ -192,55 +243,79 @@ impl Snapshots {
             }
 
             let node_base = tree_index * nodes_per_tree;
-            for (offset, (&id, &height)) in
-                facts.node_ids.iter().zip(&facts.node_heights).enumerate()
-            {
+            let mut nodes = Vec::with_capacity(nodes_per_tree);
+            for (&id, &height) in snapshot.split_ids.iter().zip(&facts.node_heights) {
                 if !height.is_finite() {
                     return Err(format!(
-                        "rooted-fact row {tree_index}, node {offset} has a non-finite height"
+                        "rooted-fact row {tree_index} has a non-finite node height"
                     ));
                 }
                 let column = exported_column(id, &id_to_col, tree_index, "node")?;
-                write_u32(&mut node_columns, node_base + offset, column);
+                nodes.push((column, height));
+            }
+            nodes.sort_unstable_by_key(|&(column, _)| column);
+            if nodes.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+                return Err(format!(
+                    "rooted-fact row {tree_index} contains a duplicate clade column"
+                ));
+            }
+            for (offset, (column, height)) in nodes.into_iter().enumerate() {
+                write_u32(&mut clade_columns, node_base + offset, column);
                 write_f64(&mut node_heights, node_base + offset, height);
             }
             write_f64(&mut root_heights, tree_index, facts.root_height);
 
             let expected_root_splits = usize::from(splits_per_tree > 0);
-            let root_splits = facts
-                .splits
-                .iter()
-                .filter(|split| split[0] == ROOT_ID)
-                .count();
+            let mut root_splits = 0;
+            let mut tree_split_ids = Vec::with_capacity(splits_per_tree);
+            for &internal_split_id in &facts.split_ids {
+                let split = store
+                    .split_table
+                    .get(internal_split_id as usize)
+                    .ok_or_else(|| {
+                        format!(
+                            "rooted-fact row {tree_index} references unknown split ID {internal_split_id}"
+                        )
+                    })?;
+                if split[0] == ROOT_ID {
+                    root_splits += 1;
+                } else if snapshot.split_ids.binary_search(&split[0]).is_err() {
+                    return Err(format!(
+                        "rooted-fact row {tree_index} split parent is absent from its clades"
+                    ));
+                }
+                if snapshot.split_ids.binary_search(&split[1]).is_err()
+                    || snapshot.split_ids.binary_search(&split[2]).is_err()
+                {
+                    return Err(format!(
+                        "rooted-fact row {tree_index} split child is absent from its clades"
+                    ));
+                }
+                tree_split_ids.push(
+                    *internal_to_exported_split
+                        .get(internal_split_id as usize)
+                        .filter(|&&id| id != u32::MAX)
+                        .ok_or_else(|| {
+                            format!(
+                                "rooted-fact row {tree_index} cannot export split ID {internal_split_id}"
+                            )
+                        })?,
+                );
+            }
             if root_splits != expected_root_splits {
                 return Err(format!(
                     "rooted-fact row {tree_index} has {root_splits} root splits; expected {expected_root_splits}"
                 ));
             }
-
+            tree_split_ids.sort_unstable();
+            if tree_split_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Err(format!(
+                    "rooted-fact row {tree_index} contains a duplicate split ID"
+                ));
+            }
             let split_base = tree_index * splits_per_tree;
-            for (offset, &[parent, child_a, child_b]) in facts.splits.iter().enumerate() {
-                let parent_column = if parent == ROOT_ID {
-                    root_column
-                } else {
-                    exported_column(parent, &id_to_col, tree_index, "split parent")?
-                };
-                let mut children = [
-                    exported_column(child_a, &id_to_col, tree_index, "split child")?,
-                    exported_column(child_b, &id_to_col, tree_index, "split child")?,
-                ];
-                children.sort_unstable();
-                if children[0] == children[1] {
-                    return Err(format!(
-                        "rooted-fact row {tree_index}, split {offset} has identical child columns {}",
-                        children[0]
-                    ));
-                }
-
-                let triple = (split_base + offset) * 3;
-                write_u32(&mut split_columns, triple, parent_column);
-                write_u32(&mut split_columns, triple + 1, children[0]);
-                write_u32(&mut split_columns, triple + 2, children[1]);
+            for (offset, split_id) in tree_split_ids.into_iter().enumerate() {
+                write_u32(&mut split_ids, split_base + offset, split_id);
             }
         }
 
@@ -248,10 +323,12 @@ impl Snapshots {
             root_column,
             nodes_per_tree,
             splits_per_tree,
-            node_columns,
+            n_observed_splits,
+            clade_columns,
             node_heights,
             root_heights,
-            split_columns,
+            split_ids,
+            split_table,
         })
     }
 

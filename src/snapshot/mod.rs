@@ -193,11 +193,20 @@ impl Snapshots {
         // construction — it can dwarf the deduplicated result and OOM the process.
         // Estimate one snapshot's raw bytes from the first tree (all trees share
         // the leaf set, so this is representative), parse the rest in chunks sized
-        // to ~`CHUNK_TARGET_BYTES`, and fold each chunk into the interner — freeing
-        // its parts — before parsing the next.
+        // to a bounded target, and fold each chunk into the interner — freeing
+        // its parts — before parsing the next. Rooted facts add several raw
+        // vectors per tree and retain a growing sidecar, so their opt-in path
+        // uses a smaller construction window. Existing paths keep the original
+        // 256 MiB target unchanged.
         const CHUNK_TARGET_BYTES: usize = 256 * 1024 * 1024;
+        const ROOTED_FACTS_CHUNK_TARGET_BYTES: usize = 64 * 1024 * 1024;
+        let chunk_target = if retain.rooted_facts {
+            ROOTED_FACTS_CHUNK_TARGET_BYTES
+        } else {
+            CHUNK_TARGET_BYTES
+        };
         let per_snap_bytes = estimated_raw_snapshot_bytes(&first_snap, first_facts.as_ref());
-        let chunk = (CHUNK_TARGET_BYTES / per_snap_bytes.max(1)).clamp(1, 4096);
+        let chunk = (chunk_target / per_snap_bytes.max(1)).clamp(1, 4096);
 
         let mut interner = Interner::new(
             entries.len(),
