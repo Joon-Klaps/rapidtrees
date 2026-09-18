@@ -16,8 +16,8 @@ use crate::par::*;
 /// `root_column` is the reserved value immediately after the last real clade
 /// column and appears only as the parent of a root split.
 ///
-/// This is consumed by the dedicated Python endpoint added in the next stage.
-#[allow(dead_code)]
+/// This is consumed by the dedicated rooted-facts Python endpoint.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RootedFactBuffers {
     pub(crate) root_column: u32,
@@ -100,7 +100,7 @@ impl Snapshots {
     /// Split triples are `(parent, child_a, child_b)`. The children are sorted
     /// after ID-to-column conversion, and the implicit root is represented by
     /// `root_column == C`, where `C` is the number of exported clades.
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     pub(crate) fn build_rooted_fact_buffers(
         &self,
         col_to_bip_id: &[usize],

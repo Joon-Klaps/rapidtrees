@@ -6,7 +6,7 @@
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyIterator};
+use pyo3::types::{PyBytes, PyDict, PyIterator};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 
@@ -25,6 +25,16 @@ type PyRfSnapshotResult = (
     Py<PyAny>,
     Vec<String>,
     usize,
+    Py<PyAny>,
+    Py<PyAny>,
+);
+
+type PyRootedFactResult = (
+    Vec<String>,
+    Py<PyAny>,
+    Vec<String>,
+    usize,
+    Py<PyAny>,
     Py<PyAny>,
     Py<PyAny>,
 );
@@ -337,6 +347,134 @@ fn pairwise_rf_with_snapshots_from_newick_iter(
     ))
 }
 
+/// Compute rooted RF distances and export clades plus MrHIPSTR source-tree facts.
+///
+/// This endpoint is rooted by definition and therefore has no ``rooted`` argument.
+/// Each Newick string is parsed once. The first six return values have the same
+/// types, byte layouts, and deterministic clade-column order as
+/// ``pairwise_rf_with_snapshots_from_newick_iter(..., rooted=True)``. The seventh
+/// value contains exact-clade node heights and only the binary child splits
+/// directly observed in each source tree.
+///
+/// Let ``T`` be the number of trees, ``L`` the shared number of taxa, and ``C``
+/// the number of distinct exported non-root clades. ``rooted_facts`` is a dict:
+///
+/// ```python
+/// {
+///     "format_version": 1,
+///     "root_column": C,
+///     "nodes_per_tree": 2 * L - 2,
+///     "splits_per_tree": L - 1,
+///     "node_columns": bytes,   # native-endian uint32[T, 2L-2]
+///     "node_heights": bytes,   # native-endian float64[T, 2L-2]
+///     "root_heights": bytes,   # native-endian float64[T]
+///     "split_columns": bytes,  # native-endian uint32[T, L-1, 3]
+/// }
+/// ```
+///
+/// Every non-root value in ``node_columns`` and ``split_columns`` is a direct
+/// column index into ``presence_bytes`` and ``clade_bytes``. ``root_column == C``
+/// is reserved for the implicit all-taxa root, appears only as a split parent,
+/// and is absent from the clade catalog. Split triples are
+/// ``(parent, left_child, right_child)`` with children ordered by exported
+/// column. Triple order itself has no algorithmic meaning.
+///
+/// Heights follow:
+///
+/// ```text
+/// root_distance(root) = 0
+/// root_distance(child) = root_distance(parent) + branch_length(child)
+/// root_height = max(root_distance(tip))
+/// node_height(node) = root_height - root_distance(node)
+/// ```
+///
+/// This supports non-ultrametric trees and includes singleton-tip heights.
+/// Tree rows preserve input order. Buffers use native endianness, matching the
+/// existing RapidTrees snapshot API.
+///
+/// Args:
+///     names: Tree identifiers (one per Newick string).
+///     newick_iter: Python iterator yielding rooted Newick strings.
+///     translate_maps: List of translate maps (number → taxon name).
+///     map_indices: Per-tree index into ``translate_maps``.
+///     progress: Optional ``rapidtrees.ProgressCounter`` whose ``.value()`` /
+///         ``.total()`` / ``.fraction()`` reflect live RF progress. See
+///         ``pairwise_rf_from_newick_iter`` for details.
+///
+/// Returns:
+///     7-tuple ``(tree_names, rf_matrix_bytes, leaf_names, n_clades,
+///     presence_bytes, clade_bytes, rooted_facts)``.
+///
+/// Raises:
+///     ValueError: If argument lengths or leaf sets differ; fewer than two
+///         trees are supplied; a tree is not strictly binary; a non-root edge
+///         lacks an explicit finite branch length; or a cumulative distance or
+///         calculated height is non-finite.
+#[pyfunction]
+#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, progress=None))]
+fn pairwise_rf_with_rooted_facts_from_newick_iter(
+    py: Python<'_>,
+    names: Vec<String>,
+    newick_iter: Bound<'_, PyIterator>,
+    translate_maps: Vec<HashMap<String, String>>,
+    map_indices: Vec<usize>,
+    progress: Option<Py<ProgressCounter>>,
+) -> PyResult<PyRootedFactResult> {
+    validate_iter_args(&names, &map_indices, &translate_maps)?;
+
+    let input = IterInput {
+        newick_iter,
+        translate_maps: &translate_maps,
+        map_indices: &map_indices,
+        rooted: true,
+    };
+    let snaps = collect_snapshots_from_iter(
+        input,
+        Retain {
+            lengths: false,
+            bipartitions: true,
+            rooted_facts: true,
+        },
+    )?;
+
+    let n = snaps.len();
+    let rf_matrix = with_counter(py, progress, n_pairs(n), |counter| {
+        snaps.pairwise_rf(Some(counter))
+    })?;
+    let rf_bytes: Vec<u8> = rf_matrix
+        .chunks(n)
+        .flat_map(|row| row.iter().flat_map(|&value| value.to_ne_bytes()))
+        .collect();
+
+    let n_clades = snaps.n_distinct_splits();
+    let (presence_bytes, col_to_bip_id) = snaps.build_presence_matrix();
+    let leaf_names = snaps.leaf_names.clone();
+    let clade_bytes = snaps.build_bipartition_bytes(&col_to_bip_id);
+    let rooted = snaps
+        .build_rooted_fact_buffers(&col_to_bip_id)
+        .map_err(PyValueError::new_err)?;
+
+    let facts = PyDict::new(py);
+    facts.set_item("format_version", 1u8)?;
+    facts.set_item("root_column", rooted.root_column)?;
+    facts.set_item("nodes_per_tree", rooted.nodes_per_tree)?;
+    facts.set_item("splits_per_tree", rooted.splits_per_tree)?;
+    facts.set_item("node_columns", PyBytes::new(py, &rooted.node_columns))?;
+    facts.set_item("node_heights", PyBytes::new(py, &rooted.node_heights))?;
+    facts.set_item("root_heights", PyBytes::new(py, &rooted.root_heights))?;
+    facts.set_item("split_columns", PyBytes::new(py, &rooted.split_columns))?;
+
+    Ok((
+        names,
+        PyBytes::new(py, &rf_bytes).into(),
+        leaf_names,
+        n_clades,
+        PyBytes::new(py, &presence_bytes).into(),
+        PyBytes::new(py, &clade_bytes).into(),
+        facts.into_any().unbind(),
+    ))
+}
+
 /// Compute pairwise WRF distances and export a branch-length matrix in a single pass.
 ///
 /// Parses each newick once, building both the pairwise WRF distance matrix and a
@@ -529,6 +667,10 @@ fn rapidtrees(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
+        pairwise_rf_with_rooted_facts_from_newick_iter,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
         pairwise_wrf_with_snapshots_from_newick_iter,
         m
     )?)?;
@@ -620,7 +762,7 @@ mod py_integration_tests {
 
     /// Initialise the embedded interpreter exactly once across all tests
     /// running in this process.
-    fn ensure_python() {
+    pub(super) fn ensure_python() {
         static INIT: Once = Once::new();
         INIT.call_once(|| {
             pyo3::append_to_inittab!(rapidtrees);
@@ -644,7 +786,7 @@ mod py_integration_tests {
         (names, trees)
     }
 
-    fn call_pairwise<'py>(
+    pub(super) fn call_pairwise<'py>(
         py: Python<'py>,
         func_name: &str,
         progress: Option<&Bound<'py, PyAny>>,
@@ -696,7 +838,7 @@ mod py_integration_tests {
     /// counter-bearing branch of `with_counter`. Without this the
     /// counter-handling closure for that metric+variant monomorphization
     /// stays at FNDA:0 in lcov.
-    fn fresh_counter<'py>(py: Python<'py>) -> Bound<'py, PyAny> {
+    pub(super) fn fresh_counter<'py>(py: Python<'py>) -> Bound<'py, PyAny> {
         py.import("rapidtrees")
             .unwrap()
             .getattr("ProgressCounter")
@@ -945,3 +1087,6 @@ mod py_integration_tests {
         });
     }
 }
+
+#[cfg(test)]
+mod rooted_facts_tests;
