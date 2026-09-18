@@ -345,4 +345,6 @@ fn collect_raw_rooted_facts(
         .map_err(|e| format!("Failed to collect rooted facts for tree at index {index}: {e}"))
 }
 #[cfg(test)]
+mod rooted_facts_tests;
+#[cfg(test)]
 mod tests;

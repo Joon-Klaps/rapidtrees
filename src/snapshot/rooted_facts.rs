@@ -286,7 +286,7 @@ fn validate_children(parent: &Part, left: &Part, right: &Part, index: usize) -> 
         || left.key ^ right.key != parent.key
     {
         return Err(format!(
-            "internal snapshot node {index} does not contain exactly two contiguous children"
+            "internal snapshot node {index} must have exactly two children spanning its interval"
         ));
     }
     Ok(())
