@@ -20,6 +20,13 @@ fn decode_f64(bytes: &[u8]) -> Vec<f64> {
         .collect()
 }
 
+/// Decode a native-endian `u32` buffer emitted by a snapshot exporter.
+fn decode_u32(bytes: &[u8]) -> Vec<u32> {
+    let (chunks, remainder) = bytes.as_chunks::<4>();
+    assert!(remainder.is_empty(), "u32 buffer must contain whole values");
+    chunks.iter().copied().map(u32::from_ne_bytes).collect()
+}
+
 /// Read one tree on its own, with the run tables its own taxa give, as tree 0
 /// of a run is read. The interner is not involved.
 fn snapshot_of(newick: &str, rooted: bool) -> Snapshot {
@@ -244,6 +251,227 @@ fn rooted_facts_sidecar_is_interned_and_tree_aligned() {
     assert_eq!(height_for(&[0]), 7.0);
     assert_eq!(height_for(&[0, 1]), 8.0);
     assert_eq!(height_for(&[2, 3]), 5.0);
+}
+
+/// Rooted facts use the exact columns returned with the presence matrix, keep
+/// node heights aligned, and contain only directly observed child splits.
+#[test]
+fn rooted_fact_export_has_stable_columns_and_fixed_shapes() {
+    let trees = ["((A:1,B:2):3,(C:4,D:5):6);", "((A:2,C:3):4,(B:5,D:6):7);"];
+    let snaps = rooted_snapshots_opts(&trees, true).expect("facts-enabled snapshots");
+    let (presence, col_to_bip_id) = snaps.build_presence_matrix();
+    let facts = snaps
+        .build_rooted_fact_buffers(&col_to_bip_id)
+        .expect("export rooted facts");
+
+    let n_trees = trees.len();
+    let n_leaves = snaps.leaf_names.len();
+    let n_clades = col_to_bip_id.len();
+    assert_eq!(facts.root_column, n_clades as u32);
+    assert_eq!(facts.nodes_per_tree, 2 * n_leaves - 2);
+    assert_eq!(facts.splits_per_tree, n_leaves - 1);
+    assert_eq!(
+        facts.node_columns.len(),
+        n_trees * facts.nodes_per_tree * size_of::<u32>()
+    );
+    assert_eq!(
+        facts.node_heights.len(),
+        n_trees * facts.nodes_per_tree * size_of::<f64>()
+    );
+    assert_eq!(facts.root_heights.len(), n_trees * size_of::<f64>());
+    assert_eq!(
+        facts.split_columns.len(),
+        n_trees * facts.splits_per_tree * 3 * size_of::<u32>()
+    );
+
+    let node_columns = decode_u32(&facts.node_columns);
+    let node_heights = decode_f64(&facts.node_heights);
+    let root_heights = decode_f64(&facts.root_heights);
+    let split_columns = decode_u32(&facts.split_columns);
+    assert_eq!(root_heights, vec![11.0, 13.0]);
+
+    let clade_at = |column: u32| snaps.clades.get(col_to_bip_id[column as usize]);
+    for tree_index in 0..n_trees {
+        let node_start = tree_index * facts.nodes_per_tree;
+        let tree_nodes = &node_columns[node_start..node_start + facts.nodes_per_tree];
+        let unique_nodes: HashSet<_> = tree_nodes.iter().copied().collect();
+        assert_eq!(
+            unique_nodes.len(),
+            facts.nodes_per_tree,
+            "row {tree_index} must contain each non-root clade once"
+        );
+        for &column in tree_nodes {
+            assert!(column < facts.root_column);
+            assert_eq!(presence[tree_index * n_clades + column as usize], 1);
+        }
+
+        let split_start = tree_index * facts.splits_per_tree * 3;
+        let tree_splits = &split_columns[split_start..split_start + facts.splits_per_tree * 3];
+        let mut root_splits = 0;
+        for triple in tree_splits.chunks_exact(3) {
+            let (parent, left, right) = (triple[0], triple[1], triple[2]);
+            assert!(left < right, "child columns must be canonicalized");
+            assert!(left < facts.root_column && right < facts.root_column);
+            assert_eq!(presence[tree_index * n_clades + left as usize], 1);
+            assert_eq!(presence[tree_index * n_clades + right as usize], 1);
+
+            let mut child_union = clade_at(left)
+                .iter()
+                .chain(clade_at(right))
+                .copied()
+                .collect::<Vec<_>>();
+            child_union.sort_unstable();
+            child_union.dedup();
+
+            let parent_clade = if parent == facts.root_column {
+                root_splits += 1;
+                (0..n_leaves as u32).collect::<Vec<_>>()
+            } else {
+                assert!(parent < facts.root_column);
+                assert_eq!(presence[tree_index * n_clades + parent as usize], 1);
+                clade_at(parent).to_vec()
+            };
+            assert_eq!(
+                child_union, parent_clade,
+                "row {tree_index} exports a split that is not a direct child partition"
+            );
+        }
+        assert_eq!(root_splits, 1, "row {tree_index}");
+    }
+
+    let column_for = |wanted: &[u32]| {
+        col_to_bip_id
+            .iter()
+            .position(|&id| snaps.clades.get(id) == wanted)
+            .expect("exported clade column") as u32
+    };
+    let a = column_for(&[0]);
+    let b = column_for(&[1]);
+    let c = column_for(&[2]);
+    let d = column_for(&[3]);
+    let ab = column_for(&[0, 1]);
+    let cd = column_for(&[2, 3]);
+    let ordered = |left: u32, right: u32| [left.min(right), left.max(right)];
+    let [root_left, root_right] = ordered(ab, cd);
+    let [ab_left, ab_right] = ordered(a, b);
+    let [cd_left, cd_right] = ordered(c, d);
+    let expected_first_splits = HashSet::from([
+        [facts.root_column, root_left, root_right],
+        [ab, ab_left, ab_right],
+        [cd, cd_left, cd_right],
+    ]);
+    let actual_first_splits = split_columns[..facts.splits_per_tree * 3]
+        .chunks_exact(3)
+        .map(|triple| [triple[0], triple[1], triple[2]])
+        .collect::<HashSet<_>>();
+    assert_eq!(actual_first_splits, expected_first_splits);
+
+    let first_nodes = &node_columns[..facts.nodes_per_tree];
+    let first_heights = &node_heights[..facts.nodes_per_tree];
+    let height_at = |column: u32| {
+        let offset = first_nodes
+            .iter()
+            .position(|&candidate| candidate == column)
+            .expect("node column");
+        first_heights[offset]
+    };
+    assert_eq!(height_at(a), 7.0);
+    assert_eq!(height_at(ab), 8.0);
+    assert_eq!(height_at(cd), 5.0);
+}
+
+/// ID-to-column conversion is driven by the supplied mapping, and children
+/// are canonicalized only after that conversion.
+#[test]
+fn rooted_fact_export_translates_before_canonicalizing_children() {
+    let trees = ["((A:1,B:2):3,(C:4,D:5):6);"];
+    let snaps = rooted_snapshots_opts(&trees, true).unwrap();
+    let n_clades = snaps.n_distinct_splits();
+    let reversed_columns = (0..n_clades).rev().collect::<Vec<_>>();
+    let buffers = snaps
+        .build_rooted_fact_buffers(&reversed_columns)
+        .expect("export on supplied columns");
+    let exported_nodes = decode_u32(&buffers.node_columns);
+    let exported_splits = decode_u32(&buffers.split_columns);
+    let stored = &snaps.rooted_facts.as_ref().unwrap().trees[0];
+
+    let column_for_id = |id: u32| n_clades as u32 - 1 - id;
+    let expected_nodes = stored
+        .node_ids
+        .iter()
+        .map(|&id| column_for_id(id))
+        .collect::<Vec<_>>();
+    assert_eq!(exported_nodes, expected_nodes);
+
+    let expected_splits = stored
+        .splits
+        .iter()
+        .flat_map(|&[parent, left, right]| {
+            let mut children = [column_for_id(left), column_for_id(right)];
+            children.sort_unstable();
+            [
+                if parent == ROOT_ID {
+                    buffers.root_column
+                } else {
+                    column_for_id(parent)
+                },
+                children[0],
+                children[1],
+            ]
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(exported_splits, expected_splits);
+    assert!(
+        exported_splits
+            .chunks_exact(3)
+            .all(|triple| triple[1] < triple[2])
+    );
+}
+
+#[test]
+fn rooted_fact_export_validates_prerequisites_and_dimensions() {
+    let trees = ["((A:1,B:2):3,(C:4,D:5):6);"];
+
+    let without_facts = rooted_snapshots_opts(&trees, false).unwrap();
+    let (_, columns) = without_facts.build_presence_matrix();
+    let error = without_facts
+        .build_rooted_fact_buffers(&columns)
+        .expect_err("missing sidecar must fail");
+    assert!(error.contains("were not retained"));
+
+    let with_facts = rooted_snapshots_opts(&trees, true).unwrap();
+    let (_, columns) = with_facts.build_presence_matrix();
+    let mut duplicate = columns.clone();
+    duplicate[0] = duplicate[1];
+    let error = with_facts
+        .build_rooted_fact_buffers(&duplicate)
+        .expect_err("duplicate mapping must fail");
+    assert!(error.contains("more than once"));
+
+    let mut malformed = rooted_snapshots_opts(&trees, true).unwrap();
+    malformed.rooted_facts.as_mut().unwrap().trees[0]
+        .node_heights
+        .pop();
+    let (_, columns) = malformed.build_presence_matrix();
+    let error = malformed
+        .build_rooted_fact_buffers(&columns)
+        .expect_err("ragged node rows must fail");
+    assert!(error.contains("expected 6 of each"));
+}
+
+#[test]
+fn rooted_fact_export_handles_an_empty_collection() {
+    let snaps = rooted_snapshots_opts(&[], true).unwrap();
+    let (_, columns) = snaps.build_presence_matrix();
+    let facts = snaps.build_rooted_fact_buffers(&columns).unwrap();
+
+    assert_eq!(facts.root_column, 0);
+    assert_eq!(facts.nodes_per_tree, 0);
+    assert_eq!(facts.splits_per_tree, 0);
+    assert!(facts.node_columns.is_empty());
+    assert!(facts.node_heights.is_empty());
+    assert!(facts.root_heights.is_empty());
+    assert!(facts.split_columns.is_empty());
 }
 
 /// Opting into facts must not perturb interner IDs, clade materialization, or
