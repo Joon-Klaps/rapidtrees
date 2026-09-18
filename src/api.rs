@@ -83,6 +83,7 @@ fn weighted_pairwise(
         Retain {
             lengths: true,
             bipartitions: false,
+            rooted_facts: false,
         },
     )?;
 
@@ -205,6 +206,7 @@ fn pairwise_rf_from_newick_iter(
         Retain {
             lengths: false,
             bipartitions: false,
+            rooted_facts: false,
         },
     )?;
 
@@ -304,6 +306,7 @@ fn pairwise_rf_with_snapshots_from_newick_iter(
         Retain {
             lengths: false,
             bipartitions: true,
+            rooted_facts: false,
         },
     )?;
 

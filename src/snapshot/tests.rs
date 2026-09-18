@@ -4,7 +4,7 @@
 //! drive the whole path from newick to interned split IDs, and they share the
 //! `snapshot_of` / `snaps_opts` helpers.
 
-use super::rooted_facts::{RawCladeRef, RawRootedFacts};
+use super::rooted_facts::{ROOT_ID, RawCladeRef, RawRootedFacts};
 use super::*;
 use crate::snapshot::fingerprint::Fingerprint;
 use std::collections::HashSet;
@@ -23,8 +23,16 @@ fn decode_f64(bytes: &[u8]) -> Vec<f64> {
 /// Read one tree on its own, with the run tables its own taxa give, as tree 0
 /// of a run is read. The interner is not involved.
 fn snapshot_of(newick: &str, rooted: bool) -> Snapshot {
+    snapshot_result(newick, rooted, false).unwrap()
+}
+
+fn snapshot_result(
+    newick: &str,
+    rooted: bool,
+    require_explicit_lengths: bool,
+) -> Result<Snapshot, String> {
     let no_translate = HashMap::new();
-    let mut names = newick::leaf_names(newick, &no_translate).unwrap();
+    let mut names = newick::leaf_names(newick, &no_translate)?;
     names.sort_unstable();
     let labels = taxon_labels(names.len());
     let leaf_index = build_leaf_index(&names);
@@ -33,22 +41,34 @@ fn snapshot_of(newick: &str, rooted: bool) -> Snapshot {
         labels: &labels,
         total: labels.iter().fold(0, |acc, &label| acc ^ label),
         rooted,
+        require_explicit_lengths,
     };
-    newick::snapshot(newick, &no_translate, 0, &run).unwrap()
+    newick::snapshot(newick, &no_translate, 0, &run)
 }
 
-/// Collect optional rooted facts directly from one parsed tree.
+/// Collect optional rooted facts from one direct-parser snapshot.
 fn rooted_facts_of(newick: &str) -> Result<(RawRootedFacts, Vec<Fingerprint>), String> {
-    let tree = PhyloTree::from_newick(newick).map_err(|error| error.to_string())?;
-    let mut names: Vec<String> = tree
-        .get_leaves()
-        .iter()
-        .filter_map(|id| tree.get(id).ok()?.name.clone())
-        .collect();
+    let no_translate = HashMap::new();
+    let mut names = newick::leaf_names(newick, &no_translate)?;
     names.sort_unstable();
     let labels = taxon_labels(names.len());
-    let facts = RawRootedFacts::from_tree(&tree, &labels, &build_leaf_index(&names))?;
+    let snapshot = snapshot_result(newick, true, true)?;
+    let facts = RawRootedFacts::from_snapshot(&snapshot)?;
     Ok((facts, labels))
+}
+
+/// Build rooted snapshots with the optional facts sidecar explicitly selected.
+fn rooted_snapshots_opts(newicks: &[&str], retain_rooted_facts: bool) -> Result<Snapshots, String> {
+    let empty: HashMap<String, String> = HashMap::new();
+    Snapshots::from_newick_iter_opts(
+        newicks.iter().map(|&newick| (newick, &empty)),
+        true,
+        Retain {
+            lengths: false,
+            bipartitions: true,
+            rooted_facts: retain_rooted_facts,
+        },
+    )
 }
 
 /// The optional collector uses max root-to-tip distance as root height and
@@ -164,6 +184,149 @@ fn rooted_facts_handle_deep_caterpillar_iteratively() {
     let (facts, _) = rooted_facts_of(&newick).expect("collect deep rooted facts");
     assert_eq!(facts.nodes.len(), 2 * LEAVES - 2);
     assert_eq!(facts.splits.len(), LEAVES - 1);
+}
+
+/// Facts are resolved against the IDs assigned by the ordinary rooted
+/// snapshot, remain aligned with input tree rows, and keep the root implicit.
+#[test]
+fn rooted_facts_sidecar_is_interned_and_tree_aligned() {
+    let trees = ["((A:1,B:2):3,(C:4,D:5):6);", "((A:2,C:3):4,(B:5,D:6):7);"];
+    let snaps = rooted_snapshots_opts(&trees, true).expect("facts-enabled snapshots");
+    let store = snaps.rooted_facts.as_ref().expect("rooted facts sidecar");
+
+    assert_eq!(store.trees.len(), trees.len());
+    assert_eq!(
+        store
+            .trees
+            .iter()
+            .map(|facts| facts.root_height)
+            .collect::<Vec<_>>(),
+        vec![11.0, 13.0]
+    );
+
+    for (row, (snapshot, facts)) in snaps.snapshots.iter().zip(&store.trees).enumerate() {
+        assert_eq!(facts.node_ids.len(), 6, "row {row}");
+        assert_eq!(facts.node_heights.len(), 6, "row {row}");
+        assert_eq!(facts.splits.len(), 3, "row {row}");
+
+        let mut fact_ids = facts.node_ids.clone();
+        fact_ids.sort_unstable();
+        assert_eq!(
+            fact_ids, snapshot.split_ids,
+            "row {row} facts must reference exactly its snapshot clades"
+        );
+
+        let root_splits = facts
+            .splits
+            .iter()
+            .filter(|split| split[0] == ROOT_ID)
+            .count();
+        assert_eq!(root_splits, 1, "row {row}");
+        for [parent, left, right] in &facts.splits {
+            if *parent != ROOT_ID {
+                assert!(snapshot.split_ids.binary_search(parent).is_ok());
+            }
+            assert!(snapshot.split_ids.binary_search(left).is_ok());
+            assert!(snapshot.split_ids.binary_search(right).is_ok());
+            assert!(left < right, "children must be canonicalized");
+        }
+    }
+
+    let first = &store.trees[0];
+    let height_for = |wanted: &[u32]| {
+        first
+            .node_ids
+            .iter()
+            .zip(&first.node_heights)
+            .find_map(|(&id, &height)| (snaps.clades.get(id as usize) == wanted).then_some(height))
+            .unwrap_or_else(|| panic!("missing clade {wanted:?}"))
+    };
+    assert_eq!(height_for(&[0]), 7.0);
+    assert_eq!(height_for(&[0, 1]), 8.0);
+    assert_eq!(height_for(&[2, 3]), 5.0);
+}
+
+/// Opting into facts must not perturb interner IDs, clade materialization, or
+/// the existing presence export. Existing constructors retain no sidecar.
+#[test]
+fn rooted_facts_are_optional_and_do_not_change_existing_snapshots() {
+    let trees = ["((A:1,B:2):3,(C:4,D:5):6);", "((A:2,C:3):4,(B:5,D:6):7);"];
+    let with_facts = rooted_snapshots_opts(&trees, true).unwrap();
+    let without_facts = rooted_snapshots_opts(&trees, false).unwrap();
+    let public_default = Snapshots::from_newicks(&trees, true).unwrap();
+
+    assert!(with_facts.rooted_facts.is_some());
+    assert!(without_facts.rooted_facts.is_none());
+    assert!(public_default.rooted_facts.is_none());
+
+    for (with, without) in with_facts.snapshots.iter().zip(&without_facts.snapshots) {
+        assert_eq!(with.split_ids, without.split_ids);
+    }
+    assert_eq!(with_facts.clades.len(), without_facts.clades.len());
+    for id in 0..with_facts.clades.len() {
+        assert_eq!(with_facts.clades.get(id), without_facts.clades.get(id));
+    }
+    assert_eq!(
+        with_facts.build_presence_matrix(),
+        without_facts.build_presence_matrix()
+    );
+}
+
+/// Strict binary/length validation belongs only to the optional facts path.
+/// The established snapshot constructor keeps accepting the inputs it handled
+/// before this feature existed.
+#[test]
+fn rooted_fact_validation_is_opt_in() {
+    let missing_lengths = ["(A,B);"];
+    assert!(rooted_snapshots_opts(&missing_lengths, false).is_ok());
+    assert!(rooted_snapshots_opts(&missing_lengths, true).is_err());
+
+    let polytomy = ["(A:1,B:1,C:1);"];
+    assert!(rooted_snapshots_opts(&polytomy, false).is_ok());
+    assert!(rooted_snapshots_opts(&polytomy, true).is_err());
+}
+
+#[test]
+fn rooted_facts_errors_include_the_source_tree_index() {
+    let trees = ["((A:1,B:1):1,(C:1,D:1):1);", "((A:1,B:1,C:1):1,D:1);"];
+    let error = rooted_snapshots_opts(&trees, true).expect_err("polytomy must fail");
+    assert!(
+        error.contains("tree at index 1") && error.contains("exactly two children"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn rooted_facts_cannot_be_retained_in_unrooted_mode() {
+    let empty: HashMap<String, String> = HashMap::new();
+    let trees = ["((A:1,B:1):1,(C:1,D:1):1);"];
+    let error = Snapshots::from_newick_iter_opts(
+        trees.iter().map(|&newick| (newick, &empty)),
+        false,
+        Retain {
+            lengths: false,
+            bipartitions: true,
+            rooted_facts: true,
+        },
+    )
+    .expect_err("unrooted facts must fail");
+    assert_eq!(error, "Rooted facts require rooted snapshot mode.");
+}
+
+#[test]
+fn rooted_facts_are_included_in_raw_chunk_memory_estimates() {
+    let newick = "((A:1,B:2):3,(C:4,D:5):6);";
+    let snapshot = snapshot_of(newick, true);
+    let (facts, _) = rooted_facts_of(newick).unwrap();
+    let ordinary = estimated_raw_snapshot_bytes(&snapshot, None);
+    let with_facts = estimated_raw_snapshot_bytes(&snapshot, Some(&facts));
+
+    assert_eq!(
+        with_facts - ordinary,
+        facts.estimated_heap_bytes(),
+        "chunk sizing must account for every retained raw fact element"
+    );
+    assert!(with_facts > ordinary);
 }
 
 /// A symmetric 4-leaf tree produces a single bipartition after canonicalization.
@@ -800,6 +963,7 @@ fn snaps_opts(newicks: &[&str], rooted: bool, store_lengths: bool) -> Snapshots 
     let retain = Retain {
         lengths: store_lengths,
         bipartitions: true,
+        rooted_facts: false,
     };
     Snapshots::from_newick_iter_opts(newicks.iter().map(|&n| (n, &empty)), rooted, retain).unwrap()
 }

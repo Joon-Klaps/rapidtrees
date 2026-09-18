@@ -1,9 +1,9 @@
 //! Optional per-tree facts needed by rooted summary-tree algorithms.
 //!
 //! This module deliberately sits beside the existing snapshot builder rather
-//! than inside it.  A facts-enabled caller can run this collector while the
-//! parsed [`PhyloTree`] is still alive, then hand the ordinary snapshot to
-//! the unchanged interner.  Existing distance paths do neither the traversal
+//! than inside it. A facts-enabled caller derives the sidecar from the direct
+//! parser's short-lived [`Snapshot`], then hands that ordinary snapshot to the
+//! unchanged interner. Existing distance paths do neither the reconstruction
 //! nor the allocations defined here.
 //!
 //! The collector retains two facts that an RF snapshot does not need:
@@ -12,9 +12,15 @@
 //! the interner, so a later step can resolve them to the IDs already assigned
 //! by the ordinary rooted snapshot path.
 
+use super::build::{Part, Snapshot};
 use super::fingerprint::Fingerprint;
-use phylotree::tree::{Node, Tree as PhyloTree};
-use rustc_hash::FxHashMap;
+
+/// Internal parent ID for the implicit all-taxa root.
+///
+/// Real clade IDs are assigned by the existing `u32` interner.  The exporter
+/// added in the next stage will translate this private sentinel to the public
+/// rooted-clade column sentinel instead of exposing it to Python.
+pub(super) const ROOT_ID: u32 = u32::MAX;
 
 /// A rooted clade on its way to the existing global clade interner.
 ///
@@ -52,12 +58,58 @@ pub(super) struct RawRootedFacts {
     pub(super) splits: Vec<RawSplitFact>,
 }
 
+/// Rooted facts after every non-root clade has been resolved by the existing
+/// global interner.
+///
+/// `node_ids` and `node_heights` are parallel arrays.  Keeping them separate
+/// uses twelve bytes per fact instead of the padding a `(u32, f64)` tuple would
+/// require.  Split triples are `(parent, child_a, child_b)`, with [`ROOT_ID`]
+/// as the parent of the root split.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct InternedRootedFacts {
+    pub(super) node_ids: Vec<u32>,
+    pub(super) node_heights: Vec<f64>,
+    pub(super) root_height: f64,
+    pub(super) splits: Vec<[u32; 3]>,
+}
+
+/// Optional tree-aligned sidecar owned by a completed snapshot collection.
+#[derive(Debug, Default)]
+pub(super) struct RootedFactsStore {
+    pub(super) trees: Vec<InternedRootedFacts>,
+}
+
+impl RootedFactsStore {
+    pub(super) fn with_capacity(n_trees: usize) -> Self {
+        Self {
+            trees: Vec::with_capacity(n_trees),
+        }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.trees.len()
+    }
+
+    pub(super) fn push(&mut self, facts: InternedRootedFacts) {
+        self.trees.push(facts);
+    }
+}
+
 impl RawRootedFacts {
-    /// Collect node heights and observed child splits without recursion.
+    /// Heap bytes retained while this raw fact set waits for interning.
     ///
-    /// `labels` and `leaf_index` must be the run-wide tables also supplied to
-    /// the ordinary rooted snapshot builder.  Reusing them is what makes the
-    /// raw clade references resolvable against that snapshot's interner.
+    /// The chunk-size heuristic intentionally follows the existing snapshot
+    /// estimate and counts element storage rather than small `Vec` headers.
+    pub(super) fn estimated_heap_bytes(&self) -> usize {
+        self.nodes.len() * size_of::<RawNodeFact>() + self.splits.len() * size_of::<RawSplitFact>()
+    }
+
+    /// Collect node heights and observed child splits without reparsing Newick.
+    ///
+    /// In rooted mode, snapshot parts are every non-root node in postorder and
+    /// each subtree occupies a contiguous leaf interval. Those two invariants
+    /// are enough to reconstruct the two children of every internal node and
+    /// the implicit root while the short-lived snapshot is still available.
     ///
     /// Heights follow TreeTracer's existing convention:
     ///
@@ -66,149 +118,131 @@ impl RawRootedFacts {
     /// node_height = root_height - root-to-node distance
     /// ```
     ///
-    /// Every non-root edge must have an explicit finite length, and every
-    /// internal node must have exactly two children.  Finite negative lengths
-    /// are accepted: this collector validates representation and arithmetic,
-    /// not biological plausibility.
-    pub(super) fn from_tree(
-        tree: &PhyloTree,
-        labels: &[Fingerprint],
-        leaf_index: &FxHashMap<&str, usize>,
-    ) -> Result<Self, String> {
-        let root_id = tree
-            .get_root()
-            .map_err(|error| format!("failed to find tree root: {error}"))?;
-
-        // Resolve every node once.  The resulting preorder guarantees that a
-        // parent's distance has been calculated before any of its children.
-        let mut order: Vec<(usize, &Node)> = Vec::with_capacity(tree.size());
-        let mut stack = vec![root_id];
-        while let Some(id) = stack.pop() {
-            let node = tree
-                .get(&id)
-                .map_err(|error| format!("failed to access node {id}: {error}"))?;
-            order.push((id, node));
-            stack.extend(node.children.iter().copied());
+    /// The parser has already required an explicit finite length for every
+    /// non-root edge on this opt-in path. Finite negative lengths remain
+    /// accepted: this collector validates representation and arithmetic, not
+    /// biological plausibility.
+    pub(super) fn from_snapshot(snapshot: &Snapshot) -> Result<Self, String> {
+        let tip_count = snapshot.leaf_order.len();
+        if tip_count == 0 {
+            return Err("tree has no tips".to_string());
         }
 
-        let mut distances = vec![0.0; tree.size()];
-        let mut tip_ids = Vec::with_capacity(leaf_index.len());
+        let expected_nodes = tip_count.saturating_mul(2).saturating_sub(2);
+        let expected_splits = tip_count.saturating_sub(1);
+        if snapshot.parts.len() != expected_nodes {
+            return Err(format!(
+                "strictly binary tree with {tip_count} tips must contain {expected_nodes} non-root nodes; found {}",
+                snapshot.parts.len()
+            ));
+        }
 
-        for &(id, node) in &order {
-            if node.children.is_empty() {
-                tip_ids.push(id);
-                continue;
-            }
-            if node.children.len() != 2 {
+        if tip_count == 1 {
+            return Ok(Self {
+                nodes: Vec::new(),
+                root_height: 0.0,
+                splits: Vec::new(),
+            });
+        }
+
+        let mut links = Vec::with_capacity(snapshot.parts.len());
+        let mut stack: Vec<usize> = Vec::with_capacity(tip_count);
+        for (index, part) in snapshot.parts.iter().enumerate() {
+            validate_interval(part, tip_count, index)?;
+            let children = if part.size == 1 {
+                None
+            } else {
+                let right = stack.pop().ok_or_else(|| {
+                    format!("internal snapshot node {index} is missing its right child")
+                })?;
+                let left = stack.pop().ok_or_else(|| {
+                    format!("internal snapshot node {index} is missing its left child")
+                })?;
+                validate_children(part, &snapshot.parts[left], &snapshot.parts[right], index)?;
+                Some([left, right])
+            };
+            links.push(children);
+            stack.push(index);
+        }
+
+        if stack.len() != 2 {
+            return Err(format!(
+                "root must have exactly two children; found {}",
+                stack.len()
+            ));
+        }
+        let root_children = [stack[0], stack[1]];
+        validate_root_children(snapshot, root_children)?;
+
+        let mut distances = vec![0.0; snapshot.parts.len()];
+        let mut traversal = vec![(root_children[1], 0.0), (root_children[0], 0.0)];
+        let mut root_height: Option<f64> = None;
+        while let Some((index, parent_distance)) = traversal.pop() {
+            let part = &snapshot.parts[index];
+            if !part.length.is_finite() {
                 return Err(format!(
-                    "internal node {id} must have exactly two children; found {}",
-                    node.children.len()
+                    "non-root snapshot node {index} has a non-finite branch length"
                 ));
             }
-
-            for &child_id in &node.children {
-                let child = tree
-                    .get(&child_id)
-                    .map_err(|error| format!("failed to access child node {child_id}: {error}"))?;
-                let length = child.parent_edge.ok_or_else(|| {
-                    format!("non-root node {child_id} is missing an explicit branch length")
-                })?;
-                if !length.is_finite() {
-                    return Err(format!(
-                        "non-root node {child_id} has a non-finite branch length"
-                    ));
+            let distance = parent_distance + part.length;
+            if !distance.is_finite() {
+                return Err(format!(
+                    "non-finite cumulative root distance at snapshot node {index}"
+                ));
+            }
+            distances[index] = distance;
+            match links[index] {
+                Some([left, right]) => {
+                    traversal.push((right, distance));
+                    traversal.push((left, distance));
                 }
-                let distance = distances[id] + length;
-                if !distance.is_finite() {
-                    return Err(format!(
-                        "non-finite cumulative root distance at node {child_id}"
-                    ));
+                None => {
+                    root_height = Some(root_height.map_or(distance, |height| height.max(distance)));
                 }
-                distances[child_id] = distance;
             }
         }
 
-        let root_height = tip_ids
-            .iter()
-            .map(|&id| distances[id])
-            .reduce(f64::max)
-            .ok_or_else(|| "tree has no tips".to_string())?;
+        let root_height = root_height.ok_or_else(|| "tree has no tips".to_string())?;
         if !root_height.is_finite() {
             return Err("calculated a non-finite root height".to_string());
         }
 
-        // The ordinary snapshot arena indexes its accumulator by node ID too;
-        // parsed PhyloTrees use the same dense node-ID invariant here.
-        let mut acc = vec![Acc::default(); tree.size()];
-        for &(id, node) in order.iter().filter(|(_, node)| node.children.is_empty()) {
-            let name = node
-                .name
-                .as_deref()
-                .ok_or_else(|| format!("leaf node {id} is unnamed"))?;
-            let &bit = leaf_index
-                .get(name)
-                .ok_or_else(|| format!("leaf {name:?} is absent from the shared taxon index"))?;
-            let &fingerprint = labels
-                .get(bit)
-                .ok_or_else(|| format!("taxon index {bit} has no fingerprint label"))?;
-            acc[id] = Acc {
-                key: fingerprint,
-                size: 1,
-            };
-        }
-
-        for &(id, node) in order
-            .iter()
-            .rev()
-            .filter(|(_, node)| !node.children.is_empty())
-        {
-            let mut folded = Acc::default();
-            for &child_id in &node.children {
-                folded.key ^= acc[child_id].key;
-                folded.size = folded
-                    .size
-                    .checked_add(acc[child_id].size)
-                    .ok_or_else(|| "tree contains more than u32::MAX tips".to_string())?;
-            }
-            acc[id] = folded;
-        }
-
-        let clade_ref = |id: usize| RawCladeRef {
-            key: acc[id].key,
-            size: acc[id].size,
-        };
-
-        let mut nodes = Vec::with_capacity(order.len().saturating_sub(1));
-        let mut splits = Vec::with_capacity(tip_ids.len().saturating_sub(1));
-        for &(id, node) in &order {
-            let height = root_height - distances[id];
+        let clade_ref = |index: usize| raw_clade(&snapshot.parts[index]);
+        let mut nodes = Vec::with_capacity(expected_nodes);
+        let mut splits = Vec::with_capacity(expected_splits);
+        for (index, part) in snapshot.parts.iter().enumerate() {
+            let height = root_height - distances[index];
             if !height.is_finite() {
-                return Err(format!("calculated a non-finite height at node {id}"));
+                return Err(format!(
+                    "calculated a non-finite height at snapshot node {index}"
+                ));
             }
+            nodes.push(RawNodeFact {
+                clade: raw_clade(part),
+                height,
+            });
 
-            if id != root_id {
-                nodes.push(RawNodeFact {
-                    clade: clade_ref(id),
-                    height,
-                });
-            }
-
-            if !node.children.is_empty() {
-                let mut children = [clade_ref(node.children[0]), clade_ref(node.children[1])];
+            if let Some([left, right]) = links[index] {
+                let mut children = [clade_ref(left), clade_ref(right)];
                 children.sort_unstable();
                 splits.push(RawSplitFact {
-                    parent: (id != root_id).then(|| clade_ref(id)),
+                    parent: Some(raw_clade(part)),
                     children,
                 });
             }
         }
 
-        let expected_nodes = tip_ids.len().saturating_mul(2).saturating_sub(2);
-        let expected_splits = tip_ids.len().saturating_sub(1);
+        let mut root_split_children = [clade_ref(root_children[0]), clade_ref(root_children[1])];
+        root_split_children.sort_unstable();
+        splits.push(RawSplitFact {
+            parent: None,
+            children: root_split_children,
+        });
+
         if nodes.len() != expected_nodes || splits.len() != expected_splits {
             return Err(format!(
                 "strictly binary tree with {} tips must contain {expected_nodes} non-root nodes and {expected_splits} internal splits; found {} and {}",
-                tip_ids.len(),
+                tip_count,
                 nodes.len(),
                 splits.len()
             ));
@@ -222,9 +256,52 @@ impl RawRootedFacts {
     }
 }
 
-/// Per-node postorder accumulator for a rooted descendant set.
-#[derive(Debug, Clone, Copy, Default)]
-struct Acc {
-    key: Fingerprint,
-    size: u32,
+fn raw_clade(part: &Part) -> RawCladeRef {
+    RawCladeRef {
+        key: part.key,
+        size: part.size,
+    }
+}
+
+fn validate_interval(part: &Part, tip_count: usize, index: usize) -> Result<(), String> {
+    let start = part.first as usize;
+    let end = start
+        .checked_add(part.size as usize)
+        .ok_or_else(|| format!("snapshot node {index} has an overflowing leaf interval"))?;
+    if part.size == 0 || end > tip_count {
+        return Err(format!(
+            "snapshot node {index} has invalid leaf interval {start}..{end} for {tip_count} tips"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_children(parent: &Part, left: &Part, right: &Part, index: usize) -> Result<(), String> {
+    let left_end = left.first.checked_add(left.size);
+    let right_end = right.first.checked_add(right.size);
+    let parent_end = parent.first.checked_add(parent.size);
+    if left.first != parent.first
+        || left_end != Some(right.first)
+        || right_end != parent_end
+        || left.key ^ right.key != parent.key
+    {
+        return Err(format!(
+            "internal snapshot node {index} does not contain exactly two contiguous children"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_root_children(snapshot: &Snapshot, children: [usize; 2]) -> Result<(), String> {
+    let left = &snapshot.parts[children[0]];
+    let right = &snapshot.parts[children[1]];
+    let tip_count = u32::try_from(snapshot.leaf_order.len())
+        .map_err(|_| "tree contains more than u32::MAX tips".to_string())?;
+    if left.first != 0
+        || left.first.checked_add(left.size) != Some(right.first)
+        || right.first.checked_add(right.size) != Some(tip_count)
+    {
+        return Err("root children do not cover the complete contiguous leaf order".to_string());
+    }
+    Ok(())
 }

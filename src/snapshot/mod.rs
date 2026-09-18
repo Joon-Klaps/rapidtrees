@@ -34,14 +34,12 @@ mod export;
 mod fingerprint;
 mod intern;
 mod newick;
-// Step 1 introduces the isolated collector; Step 2 wires it into the optional
-// sidecar construction path and removes this temporary module-scoped allowance.
-#[allow(dead_code)]
 mod rooted_facts;
 
 use build::{Part, Snapshot};
 use fingerprint::{build_leaf_index, taxon_labels};
 use intern::Interner;
+use rooted_facts::{RawRootedFacts, RootedFactsStore};
 
 pub(crate) use intern::InternSnap;
 
@@ -72,14 +70,18 @@ pub struct Snapshots {
     pub words_per_bitset: usize,
     /// Alphabetically sorted taxon names shared by all trees in this set.
     pub leaf_names: Vec<String>,
+    /// Optional tree-aligned node heights and directly observed rooted splits.
+    /// Existing distance and snapshot-export paths leave this absent.
+    rooted_facts: Option<RootedFactsStore>,
 }
 
 /// What to keep besides the split IDs themselves.
 ///
-/// Neither is read by the distance kernels, and both cost real work: branch
+/// None is read by the distance kernels, and each costs real work: branch
 /// lengths are `~n_bip × 8` bytes per tree, and materialising a bipartition is
-/// an `O(subtree)` walk per distinct split. A path that computes a matrix and
-/// exports nothing wants both off.
+/// an `O(subtree)` walk per distinct split. Rooted facts add a second linear
+/// tree traversal plus compact per-node storage. A path that computes a matrix
+/// and exports nothing wants all three off.
 #[derive(Debug, Clone, Copy)]
 pub struct Retain {
     /// Per-edge branch lengths. Required by WRF and KF; dead weight for RF.
@@ -87,14 +89,22 @@ pub struct Retain {
     /// The canonical leaf set per distinct split. Required only to export a
     /// bipartition table to Python or to order export columns.
     pub bipartitions: bool,
+    /// Exact node heights and observed child splits for rooted summary trees.
+    /// Existing public constructors and distance APIs deliberately leave this
+    /// off; the dedicated rooted-facts endpoint will opt in.
+    pub rooted_facts: bool,
 }
 
 impl Retain {
-    /// Keep everything — what the public constructors use.
+    /// Keep the pre-existing branch-length and bipartition exports.
+    ///
+    /// Rooted facts are a separate optional feature, so public constructors
+    /// retain their exact historical validation, memory use, and behavior.
     pub fn everything() -> Self {
         Self {
             lengths: true,
             bipartitions: true,
+            rooted_facts: false,
         }
     }
 
@@ -103,6 +113,7 @@ impl Retain {
         Self {
             lengths: weighted,
             bipartitions: false,
+            rooted_facts: false,
         }
     }
 }
@@ -136,9 +147,13 @@ impl Snapshots {
         rooted: bool,
         retain: Retain,
     ) -> Result<Self, String> {
+        if retain.rooted_facts && !rooted {
+            return Err("Rooted facts require rooted snapshot mode.".to_string());
+        }
+
         let entries: Vec<_> = entries.into_iter().collect();
         if entries.is_empty() {
-            return Ok(Self::empty());
+            return Ok(Self::empty(retain.rooted_facts));
         }
 
         // Tree 0 defines the run's taxa, so its names are read first and on
@@ -167,9 +182,11 @@ impl Snapshots {
             labels: &labels,
             total: labels.iter().fold(0, |acc, &label| acc ^ label),
             rooted,
+            require_explicit_lengths: retain.rooted_facts,
         };
 
         let first_snap = newick::snapshot(first_newick, first_translate, 0, &run)?;
+        let first_facts = collect_raw_rooted_facts(&first_snap, 0, retain.rooted_facts)?;
 
         // Bound how many raw snapshots are alive at once. Holding every tree's
         // un-interned parts simultaneously is the dominant memory cost at
@@ -179,8 +196,7 @@ impl Snapshots {
         // to ~`CHUNK_TARGET_BYTES`, and fold each chunk into the interner — freeing
         // its parts — before parsing the next.
         const CHUNK_TARGET_BYTES: usize = 256 * 1024 * 1024;
-        let per_snap_bytes = first_snap.parts.len() * size_of::<Part>()
-            + first_snap.leaf_order.len() * size_of::<u32>();
+        let per_snap_bytes = estimated_raw_snapshot_bytes(&first_snap, first_facts.as_ref());
         let chunk = (CHUNK_TARGET_BYTES / per_snap_bytes.max(1)).clamp(1, 4096);
 
         let mut interner = Interner::new(
@@ -191,22 +207,36 @@ impl Snapshots {
             retain,
         );
         interner.push(first_snap);
+        if let Some(facts) = first_facts {
+            interner
+                .push_rooted_facts(facts)
+                .map_err(|e| format!("Failed to intern rooted facts for tree at index 0: {e}"))?;
+        }
 
         let mut base = 1usize; // tree 0 is already interned
         for chunk_entries in entries[1..].chunks(chunk) {
             // Parse this chunk in parallel, validating leaf sets.
-            let raw: Vec<Snapshot> = chunk_entries
+            let raw: Vec<(Snapshot, Option<RawRootedFacts>)> = chunk_entries
                 .par_iter()
                 .enumerate()
                 .map(|(k, &(newick, translate))| {
-                    newick::snapshot(newick, translate, base + k, &run)
+                    let i = base + k;
+                    let snap = newick::snapshot(newick, translate, i, &run)?;
+                    let facts = collect_raw_rooted_facts(&snap, i, retain.rooted_facts)?;
+                    Ok::<_, String>((snap, facts))
                 })
                 .collect::<Result<_, _>>()?;
 
             // Sequential fold: each raw snapshot is dropped right after it is
             // interned, so peak stays near the deduplicated footprint.
-            for snap in raw {
+            for (offset, (snap, facts)) in raw.into_iter().enumerate() {
                 interner.push(snap);
+                if let Some(facts) = facts {
+                    let i = base + offset;
+                    interner.push_rooted_facts(facts).map_err(|e| {
+                        format!("Failed to intern rooted facts for tree at index {i}: {e}")
+                    })?;
+                }
             }
             base += chunk_entries.len();
         }
@@ -229,6 +259,12 @@ impl Snapshots {
 
     /// Number of trees in this collection.
     pub fn len(&self) -> usize {
+        debug_assert!(
+            self.rooted_facts
+                .as_ref()
+                .is_none_or(|facts| facts.len() == self.snapshots.len()),
+            "rooted facts must stay aligned with snapshot rows"
+        );
         self.snapshots.len()
     }
 
@@ -269,16 +305,44 @@ impl Snapshots {
         crate::distances::distance_kf(self, progress)
     }
 
-    fn empty() -> Self {
+    fn empty(retain_rooted_facts: bool) -> Self {
         Self {
             snapshots: Vec::new(),
             clades: CladeTable::new(),
             split_counts: Vec::new(),
             words_per_bitset: 0,
             leaf_names: Vec::new(),
+            rooted_facts: retain_rooted_facts.then(RootedFactsStore::default),
         }
     }
 }
 
+/// Approximate heap bytes held by one parsed snapshot until it is interned.
+///
+/// The original estimate covers the ordinary snapshot vectors. Optional raw
+/// rooted facts are added only on the facts-enabled path, keeping the existing
+/// chunk sizing unchanged otherwise.
+fn estimated_raw_snapshot_bytes(
+    snapshot: &Snapshot,
+    rooted_facts: Option<&RawRootedFacts>,
+) -> usize {
+    snapshot.parts.len() * size_of::<Part>()
+        + snapshot.leaf_order.len() * size_of::<u32>()
+        + rooted_facts.map_or(0, RawRootedFacts::estimated_heap_bytes)
+}
+
+/// Collect the optional sidecar from the direct parser's rooted snapshot.
+fn collect_raw_rooted_facts(
+    snapshot: &Snapshot,
+    index: usize,
+    retain: bool,
+) -> Result<Option<RawRootedFacts>, String> {
+    if !retain {
+        return Ok(None);
+    }
+    RawRootedFacts::from_snapshot(snapshot)
+        .map(Some)
+        .map_err(|e| format!("Failed to collect rooted facts for tree at index {index}: {e}"))
+}
 #[cfg(test)]
 mod tests;
