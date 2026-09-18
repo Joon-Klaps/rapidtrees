@@ -34,6 +34,10 @@ mod export;
 mod fingerprint;
 mod intern;
 mod newick;
+// Step 1 introduces the isolated collector; Step 2 wires it into the optional
+// sidecar construction path and removes this temporary module-scoped allowance.
+#[allow(dead_code)]
+mod rooted_facts;
 
 use build::{Part, Snapshot};
 use fingerprint::{build_leaf_index, taxon_labels};

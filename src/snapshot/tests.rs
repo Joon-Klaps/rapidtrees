@@ -4,7 +4,9 @@
 //! drive the whole path from newick to interned split IDs, and they share the
 //! `snapshot_of` / `snaps_opts` helpers.
 
+use super::rooted_facts::{RawCladeRef, RawRootedFacts};
 use super::*;
+use crate::snapshot::fingerprint::Fingerprint;
 use std::collections::HashSet;
 
 /// Decode a native-endian `f64` matrix emitted by `build_branch_length_matrix`.
@@ -33,6 +35,135 @@ fn snapshot_of(newick: &str, rooted: bool) -> Snapshot {
         rooted,
     };
     newick::snapshot(newick, &no_translate, 0, &run).unwrap()
+}
+
+/// Collect optional rooted facts directly from one parsed tree.
+fn rooted_facts_of(newick: &str) -> Result<(RawRootedFacts, Vec<Fingerprint>), String> {
+    let tree = PhyloTree::from_newick(newick).map_err(|error| error.to_string())?;
+    let mut names: Vec<String> = tree
+        .get_leaves()
+        .iter()
+        .filter_map(|id| tree.get(id).ok()?.name.clone())
+        .collect();
+    names.sort_unstable();
+    let labels = taxon_labels(names.len());
+    let facts = RawRootedFacts::from_tree(&tree, &labels, &build_leaf_index(&names))?;
+    Ok((facts, labels))
+}
+
+/// The optional collector uses max root-to-tip distance as root height and
+/// retains heights for every exact non-root clade, including singleton tips.
+#[test]
+fn rooted_facts_collect_exact_non_ultrametric_heights() {
+    let (facts, labels) =
+        rooted_facts_of("((A:1,B:2):3,(C:4,D:5):6);").expect("collect rooted facts");
+
+    assert_eq!(facts.root_height, 11.0);
+    assert_eq!(facts.nodes.len(), 6);
+
+    let heights: std::collections::HashMap<Fingerprint, f64> = facts
+        .nodes
+        .iter()
+        .map(|fact| (fact.clade.key, fact.height))
+        .collect();
+    assert_eq!(heights[&labels[0]], 7.0, "A");
+    assert_eq!(heights[&labels[1]], 6.0, "B");
+    assert_eq!(heights[&(labels[0] ^ labels[1])], 8.0, "{{A,B}}");
+    assert_eq!(heights[&labels[2]], 1.0, "C");
+    assert_eq!(heights[&labels[3]], 0.0, "D");
+    assert_eq!(heights[&(labels[2] ^ labels[3])], 5.0, "{{C,D}}");
+}
+
+/// Every emitted split is a parent paired with its two immediate source-tree
+/// children.  The root is represented by `None`, not by a synthetic clade.
+#[test]
+fn rooted_facts_collect_only_directly_observed_splits() {
+    let (facts, labels) =
+        rooted_facts_of("((A:1,B:2):3,(C:4,D:5):6);").expect("collect rooted facts");
+
+    let leaf = |index: usize| RawCladeRef {
+        key: labels[index],
+        size: 1,
+    };
+    let clade = |a: usize, b: usize| RawCladeRef {
+        key: labels[a] ^ labels[b],
+        size: 2,
+    };
+    let pair = |mut children: [RawCladeRef; 2]| {
+        children.sort_unstable();
+        children
+    };
+
+    let expected = HashSet::from([
+        (None, pair([clade(0, 1), clade(2, 3)])),
+        (Some(clade(0, 1)), pair([leaf(0), leaf(1)])),
+        (Some(clade(2, 3)), pair([leaf(2), leaf(3)])),
+    ]);
+    let observed: HashSet<_> = facts
+        .splits
+        .iter()
+        .map(|split| (split.parent, split.children))
+        .collect();
+
+    assert_eq!(observed, expected);
+}
+
+#[test]
+fn rooted_facts_require_explicit_non_root_branch_lengths() {
+    let error = rooted_facts_of("(A:1,B);").expect_err("missing length must fail");
+    assert!(
+        error.contains("missing an explicit branch length"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn rooted_facts_require_strictly_binary_internal_nodes() {
+    let error = rooted_facts_of("(A:1,B:1,C:1);").expect_err("polytomy must fail");
+    assert!(
+        error.contains("must have exactly two children; found 3"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn rooted_facts_reject_non_finite_cumulative_distances() {
+    let error = rooted_facts_of("((A:1e308,B:1e308):1e308,C:1);")
+        .expect_err("overflowed cumulative distance must fail");
+    assert!(
+        error.contains("non-finite cumulative root distance"),
+        "unexpected error: {error}"
+    );
+}
+
+/// Negative lengths are not silently rejected: current TreeTracer ingestion
+/// accepts any finite length and validates only the resulting arithmetic.
+#[test]
+fn rooted_facts_accept_finite_negative_branch_lengths() {
+    let (facts, labels) = rooted_facts_of("(A:-1,B:2);").expect("finite lengths");
+    let heights: std::collections::HashMap<Fingerprint, f64> = facts
+        .nodes
+        .iter()
+        .map(|fact| (fact.clade.key, fact.height))
+        .collect();
+    assert_eq!(facts.root_height, 2.0);
+    assert_eq!(heights[&labels[0]], 3.0);
+    assert_eq!(heights[&labels[1]], 0.0);
+}
+
+/// The facts traversal must not consume call-stack depth on caterpillar trees.
+#[test]
+fn rooted_facts_handle_deep_caterpillar_iteratively() {
+    const LEAVES: usize = 3000;
+    let mut newick = format!("l{}:0.1", LEAVES - 1);
+    for i in (0..LEAVES - 1).rev() {
+        newick = format!("(l{i}:0.1,{newick}):0.1");
+    }
+    newick.push(';');
+
+    let (facts, _) = rooted_facts_of(&newick).expect("collect deep rooted facts");
+    assert_eq!(facts.nodes.len(), 2 * LEAVES - 2);
+    assert_eq!(facts.splits.len(), LEAVES - 1);
 }
 
 /// A symmetric 4-leaf tree produces a single bipartition after canonicalization.
