@@ -33,6 +33,19 @@ pub(crate) struct RootedFactBuffers {
     pub(crate) split_table: Vec<u8>,
 }
 
+/// Compressed sparse-row presence buffers for the general snapshot endpoint.
+///
+/// `row_offsets` is native-endian `u64[T + 1]`; `column_indices` is
+/// native-endian `u32[nnz]`. Each row is sorted and unique in the same stable
+/// public column order used by the dense presence matrix and clade table.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SparseSnapshotBuffers {
+    pub(crate) n_entries: usize,
+    pub(crate) row_offsets: Vec<u8>,
+    pub(crate) column_indices: Vec<u8>,
+}
+
 impl Snapshots {
     /// The one column order every builder here shares, in both directions.
     ///
@@ -85,6 +98,93 @@ impl Snapshots {
             });
 
         (presence, col_to_bip_id)
+    }
+
+    /// Build the presence matrix in compressed sparse-row form.
+    ///
+    /// Returns `(buffers, col_to_bip_id)`. The clade catalog order is exactly
+    /// the same as [`Snapshots::build_presence_matrix`], so expanding each CSR
+    /// row to ones at its `column_indices` reconstructs the dense bytes
+    /// exactly. Unlike the rooted-facts fixed-width rows, CSR also represents
+    /// unrooted and non-binary trees whose row lengths may differ.
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
+    pub(crate) fn build_sparse_presence_matrix(
+        &self,
+    ) -> Result<(SparseSnapshotBuffers, Vec<usize>), String> {
+        let (id_to_col, col_to_bip_id) = self.column_order();
+        if self.clades.len() > u32::MAX as usize {
+            return Err(
+                "sparse snapshots cannot export more than u32::MAX clade columns".to_string(),
+            );
+        }
+
+        let n_entries = self.snapshots.iter().try_fold(0usize, |total, snapshot| {
+            total
+                .checked_add(snapshot.split_ids.len())
+                .ok_or_else(|| "sparse snapshot entry count overflows usize".to_string())
+        })?;
+        let offset_count = self
+            .snapshots
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| "sparse snapshot row-offset count overflows usize".to_string())?;
+        let offset_bytes = offset_count
+            .checked_mul(size_of::<u64>())
+            .ok_or_else(|| "sparse snapshot row-offset buffer size overflows usize".to_string())?;
+        let column_bytes = n_entries
+            .checked_mul(size_of::<u32>())
+            .ok_or_else(|| "sparse snapshot column buffer size overflows usize".to_string())?;
+
+        let mut row_offsets = vec![0u8; offset_bytes];
+        let mut column_indices = vec![0u8; column_bytes];
+        let mut entry_offset = 0usize;
+        let mut row = Vec::new();
+        write_u64(&mut row_offsets, 0, 0);
+
+        for (tree_index, snapshot) in self.snapshots.iter().enumerate() {
+            row.clear();
+            row.reserve(snapshot.split_ids.len());
+            for &split_id in &snapshot.split_ids {
+                let column = *id_to_col.get(split_id as usize).ok_or_else(|| {
+                    format!(
+                        "sparse snapshot row {tree_index} references unknown split ID {split_id}"
+                    )
+                })?;
+                row.push(u32::try_from(column).map_err(|_| {
+                    format!(
+                        "sparse snapshot row {tree_index} contains a column that cannot be represented as uint32"
+                    )
+                })?);
+            }
+            row.sort_unstable();
+            if row.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Err(format!(
+                    "sparse snapshot row {tree_index} contains a duplicate clade column"
+                ));
+            }
+            for (within_row, &column) in row.iter().enumerate() {
+                write_u32(&mut column_indices, entry_offset + within_row, column);
+            }
+            entry_offset = entry_offset
+                .checked_add(snapshot.split_ids.len())
+                .ok_or_else(|| "sparse snapshot entry offset overflows usize".to_string())?;
+            write_u64(
+                &mut row_offsets,
+                tree_index + 1,
+                u64::try_from(entry_offset)
+                    .map_err(|_| "sparse snapshot entry offset overflows uint64".to_string())?,
+            );
+        }
+
+        debug_assert_eq!(entry_offset, n_entries);
+        Ok((
+            SparseSnapshotBuffers {
+                n_entries,
+                row_offsets,
+                column_indices,
+            },
+            col_to_bip_id,
+        ))
     }
 
     /// Export the optional rooted-tree sidecar on stable public clade columns.
@@ -446,6 +546,11 @@ fn exported_column(
 fn write_u32(bytes: &mut [u8], index: usize, value: u32) {
     let start = index * size_of::<u32>();
     bytes[start..start + size_of::<u32>()].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn write_u64(bytes: &mut [u8], index: usize, value: u64) {
+    let start = index * size_of::<u64>();
+    bytes[start..start + size_of::<u64>()].copy_from_slice(&value.to_ne_bytes());
 }
 
 fn write_f64(bytes: &mut [u8], index: usize, value: f64) {

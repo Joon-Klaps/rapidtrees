@@ -38,6 +38,15 @@ type PyRootedFactResult = (
     Py<PyAny>,
 );
 
+type PySparseSnapshotResult = (
+    Vec<String>,
+    Py<PyAny>,
+    Vec<String>,
+    usize,
+    Py<PyAny>,
+    Py<PyAny>,
+);
+
 /// The tree source as handed in from Python: the newicks, how to rename their
 /// taxa, and whether to compare clades or bipartitions.
 ///
@@ -343,6 +352,110 @@ fn pairwise_rf_with_snapshots_from_newick_iter(
         n_bipartitions,
         py_pres.into(),
         py_bip.into(),
+    ))
+}
+
+/// Compute RF distances and export snapshots in compressed sparse-row form.
+///
+/// This is the compact counterpart of
+/// ``pairwise_rf_with_snapshots_from_newick_iter``. RF distances and clade
+/// bitmasks are byte-identical to that endpoint for the same inputs, but the
+/// dense ``uint8[T, C]`` presence matrix is replaced by a versioned CSR
+/// dictionary:
+///
+/// ```python
+/// {
+///     "format_version": 1,
+///     "encoding": "csr",
+///     "n_entries": nnz,
+///     "row_offsets": bytes,     # native-endian uint64[T + 1]
+///     "column_indices": bytes,  # native-endian uint32[nnz]
+/// }
+/// ```
+///
+/// Row ``i`` occupies
+/// ``column_indices[row_offsets[i]:row_offsets[i + 1]]``. Every row is sorted
+/// and unique, and its values directly index the accompanying clade bitmasks.
+/// Writing ``1`` at those columns reconstructs the established dense presence
+/// row exactly. CSR supports both rooting modes and variable-width trees.
+///
+/// Args:
+///     names: Tree identifiers (one per newick).
+///     newick_iter: Python iterator yielding newick strings.
+///     translate_maps: List of translate maps (number → taxon name).
+///     map_indices: Per-tree index into translate_maps.
+///     rooted: If True compare clades; if False compare bipartitions (default: False).
+///     progress: Optional ``rapidtrees.ProgressCounter`` whose ``.value()`` /
+///         ``.total()`` / ``.fraction()`` reflect live RF progress. See
+///         ``pairwise_rf_from_newick_iter`` for details.
+///
+/// Returns:
+///     6-tuple ``(tree_names, rf_matrix_bytes, leaf_names, n_clades,
+///     clade_bytes, sparse_snapshot)``.
+///
+/// Raises:
+///     ValueError: If fewer than 2 trees, leaf sets differ, argument lengths
+///         mismatch, or the sparse buffers cannot represent the input size.
+#[pyfunction]
+#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false, progress=None))]
+fn pairwise_rf_with_sparse_snapshots_from_newick_iter(
+    py: Python<'_>,
+    names: Vec<String>,
+    newick_iter: Bound<'_, PyIterator>,
+    translate_maps: Vec<HashMap<String, String>>,
+    map_indices: Vec<usize>,
+    rooted: bool,
+    progress: Option<Py<ProgressCounter>>,
+) -> PyResult<PySparseSnapshotResult> {
+    validate_iter_args(&names, &map_indices, &translate_maps)?;
+
+    let input = IterInput {
+        newick_iter,
+        translate_maps: &translate_maps,
+        map_indices: &map_indices,
+        rooted,
+    };
+    let snaps = collect_snapshots_from_iter(
+        input,
+        Retain {
+            lengths: false,
+            bipartitions: true,
+            rooted_facts: false,
+        },
+    )?;
+
+    let n = snaps.len();
+    let rf_matrix = with_counter(py, progress, n_pairs(n), |counter| {
+        snaps.pairwise_rf(Some(counter))
+    })?;
+    let rf_bytes: Vec<u8> = rf_matrix
+        .chunks(n)
+        .flat_map(|row| row.iter().flat_map(|&value| value.to_ne_bytes()))
+        .collect();
+    drop(rf_matrix);
+
+    let n_clades = snaps.n_distinct_splits();
+    let (sparse, col_to_bip_id) = snaps
+        .build_sparse_presence_matrix()
+        .map_err(PyValueError::new_err)?;
+    let leaf_names = snaps.leaf_names.clone();
+    let clade_bytes = snaps.build_bipartition_bytes(&col_to_bip_id);
+    drop(snaps);
+
+    let sparse_dict = PyDict::new(py);
+    sparse_dict.set_item("format_version", 1u8)?;
+    sparse_dict.set_item("encoding", "csr")?;
+    sparse_dict.set_item("n_entries", sparse.n_entries)?;
+    sparse_dict.set_item("row_offsets", PyBytes::new(py, &sparse.row_offsets))?;
+    sparse_dict.set_item("column_indices", PyBytes::new(py, &sparse.column_indices))?;
+
+    Ok((
+        names,
+        PyBytes::new(py, &rf_bytes).into(),
+        leaf_names,
+        n_clades,
+        PyBytes::new(py, &clade_bytes).into(),
+        sparse_dict.into_any().unbind(),
     ))
 }
 
@@ -690,6 +803,10 @@ fn rapidtrees(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pairwise_rf_from_newick_iter, m)?)?;
     m.add_function(wrap_pyfunction!(
         pairwise_rf_with_snapshots_from_newick_iter,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        pairwise_rf_with_sparse_snapshots_from_newick_iter,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
@@ -1116,3 +1233,5 @@ mod py_integration_tests {
 
 #[cfg(test)]
 mod rooted_facts_tests;
+#[cfg(test)]
+mod sparse_snapshot_tests;

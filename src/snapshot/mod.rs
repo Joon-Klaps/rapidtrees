@@ -356,4 +356,6 @@ fn collect_raw_rooted_facts(
 #[cfg(test)]
 mod rooted_facts_tests;
 #[cfg(test)]
+mod sparse_snapshot_tests;
+#[cfg(test)]
 mod tests;
