@@ -1,9 +1,10 @@
 # Python API reference
 
-`rapidtrees` exposes six functions from its Rust core via PyO3. All accept a
-Python **iterator** of newick strings, which lets the library stream through
-arbitrarily large tree files without materialising all strings in memory at
-once.
+`rapidtrees` exposes iterator-based functions from its Rust core via PyO3. They
+accept a Python **iterator** of newick strings, which lets callers stream source
+text rather than materialising every input string solely for ingestion.
+Returned distance and snapshot buffers still scale with the numbers of trees
+and clades.
 
 > **On exactness.** Splits are identified by a 128-bit fingerprint rather than
 > by comparing leaf sets — that is what keeps building a tree linear in its
@@ -23,12 +24,14 @@ once.
 | --- | --- |
 | `pairwise_rf_from_newick_iter` | `(names, bytes)` — RF matrix as flat `uint32` bytes, row-major |
 | `pairwise_rf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, bytes)` — RF matrix + bipartition presence matrix + bipartition clade bitmasks |
+| `pairwise_rf_with_sparse_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, sparse)` — RF matrix + clade bitmasks + CSR presence rows |
+| `pairwise_rf_with_rooted_facts_from_newick_iter` | `(names, bytes, leaf_names, n_clades, bytes, facts)` — rooted RF + compact MrHIPSTR facts |
 | `pairwise_wrf_from_newick_iter` | `(names, list[float])` — Weighted RF, flat row-major |
 | `pairwise_wrf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, bytes)` — wRF matrix + branch-length matrix + bipartition clade bitmasks |
 | `pairwise_kf_from_newick_iter` | `(names, list[float])` — Kuhner-Felsenstein, flat row-major |
 | `pairwise_kf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, bytes)` — KF matrix + branch-length matrix + bipartition clade bitmasks |
 
-All six share the same call signature:
+All general RF/WRF/KF endpoints share this call signature:
 
 ```python
 func(
@@ -38,6 +41,19 @@ func(
     map_indices,      # list[int]            — which translate map applies to each tree
     rooted=False,     # bool                 — compare clades (True) or bipartitions (False)
     progress=None,    # ProgressCounter | None — see "Progress reporting" below
+)
+```
+
+`pairwise_rf_with_rooted_facts_from_newick_iter` is rooted by definition and
+therefore omits the `rooted` argument:
+
+```python
+pairwise_rf_with_rooted_facts_from_newick_iter(
+    names,
+    newick_iter,
+    translate_maps,
+    map_indices,
+    progress=None,
 )
 ```
 
@@ -101,16 +117,23 @@ Notes:
 | `pairwise_wrf_from_newick_iter` | `list[float]` — flat, row-major | `np.array(lst, dtype=np.float64).reshape(n, n)` |
 | `pairwise_kf_from_newick_iter` | `list[float]` — flat, row-major | `np.array(lst, dtype=np.float64).reshape(n, n)` |
 | `pairwise_rf_with_snapshots_from_newick_iter` | 6-tuple — see below | see below |
+| `pairwise_rf_with_sparse_snapshots_from_newick_iter` | 6-tuple — see below | see below |
+| `pairwise_rf_with_rooted_facts_from_newick_iter` | 6-tuple — see below | see below |
 | `pairwise_wrf_with_snapshots_from_newick_iter` | 6-tuple — see below | see below |
 | `pairwise_kf_with_snapshots_from_newick_iter` | 6-tuple — see below | see below |
 
 ### Errors raised
 
 All functions raise `ValueError` when:
+
 - Fewer than 2 trees are provided
 - `len(names) != len(map_indices)`
 - A `map_indices` value is out of bounds
 - Trees have different leaf sets
+
+The rooted-facts endpoint additionally raises `ValueError` when a tree is not
+strictly binary, a non-root edge lacks an explicit finite branch length, or a
+cumulative root distance or calculated height is non-finite.
 
 ---
 
@@ -257,6 +280,55 @@ The presence matrix entry `presence[i, j]` is `1` if edge `j` appears in tree
 `i`, otherwise `0`. Column order is deterministic and stable across calls on
 the same tree set, so the same trees always give the same column indices.
 
+### RF + sparse snapshot in one pass
+
+`pairwise_rf_with_sparse_snapshots_from_newick_iter` returns the same RF bytes,
+leaf names, clade count, and clade bitmasks as the dense endpoint, replacing
+`presence_bytes` with a versioned CSR dictionary:
+
+```text
+(tree_names, rf_bytes, leaf_names, n_bip, bipartition_clade_bytes, sparse)
+```
+
+```python
+(
+    tree_names, rf_bytes, leaf_names, n_bip,
+    bipartition_clade_bytes, sparse,
+) = rtd.pairwise_rf_with_sparse_snapshots_from_newick_iter(
+    names,
+    iter(newicks),
+    translate_maps,
+    map_indices,
+    rooted=True,
+)
+
+assert sparse["format_version"] == 1
+assert sparse["encoding"] == "csr"
+offsets = np.frombuffer(sparse["row_offsets"], dtype=np.uint64)
+columns = np.frombuffer(sparse["column_indices"], dtype=np.uint32)
+
+# Sorted, unique clade columns present in tree i.
+i = 0
+row = columns[offsets[i]:offsets[i + 1]]
+
+# Count source-tree occurrences of every clade without a dense matrix.
+counts = np.bincount(columns, minlength=n_bip)
+```
+
+The payload fields are:
+
+| Key | Type | Description |
+| --- | --- | --- |
+| `format_version` | `int` | Currently `1` |
+| `encoding` | `str` | Currently `"csr"` |
+| `n_entries` | `int` | Number of stored tree–clade incidences (`nnz`) |
+| `row_offsets` | `bytes` | Native-endian `uint64`, shape `(n_trees + 1,)` |
+| `column_indices` | `bytes` | Native-endian `uint32`, shape `(n_entries,)` |
+
+Each row is sorted and unique. Expanding it to ones at the listed columns
+reconstructs the dense endpoint byte-for-byte. CSR supports both rooting modes
+and variable-width rows from non-binary trees.
+
 #### Edge table contents
 
 `n_bip` counts **all** edges: pendant (leaf) edges and internal bipartitions.
@@ -344,6 +416,91 @@ col_labels = [
 df = pd.DataFrame(presence, index=tree_names, columns=col_labels)
 # e.g.  col "C|D|E" == 1 means the split {C,D,E}|rest is present in that tree
 ```
+
+---
+
+### RF + rooted facts in one pass
+
+`pairwise_rf_with_rooted_facts_from_newick_iter` exports the compact rooted
+facts needed by MrHIPSTR-style consumers without reparsing Newick in Python.
+It returns rooted RF distances, the same deterministic clade catalog used by
+the rooted dense-snapshot endpoint, sparse source-tree clade columns, aligned
+node heights, and directly observed binary splits:
+
+```text
+(tree_names, rf_bytes, leaf_names, n_clades, clade_bytes, facts)
+```
+
+```python
+(
+    tree_names, rf_bytes, leaf_names, n_clades,
+    clade_bytes, facts,
+) = rtd.pairwise_rf_with_rooted_facts_from_newick_iter(
+    names,
+    iter(newicks),
+    translate_maps,
+    map_indices,
+)
+
+assert facts["format_version"] == 2
+n_trees = len(tree_names)
+
+clade_columns = np.frombuffer(
+    facts["clade_columns"], dtype=np.uint32
+).reshape(n_trees, facts["nodes_per_tree"])
+node_heights = np.frombuffer(
+    facts["node_heights"], dtype=np.float64
+).reshape(clade_columns.shape)
+root_heights = np.frombuffer(facts["root_heights"], dtype=np.float64)
+split_ids = np.frombuffer(
+    facts["split_ids"], dtype=np.uint32
+).reshape(n_trees, facts["splits_per_tree"])
+split_table = np.frombuffer(
+    facts["split_table"], dtype=np.uint32
+).reshape(facts["n_observed_splits"], 3)
+observed_splits = split_table[split_ids]
+
+# Source-tree occurrence count for every exported clade.
+clade_counts = np.bincount(clade_columns.ravel(), minlength=n_clades)
+```
+
+The facts dictionary contains native-endian buffers:
+
+| Key | Type | Description |
+| --- | --- | --- |
+| `format_version` | `int` | Currently `2` |
+| `root_column` | `int` | Root sentinel; always equal to `n_clades` |
+| `nodes_per_tree` | `int` | Non-root nodes per binary tree: `2 * n_leaves - 2` |
+| `splits_per_tree` | `int` | Directly observed internal splits per tree: `n_leaves - 1` |
+| `n_observed_splits` | `int` | Number of distinct rows in `split_table` |
+| `clade_columns` | `bytes` | `uint32`, shape `(n_trees, nodes_per_tree)` |
+| `node_heights` | `bytes` | `float64`, aligned with `clade_columns` |
+| `root_heights` | `bytes` | `float64`, shape `(n_trees,)` |
+| `split_ids` | `bytes` | `uint32`, shape `(n_trees, splits_per_tree)` |
+| `split_table` | `bytes` | `uint32`, shape `(n_observed_splits, 3)` |
+
+Each `clade_columns` row is sorted and unique and lists exactly the non-root
+clades present in that source tree. Writing ones at those columns reconstructs
+the corresponding rooted dense-presence row. `node_heights` is aligned
+element-for-element with it, including singleton tips. `root_heights` stores
+the implicit all-taxa root separately.
+
+Rows of `split_table` are `(parent, left_child, right_child)` column triples.
+Non-root values index `clade_bytes`; `root_column == n_clades` is used only as
+a parent. Children are ordered by clade column, and `split_ids` maps each source
+tree to only the splits directly observed in that tree.
+
+Heights support ultrametric and non-ultrametric input and are calculated as:
+
+```text
+root_distance(root) = 0
+root_distance(child) = root_distance(parent) + branch_length(child)
+root_height = max(root_distance(tip))
+node_height(node) = root_height - root_distance(node)
+```
+
+The endpoint requires strictly binary rooted trees and an explicit finite
+branch length on every non-root edge. It has no `rooted` argument.
 
 ---
 

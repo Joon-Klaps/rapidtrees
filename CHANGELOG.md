@@ -10,6 +10,9 @@ This project uses release names based on random words from [codenamegenerator.co
 
 ## [UNRELEASED] - MICROSOFT_COORPERATION SNAKE (YYYY-MM-DD)
 
+- **Python API (rooted facts):** Added `pairwise_rf_with_rooted_facts_from_newick_iter`, which exports rooted RF distances, stable clade columns, aligned node heights, and deduplicated directly observed `(parent, left, right)` splits in one parse. The optional rooted-facts sidecar leaves existing endpoints unchanged.
+- **Python API (sparse snapshots):** Added `pairwise_rf_with_sparse_snapshots_from_newick_iter`, which replaces the dense tree-by-clade presence matrix with versioned CSR `row_offsets` and `column_indices` buffers while preserving the established RF bytes, clade catalog, deterministic column order, and support for rooted, unrooted, binary, and non-binary trees.
+
 ## [0.10.0] - Surface Copperhead (2026-09-24)
 
 - ([#29](https://github.com/Joon-Klaps/rapidtrees/pull/29)) - __FEATURE__ __BREAKING API CHANGE__: `load_beast_trees` takes an optional `Retain` argument saying whether branch lengths and bipartitions need to be kept.
@@ -132,4 +135,3 @@ Initial release with basic functionality for computing phylogenetic tree distanc
 - Kuhner-Felsenstein distance
 - BEAST/NEXUS file format support
 - Python API via maturin
-
