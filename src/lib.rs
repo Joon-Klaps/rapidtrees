@@ -23,4 +23,4 @@ pub(crate) mod progress;
 pub use bitset::Bitset;
 #[cfg(feature = "cli")]
 pub use io::write_matrix_tsv;
-pub use snapshot::Snapshots;
+pub use snapshot::{Retain, Snapshots};

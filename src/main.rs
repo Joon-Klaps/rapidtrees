@@ -1,5 +1,6 @@
 use clap::{Parser, ValueEnum};
-use rapidtrees::io::{load_beast_trees, load_snapshots, write_matrix_tsv, write_snap};
+use rapidtrees::io::{load_beast_trees, write_matrix_tsv};
+use rapidtrees::{Backend, Kernel, Retain};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -86,6 +87,7 @@ fn main() {
     let t_total = Instant::now();
     let t = Instant::now();
 
+<<<<<<< Updated upstream
     let (names, interned) = match &args.snap_input {
         Some(path) => load_snapshots(path).unwrap_or_else(|e| {
             eprintln!("Failed to load trees: {e}");
@@ -99,6 +101,24 @@ fn main() {
             args.rooted,
         ),
     };
+||||||| Stash base
+    let (names, interned) = load_beast_trees(
+        &args.input,
+        args.burnin_trees,
+        args.burnin_states,
+        args.use_real_taxa,
+        args.rooted,
+    );
+=======
+    let (names, interned) = load_beast_trees(
+        &args.input,
+        args.burnin_trees,
+        args.burnin_states,
+        args.use_real_taxa,
+        args.rooted,
+        Retain::for_distances(args.metric != MetricArg::Rf),
+    );
+>>>>>>> Stashed changes
 
     log_if(
         quiet,
