@@ -58,10 +58,11 @@ docs/
    is not a `rapidtrees` concern. MCMC diagnostics — log densities, chain
    splitting, burnin, subsampling — are the browser's, which is why BEAST
    *header* semantics live there while NEXUS *primitives* (`parse_taxon_block`,
-   `extract_name_state`, `strip_beast_annotations`, `rename_leaf_nodes`) stay
-   here and are `pub` for it to build on.
+   `extract_name_state`, `strip_beast_annotations`) stay here and are `pub` for
+   it to build on. `rename_leaf_nodes` was removed with the Newick reader: it
+   took a phylotree `Tree`, and rapidtrees no longer parses into one.
 4. **Anything `pub` in `io.rs` is treetracer-web's API.** Changing one of those
-   four signatures breaks that repo's build with no compiler to warn you, since
+   three signatures breaks that repo's build with no compiler to warn you, since
    it is a git dependency rather than a workspace member. Treat them as
    published surface.
 

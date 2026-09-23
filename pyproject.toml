@@ -49,6 +49,9 @@ prek = "*"
 [tool.pixi.pypi-dependencies]
 rapidtrees = { path = ".", editable = true }
 
+[tool.pixi.target.osx-arm64.activation.env]
+CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER = "/usr/bin/cc"
+
 [tool.pixi.feature.py310.dependencies]
 python = "3.10.*"
 

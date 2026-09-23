@@ -18,18 +18,21 @@ fn decode_f64(bytes: &[u8]) -> Vec<f64> {
         .collect()
 }
 
-/// Build one snapshot with a fresh label table — the interner is not
-/// involved, so any consistent labels will do.
+/// Read one tree on its own, with the run tables its own taxa give, as tree 0
+/// of a run is read. The interner is not involved.
 fn snapshot_of(newick: &str, rooted: bool) -> Snapshot {
-    let tree = PhyloTree::from_newick(newick).unwrap();
-    let mut names: Vec<String> = tree
-        .get_leaves()
-        .iter()
-        .filter_map(|id| tree.get(id).ok()?.name.clone())
-        .collect();
+    let no_translate = HashMap::new();
+    let mut names = newick::leaf_names(newick, &no_translate).unwrap();
     names.sort_unstable();
     let labels = taxon_labels(names.len());
-    Snapshot::from_tree(&tree, rooted, &labels, &build_leaf_index(&names)).unwrap()
+    let leaf_index = build_leaf_index(&names);
+    let run = newick::RunTables {
+        leaf_index: &leaf_index,
+        labels: &labels,
+        total: labels.iter().fold(0, |acc, &label| acc ^ label),
+        rooted,
+    };
+    newick::snapshot(newick, &no_translate, 0, &run).unwrap()
 }
 
 /// A symmetric 4-leaf tree produces a single bipartition after canonicalization.
@@ -86,7 +89,7 @@ fn test_materialised_side_excludes_leaf_zero() {
     assert_eq!(internal[0], &[2, 3], "the {{C,D}} side");
 }
 
-/// Test that from_tree deduplicates root bipartitions in rooted binary trees.
+/// The reader deduplicates the root bipartition of a rooted binary tree.
 ///
 /// In a rooted binary tree ((A,B),(C,D)), both root children produce the
 /// same canonical bipartition ({C,D}|{A,B}).  Without deduplication, this
@@ -836,4 +839,417 @@ fn populated_collection_is_not_empty() {
     let snaps = Snapshots::from_newicks(&["(A:1,(B:1,C:1):1);"], false).unwrap();
     assert!(!snaps.is_empty());
     assert_eq!(snaps.len(), 1);
+}
+
+// ─── the Newick reader ──────────────────────────────────────────────────────
+
+/// One split as the tests compare it: key, canonical leaf set and length.
+type Fact = (fingerprint::Fingerprint, Vec<u32>, f64);
+
+/// Put facts in one order. The reader emits parts in post-order, so only the
+/// set of them can be compared. Length breaks ties: rooted mode keeps a unary
+/// node and its child as two parts with one key and one leaf set.
+fn sort_facts(facts: &mut [Fact]) {
+    facts.sort_unstable_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)).then(a.2.total_cmp(&b.2)));
+}
+
+/// One tree's parts as order-free facts.
+fn part_facts(snap: &Snapshot, rooted: bool) -> Vec<Fact> {
+    let mut facts: Vec<Fact> = snap
+        .parts
+        .iter()
+        .map(|part| {
+            let mut table = CladeTable::new();
+            snap.push_canonical(part, rooted, &mut table);
+            (part.key, table.get(0).to_vec(), part.length)
+        })
+        .collect();
+    sort_facts(&mut facts);
+    facts
+}
+
+/// Each pair must read as the same parts: the first is the second with
+/// something added that does not change the tree.
+#[test]
+fn reader_ignores_what_does_not_change_the_tree() {
+    // Neither mode reads annotations, the rooted-tree flag, internal labels,
+    // support values, blank space or a stray ']', and a missing length is 0,
+    // whether the ':' is left out or left empty.
+    for (text, plain) in [
+        (
+            "[&R] ((A[&rate=0.5]:1,B[&rate=0.3]:2)[&posterior=1.0]:1,(C:1,D:1):1);",
+            "((A:1,B:2):1,(C:1,D:1):1);",
+        ),
+        // BEAST writes its annotation between the colon and the number.
+        (
+            "((A:[&rate=0.5]1,B:[&rate=0.3] 2):[&rate=1,posterior=1.0]0.5,(C:1,D:[&x]4):1);",
+            "((A:1,B:2):0.5,(C:1,D:4):1);",
+        ),
+        (
+            "((A:1,B:1)0.95:1,(C:1,D:1)label:1,E:1);",
+            "((A:1,B:1):1,(C:1,D:1):1,E:1);",
+        ),
+        (
+            "( ( A : 1 , B:1 ) : 1 ,\n C : 1 ,\t D:1 ) ;",
+            "((A:1,B:1):1,C:1,D:1);",
+        ),
+        (
+            "((A,B),(C:1e-3,D:2.5E2));",
+            "((A:0,B:0):0,(C:0.001,D:250):0);",
+        ),
+        (
+            "((A:,B:2):,(C:1,D: [&x] ):1);",
+            "((A:0,B:2):0,(C:1,D:0):1);",
+        ),
+        ("((A]:1,B:2):1,(C:1,D:1)]:1);", "((A:1,B:2):1,(C:1,D:1):1);"),
+    ] {
+        for rooted in [false, true] {
+            assert_eq!(
+                part_facts(&snapshot_of(text, rooted), rooted),
+                part_facts(&snapshot_of(plain, rooted), rooted),
+                "{text} (rooted: {rooted})"
+            );
+        }
+    }
+
+    // Unrooted, a bifurcating root's two edges are one edge, a unary node's
+    // edge joins the edge below it, and the other side of a pendant edge is
+    // no split at all.
+    for (text, plain) in [
+        (
+            "((A:1,B:2):0.5,(C:3,D:4):0.25);",
+            "(A:1,B:2,(C:3,D:4):0.75);",
+        ),
+        ("(((A:1,B:1):1):2,C:1,D:1);", "((A:1,B:1):3,C:1,D:1);"),
+        ("((A:1,B:1):1,((C:1,D:1):1):1);", "(A:1,B:1,(C:1,D:1):3);"),
+        ("(A:1,(B:1,(C:1,D:1):1):1);", "(A:1,B:1,(C:1,D:1):1);"),
+    ] {
+        assert_eq!(
+            part_facts(&snapshot_of(text, false), false),
+            part_facts(&snapshot_of(plain, false), false),
+            "{text}"
+        );
+    }
+}
+
+/// A double-quoted name is kept whole: quotes, blank space and commas included.
+/// Blank space outside the quotes is dropped, as phylotree dropped it.
+#[test]
+fn reader_keeps_double_quoted_names_whole() {
+    let names = newick::leaf_names(
+        "((\"A B\":1,\"C,D\":1):1,E F:1,G \"H I\":1);",
+        &HashMap::new(),
+    )
+    .unwrap();
+    assert_eq!(names, ["\"A B\"", "\"C,D\"", "EF", "G\"H I\""]);
+}
+
+/// Malformed input fails with the offending tree's index, and never panics.
+#[test]
+fn reader_rejects_malformed_trees() {
+    const REF: &str = "((A:1,B:1):1,(C:1,D:1):1);";
+    for bad in [
+        "((A:1,B:1):1,(C:1,D:1):1)",  // no ';'
+        "((A:1,B:1):1,(C:1,D:1):1;",  // a '(' never closed
+        "(A:1,B:1)):1,(C:1,D:1):1);", // a ')' with nothing open
+        "((A:x,B:1):1,(C:1,D:1):1);", // not a number
+        "((A:1,B:1)[never closed,(C:1,D:1):1);",
+        "((A:[&rate=1,B:1):1,(C:1,D:1):1);", // a '[' after ':' never closed
+        "((A:1,B:1):1,(,C:1):1);",           // an anonymous leaf
+        "((A:1,B:1):1(C:1,D:1):1);",         // no ',' between siblings
+        "((A:1,\"B:1):1,(C:1,D:1):1);",      // a '\"' never closed
+        "A:1,B:1,C:1,D:1;",                  // siblings with no parent
+        ";",
+    ] {
+        let err = Snapshots::from_newicks(&[REF, bad], false)
+            .err()
+            .unwrap_or_else(|| panic!("{bad} must be rejected"));
+        assert!(
+            err.contains("index 1") || err.contains("Tree 1"),
+            "{bad}: {err}"
+        );
+    }
+}
+
+/// A small LCG, so the decorated trees below are the same on every run.
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0 >> 11
+    }
+
+    fn below(&mut self, k: usize) -> usize {
+        self.next() as usize % k
+    }
+
+    fn pick<'a>(&mut self, options: &[&'a str]) -> &'a str {
+        options[self.below(options.len())]
+    }
+}
+
+/// Every edge of a tree, as the leaf set it cuts off and its length.
+type Edges = Vec<(Vec<u32>, f64)>;
+
+/// An edge as a real file might write it: an optional BEAST annotation after
+/// the node, then an optional length in one of several spellings, with the
+/// annotation BEAST puts between the colon and the number. Returns the text
+/// and the length it stands for.
+fn decorated_edge(rng: &mut Lcg) -> (String, f64) {
+    const SPACE: [&str; 5] = ["", "", " ", "\n", "\t "];
+    let mut edge = String::new();
+    if rng.below(3) == 0 {
+        edge.push_str("[&rate=0.5,height_95%_HPD={1.0,2.5}]");
+    }
+    if rng.below(5) == 0 {
+        return (edge, 0.0);
+    }
+    edge.push_str(rng.pick(&SPACE));
+    edge.push(':');
+    edge.push_str(rng.pick(&SPACE));
+    if rng.below(2) == 0 {
+        edge.push_str("[&rate=1.25]");
+        edge.push_str(rng.pick(&SPACE));
+    }
+    let x = rng.next() as f64 / (1u64 << 53) as f64;
+    let number = match rng.below(4) {
+        0 => format!("{x:.6}"),
+        1 => format!("{:e}", x * 1e-3),
+        2 => format!("{}", rng.below(20)),
+        _ => format!("{:.3E}", x * 40.0),
+    };
+    edge.push_str(&number);
+    (edge, number.parse().unwrap())
+}
+
+/// A subtree as the generator builds it: its text, its leaves, and every edge
+/// in it, its own included.
+struct Subtree {
+    text: String,
+    leaves: Vec<u32>,
+    edges: Edges,
+}
+
+impl Subtree {
+    /// Taxon `i` is named `T{i:03}`, so sorting the names keeps `i` as its bit.
+    fn leaf(taxon: u32, rng: &mut Lcg) -> Self {
+        let (edge, length) = decorated_edge(rng);
+        Subtree {
+            text: format!("T{taxon:03}{edge}"),
+            leaves: vec![taxon],
+            edges: vec![(vec![taxon], length)],
+        }
+    }
+
+    /// A node over `children`, written with `sep` between them and `label`
+    /// after the `)`.
+    fn node(children: Vec<Subtree>, sep: &str, label: &str, rng: &mut Lcg) -> Self {
+        let (edge, length) = decorated_edge(rng);
+        let texts: Vec<&str> = children.iter().map(|c| c.text.as_str()).collect();
+        let text = format!("({}){label}{edge}", texts.join(sep));
+        let mut leaves: Vec<u32> = children.iter().flat_map(|c| c.leaves.clone()).collect();
+        leaves.sort_unstable();
+        let mut edges: Edges = children.into_iter().flat_map(|c| c.edges).collect();
+        edges.push((leaves.clone(), length));
+        Subtree {
+            text,
+            leaves,
+            edges,
+        }
+    }
+}
+
+/// A random tree over `n` taxa, dressed the way real files are: polytomies,
+/// the odd unary node, support values on internal nodes, annotations and blank
+/// space. Returns the text and the edges it was built from.
+fn decorated_tree(n: usize, rng: &mut Lcg) -> (String, Edges) {
+    const SPACE: [&str; 5] = ["", "", " ", "\n", "  "];
+    let mut subtrees: Vec<Subtree> = (0..n as u32).map(|i| Subtree::leaf(i, rng)).collect();
+    while subtrees.len() > 4 {
+        let arity = 2 + rng.below(3).min(subtrees.len() - 4);
+        let children = (0..arity)
+            .map(|_| subtrees.swap_remove(rng.below(subtrees.len())))
+            .collect();
+        let sep = format!(",{}", rng.pick(&SPACE));
+        let label = rng.pick(&["", "", "0.97", "100", "clade_x"]);
+        let mut node = Subtree::node(children, &sep, label, rng);
+        if rng.below(12) == 0 {
+            node = Subtree::node(vec![node], "", "", rng);
+        }
+        subtrees.push(node);
+    }
+    // Two, three or four children at the root.
+    let keep = 2 + rng.below(3);
+    while subtrees.len() > keep {
+        let a = subtrees.swap_remove(rng.below(subtrees.len()));
+        let b = subtrees.swap_remove(rng.below(subtrees.len()));
+        subtrees.push(Subtree::node(vec![a, b], ",", "", rng));
+    }
+    let prefix = rng.pick(&["", "[&R] ", "[&U]"]);
+    let texts: Vec<&str> = subtrees.iter().map(|s| s.text.as_str()).collect();
+    let newick = format!("{prefix}({}){};", texts.join(", "), rng.pick(&["", ":0.0"]));
+    let edges = subtrees.into_iter().flat_map(|s| s.edges).collect();
+    (newick, edges)
+}
+
+/// The facts a tree must read as, worked out from the edges it was built from
+/// rather than from its text. Taxon `i` is bit `i`.
+///
+/// Rooted, every edge is its own clade. Unrooted, the other side of a pendant
+/// edge is dropped, a split keeps the side without leaf 0, and edges that cut
+/// the same split merge into one with their lengths summed.
+fn expected_facts(edges: &Edges, n: usize, rooted: bool) -> Vec<Fact> {
+    let labels = taxon_labels(n);
+    let total = labels.iter().fold(0, |acc, &label| acc ^ label);
+    let mut facts: Vec<Fact> = Vec::new();
+    for (leaves, length) in edges {
+        let fp = leaves
+            .iter()
+            .fold(0, |acc, &bit| acc ^ labels[bit as usize]);
+        if rooted {
+            facts.push((fp, leaves.clone(), *length));
+            continue;
+        }
+        let pendant = leaves.len() == 1;
+        if !pendant && leaves.len() >= n - 1 {
+            continue;
+        }
+        let (key, side) = if pendant || !leaves.contains(&0) {
+            (
+                if pendant { fp } else { fp.min(fp ^ total) },
+                leaves.clone(),
+            )
+        } else {
+            let others = (0..n as u32).filter(|bit| leaves.binary_search(bit).is_err());
+            (fp.min(fp ^ total), others.collect())
+        };
+        match facts.iter_mut().find(|fact| fact.1 == side) {
+            Some(fact) => fact.2 += length,
+            None => facts.push((key, side, *length)),
+        }
+    }
+    sort_facts(&mut facts);
+    facts
+}
+
+/// The reader against trees whose splits are known from how they were built,
+/// rooted and unrooted: the same names, keys and leaf sets exactly, and the
+/// same lengths. A length can differ in its last bit where three or more edges
+/// merge into one split, since the reader and [`expected_facts`] add them up in
+/// different orders.
+#[test]
+fn reader_reads_trees_as_built() {
+    let mut rng = Lcg(11);
+    for n in [2, 3, 4, 5, 6, 9, 16, 33, 60, 64, 65, 200] {
+        let taxa: Vec<String> = (0..n).map(|i| format!("T{i:03}")).collect();
+        for _ in 0..30 {
+            let (newick, edges) = decorated_tree(n, &mut rng);
+
+            let mut names = newick::leaf_names(&newick, &HashMap::new()).unwrap();
+            names.sort_unstable();
+            assert_eq!(names, taxa, "{newick}");
+
+            for rooted in [false, true] {
+                let got = part_facts(&snapshot_of(&newick, rooted), rooted);
+                let want = expected_facts(&edges, n, rooted);
+                assert_eq!(
+                    got.len(),
+                    want.len(),
+                    "{newick} (rooted: {rooted}): part count"
+                );
+                for ((key, leaves, length), (want_key, want_leaves, want_length)) in
+                    got.iter().zip(&want)
+                {
+                    assert_eq!(
+                        (key, leaves),
+                        (want_key, want_leaves),
+                        "{newick} (rooted: {rooted})"
+                    );
+                    assert!(
+                        (length - want_length).abs() <= 1e-12 * want_length.abs(),
+                        "{newick} (rooted: {rooted}): length {length} against {want_length}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// NEXUS trees name leaves by number and map them through TRANSLATE. The
+/// result must match the same trees written with names, and a number the
+/// table lacks is an unnamed leaf.
+#[test]
+fn reader_applies_translate() {
+    let named = [
+        "((Alpha:1,Beta:2):1,(Gamma:1,Delta:1):1);",
+        "((Alpha:1,Gamma:2):1,(Beta:1,Delta:3):1);",
+    ];
+    let numbered = ["((1:1,2:2):1,(3:1,4:1):1);", "((1:1,3:2):1,(2:1,4:3):1);"];
+    let translate: HashMap<String, String> = [
+        ("1", "Alpha"),
+        ("2", "Beta"),
+        ("3", "Gamma"),
+        ("4", "Delta"),
+    ]
+    .map(|(id, name)| (id.to_string(), name.to_string()))
+    .into();
+    let empty = HashMap::new();
+
+    let a = Snapshots::from_newick_iter(named.iter().map(|&n| (n, &empty)), false).unwrap();
+    let b = Snapshots::from_newick_iter(numbered.iter().map(|&n| (n, &translate)), false).unwrap();
+    assert_eq!(a.leaf_names, b.leaf_names);
+    assert_eq!(a.pairwise_rf(None), b.pairwise_rf(None));
+    assert_eq!(a.pairwise_wrf(None), b.pairwise_wrf(None));
+    assert_eq!(a.pairwise_kf(None), b.pairwise_kf(None));
+
+    let unknown = "((1:1,2:2):1,(3:1,9:1):1);";
+    assert_eq!(
+        Snapshots::from_newick_iter([(unknown, &translate)], false).unwrap_err(),
+        "Tree 0 has an unnamed leaf. All leaves must be named."
+    );
+    assert_eq!(
+        Snapshots::from_newick_iter([(numbered[0], &translate), (unknown, &translate)], false)
+            .unwrap_err(),
+        "Tree 1 has an unnamed leaf. All leaves must be named."
+    );
+}
+
+/// The leaf-set errors keep the wording they had before the reader.
+#[test]
+fn reader_keeps_leaf_set_error_messages() {
+    const REF: &str = "((A:1,B:1):1,(C:1,D:1):1);";
+    let err = |trees: &[&str]| Snapshots::from_newicks(trees, false).unwrap_err();
+    let different =
+        "Tree 1 has a different leaf set than tree 0. All trees must share the same taxa.";
+
+    assert_eq!(
+        err(&[REF, "((A:1,B:1):1,(C:1,E:1):1);"]),
+        different,
+        "an unknown taxon"
+    );
+    assert_eq!(
+        err(&[REF, "((A:1,B:1):1,C:1);"]),
+        different,
+        "a missing taxon"
+    );
+    assert_eq!(
+        err(&[REF, "((A:1,B:1):1,(C:1,C:1):1);"]),
+        "Tree 1 repeats the leaf name \"C\". All leaf names must be unique."
+    );
+    assert_eq!(
+        err(&[REF, "((A:1,B:1):1,(:1,C:1):1);"]),
+        "Tree 1 has an unnamed leaf. All leaves must be named."
+    );
+    assert_eq!(
+        err(&["((A:1,A:1):1,(B:1,C:1):1);"]),
+        "Tree 0 has duplicate leaf names. All leaf names must be unique."
+    );
+    assert_eq!(
+        err(&["((A:1,B:1):1,(:1,C:1):1);"]),
+        "Tree 0 has an unnamed leaf. All leaves must be named."
+    );
 }

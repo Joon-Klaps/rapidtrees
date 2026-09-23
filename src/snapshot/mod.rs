@@ -13,15 +13,16 @@
 //! One tree at a time, and never more than a chunk of them alive at once:
 //!
 //! ```text
-//!   newick ──parse──▶ PhyloTree ──[build]──▶ Snapshot ──[intern]──▶ InternSnap
-//!                                            (per tree,             (u32 split
-//!                                             dropped after)         IDs, kept)
+//!   newick ──[newick]──▶ Snapshot ──[intern]──▶ InternSnap
+//!                        (per tree,             (u32 split
+//!                         dropped after)         IDs, kept)
 //! ```
 //!
 //! - [`fingerprint`] — the run-wide tables that make one tree's splits
 //!   comparable to another's.
-//! - [`build`] — one `PhyloTree` folded into one [`Snapshot`] of fingerprinted
-//!   edges.
+//! - [`newick`] — one tree's text read straight into a [`Snapshot`] of
+//!   fingerprinted edges, with no tree built in between.
+//! - [`build`] — the [`Snapshot`] and [`Part`] types themselves.
 //! - [`intern`] — those edges deduplicated across every tree into `u32` IDs.
 //! - [`export`] — flat byte buffers of the result for the Python side.
 //!
@@ -32,6 +33,7 @@ mod clades;
 mod export;
 mod fingerprint;
 mod intern;
+mod newick;
 
 use build::{Part, Snapshot};
 use fingerprint::{build_leaf_index, taxon_labels};
@@ -41,8 +43,6 @@ pub(crate) use intern::InternSnap;
 
 use crate::par::*;
 use clades::CladeTable;
-use phylotree::tree::Tree as PhyloTree;
-use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 
 /// A bulk collection of tree snapshots in an interned split-ID representation.
@@ -106,9 +106,10 @@ impl Retain {
 impl Snapshots {
     /// Build a `Snapshots` collection from a lazy iterator of `(newick, translate_map)` pairs.
     ///
-    /// Each `newick` may contain BEAST-format `[&...]` annotations — they are stripped
-    /// automatically. The `translate_map` is applied to rename leaf labels (pass an empty
-    /// map for plain Newick files with no BEAST translate block).
+    /// Each `newick` may contain BEAST-format `[&...]` annotations, or any other
+    /// `[...]` comment; the reader skips them. The `translate_map` is applied to
+    /// rename leaf labels (pass an empty map for plain Newick files with no BEAST
+    /// translate block).
     ///
     /// All trees must share the same leaf set; an error is returned if any tree differs.
     ///
@@ -136,25 +137,16 @@ impl Snapshots {
             return Ok(Self::empty());
         }
 
-        // Parse the first tree to establish the reference leaf set.
+        // Tree 0 defines the run's taxa, so its names are read first and on
+        // their own: every tree's leaf check, tree 0's included, needs the very
+        // table they are about to build. An unnamed leaf fails inside
+        // `leaf_names`; a repeated one is caught here.
         let (first_newick, first_translate) = entries[0];
-        let first_tree = parse_and_rename(first_newick, first_translate, 0)?;
-
-        // Tree 0 defines the run's taxa, so it is checked here rather than by
-        // `check_leaf_set` — which needs the very table tree 0 is about to
-        // build. Both counts are against `first_leaves`, so an unnamed leaf and
-        // a repeated one are told apart.
-        let first_leaves = first_tree.get_leaves();
-        let mut sorted_leaf_names: Vec<String> = first_leaves
-            .iter()
-            .filter_map(|&id| first_tree.get(&id).ok()?.name.clone())
-            .collect();
-        if sorted_leaf_names.len() != first_leaves.len() {
-            return Err("Tree 0 has an unnamed leaf. All leaves must be named.".to_string());
-        }
+        let mut sorted_leaf_names = newick::leaf_names(first_newick, first_translate)?;
+        let n_leaves = sorted_leaf_names.len();
         sorted_leaf_names.sort_unstable();
         sorted_leaf_names.dedup();
-        if sorted_leaf_names.len() != first_leaves.len() {
+        if sorted_leaf_names.len() != n_leaves {
             return Err(
                 "Tree 0 has duplicate leaf names. All leaf names must be unique.".to_string(),
             );
@@ -166,10 +158,14 @@ impl Snapshots {
         // same names once per tree.
         let labels = taxon_labels(sorted_leaf_names.len());
         let leaf_index = build_leaf_index(&sorted_leaf_names);
+        let run = newick::RunTables {
+            leaf_index: &leaf_index,
+            labels: &labels,
+            total: labels.iter().fold(0, |acc, &label| acc ^ label),
+            rooted,
+        };
 
-        let first_snap = Snapshot::from_tree(&first_tree, rooted, &labels, &leaf_index)
-            .map_err(|e| format!("Failed to snapshot tree at index 0: {e}"))?;
-        drop(first_tree);
+        let first_snap = newick::snapshot(first_newick, first_translate, 0, &run)?;
 
         // Bound how many raw snapshots are alive at once. Holding every tree's
         // un-interned parts simultaneously is the dominant memory cost at
@@ -199,11 +195,7 @@ impl Snapshots {
                 .par_iter()
                 .enumerate()
                 .map(|(k, &(newick, translate))| {
-                    let i = base + k;
-                    let tree = parse_and_rename(newick, translate, i)?;
-                    check_leaf_set(&tree, &leaf_index, i)?;
-                    Snapshot::from_tree(&tree, rooted, &labels, &leaf_index)
-                        .map_err(|e| format!("Failed to snapshot tree at index {i}: {e}"))
+                    newick::snapshot(newick, translate, base + k, &run)
                 })
                 .collect::<Result<_, _>>()?;
 
@@ -220,8 +212,9 @@ impl Snapshots {
 
     /// Build a `Snapshots` collection from a slice of plain Newick strings.
     ///
-    /// No BEAST annotation stripping or taxon renaming is performed — the strings
-    /// must already be in standard Newick format.
+    /// No taxon renaming is performed, so leaves must carry their taxon names.
+    /// `[...]` comments, BEAST annotations included, are skipped as in
+    /// [`Self::from_newick_iter`].
     ///
     /// # Errors
     /// Returns `Err(String)` if any newick fails to parse or leaf sets differ.
@@ -281,64 +274,6 @@ impl Snapshots {
             leaf_names: Vec::new(),
         }
     }
-}
-
-/// Confirm one tree carries exactly the run's taxa — each one once, none
-/// missing, none unknown.
-///
-/// Checked against `leaf_index` rather than by building this tree's own
-/// `HashSet<String>`: the set comparison is the same, but the set costs one
-/// `String` allocation per leaf *per tree*, which is the run's whole taxon list
-/// cloned once for every tree in the file. The `seen` vector is `n` bytes and is
-/// what catches a name repeated within one tree — a plain count would let
-/// `(A,A,B)` pass against `{A,B,C}`.
-fn check_leaf_set(
-    tree: &PhyloTree,
-    leaf_index: &FxHashMap<&str, usize>,
-    index: usize,
-) -> Result<(), String> {
-    let mismatch = || {
-        format!(
-            "Tree {index} has a different leaf set than tree 0. All trees must share the same taxa."
-        )
-    };
-
-    let mut seen = vec![false; leaf_index.len()];
-    for leaf_id in tree.get_leaves() {
-        let node = tree
-            .get(&leaf_id)
-            .map_err(|e| format!("Tree {index}: {e}"))?;
-        let name = node.name.as_deref().ok_or_else(|| {
-            format!("Tree {index} has an unnamed leaf. All leaves must be named.")
-        })?;
-        let &bit = leaf_index.get(name).ok_or_else(mismatch)?;
-        if std::mem::replace(&mut seen[bit], true) {
-            return Err(format!(
-                "Tree {index} repeats the leaf name {name:?}. All leaf names must be unique."
-            ));
-        }
-    }
-
-    if seen.iter().all(|&s| s) {
-        Ok(())
-    } else {
-        Err(mismatch())
-    }
-}
-
-/// Strip BEAST annotations, parse the Newick, and apply taxon renaming.
-///
-/// `index` only feeds the parse-error message so it points at the offending tree.
-fn parse_and_rename(
-    newick: &str,
-    translate: &HashMap<String, String>,
-    index: usize,
-) -> Result<PhyloTree, String> {
-    let clean = crate::io::strip_annotations(newick);
-    let mut tree = PhyloTree::from_newick(&clean)
-        .map_err(|e| format!("Failed to parse newick at index {index}: {e}"))?;
-    crate::io::rename_leaf_nodes(&mut tree, translate);
-    Ok(tree)
 }
 
 #[cfg(test)]
