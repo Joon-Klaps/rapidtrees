@@ -7,32 +7,41 @@
 //! also drops the splits held by every tree, which cancel. Both filters are pure
 //! optimisations — disabling either changes no distance.
 //!
-//! Every metric sweeps dense rows, one per tree, word by word. A pair costs
-//! `⌈U/64⌉` words regardless of how much the two trees share, where `U` is the
-//! collection's distinct-split count — cheap on a posterior.
+//! RF sweeps dense bit-rows, one per tree, word by word. A pair costs `⌈U/64⌉`
+//! words regardless of how much the two trees share, where `U` is the count of
+//! splits left after filtering — cheap on a posterior.
+//!
+//! The weighted metrics cannot pack 64 splits into a word, so a dense row of
+//! `f64` lengths over every shared split would cost one element per split per
+//! pair, most of them zero. They split their columns instead. A split held by
+//! at least [`DENSE_SHARE`] of the trees keeps a dense column; a rarer one keeps
+//! a posting list of the trees that hold it, and each row adds those shared
+//! terms straight into the output. A posting list of `k` trees costs `k²/2`
+//! additions — HashRF's bucket — which is why only the rare splits get one.
 //!
 //! There is no per-pair entry point. To compare two trees, build a two-tree
 //! `Snapshots` and read the off-diagonal cell.
 
 use crate::par::*;
-use crate::snapshot::Snapshots;
+use crate::snapshot::{InternSnap, Snapshots};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Fill a symmetric `n × n` matrix from `cell(i, j)`, one rayon task per row.
+/// Fill a symmetric `n × n` matrix one row at a time, one rayon task per row.
 ///
-/// Only the upper triangle is computed; the diagonal stays at `T::default()`.
-/// `progress` is bumped by each row's pair count as that row finishes.
-fn fill_symmetric<T, F>(n: usize, progress: Option<&AtomicUsize>, cell: F) -> Vec<T>
+/// `fill_row(i, row)` writes `row[j]` for every `j > i`. `row` arrives holding
+/// `T::default()` throughout, so a caller may accumulate into it first. The
+/// diagonal stays at `T::default()` and the lower triangle is mirrored from
+/// the upper. `progress` is bumped by each row's pair count as that row
+/// finishes.
+fn fill_symmetric<T, F>(n: usize, progress: Option<&AtomicUsize>, fill_row: F) -> Vec<T>
 where
     T: Copy + Default + Send,
-    F: Fn(usize, usize) -> T + Sync,
+    F: Fn(usize, &mut [T]) + Sync,
 {
     let mut matrix = vec![T::default(); n * n];
 
     matrix.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
-        for (j, slot) in row.iter_mut().enumerate().skip(i + 1) {
-            *slot = cell(i, j);
-        }
+        fill_row(i, row);
         if let Some(counter) = progress {
             counter.fetch_add(n.saturating_sub(i + 1), Ordering::Relaxed);
         }
@@ -151,78 +160,88 @@ pub(crate) fn distance_rf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> 
         .map(|snap| (snap.split_ids.len() - everywhere) as u32)
         .collect();
 
-    fill_symmetric(n_trees, progress, |i, j| {
-        let (lo, hi) = (spans[i].0.max(spans[j].0), spans[i].1.min(spans[j].1));
-        let shared: u32 = if lo > hi {
-            0
-        } else {
-            row_slice(&packed, i, words)[lo..=hi]
-                .iter()
-                .zip(&row_slice(&packed, j, words)[lo..=hi])
-                .map(|(&x, &y)| (x & y).count_ones())
-                .sum()
-        };
-        kept_per_tree[i] + kept_per_tree[j] - 2 * shared
+    fill_symmetric(n_trees, progress, |i, row| {
+        for (j, slot) in row.iter_mut().enumerate().skip(i + 1) {
+            let (lo, hi) = (spans[i].0.max(spans[j].0), spans[i].1.min(spans[j].1));
+            let shared: u32 = if lo > hi {
+                0
+            } else {
+                row_slice(&packed, i, words)[lo..=hi]
+                    .iter()
+                    .zip(&row_slice(&packed, j, words)[lo..=hi])
+                    .map(|(&x, &y)| (x & y).count_ones())
+                    .sum()
+            };
+            *slot = kept_per_tree[i] + kept_per_tree[j] - 2 * shared;
+        }
     })
 }
 
 // ─── weighted metrics (WRF, KF) ─────────────────────────────────────────────
 
-/// Lay out branch lengths over only the splits at least two trees hold.
+/// Share of the trees a split must be held by to keep a dense column in the
+/// weighted metrics. Rarer splits get a posting list instead.
 ///
-/// A split held by one tree alone can never be shared, so it gets no column —
-/// its `term(length)` folds into that tree's `unique_self` instead. On diverse
-/// sets this cuts ~48 000 splits to ~2 600 (~19×); on similar sets it is nearly
-/// a no-op. "Everywhere" splits are kept: unlike in RF, they do not cancel out
-/// of a weighted score.
-///
-/// Returns the flat `n × stride` length matrix and, per tree, `Σ term(length)`
-/// over the splits no other tree holds.
-fn shared_length_rows(
-    snaps: &Snapshots,
-    column_of: &[u32],
-    stride: usize,
-    term: impl Fn(f64) -> f64,
-) -> (Vec<f64>, Vec<f64>) {
-    let n = snaps.snapshots.len();
-    let mut rows = vec![0.0f64; n * stride];
-    if stride > 0 {
-        rows.par_chunks_mut(stride)
-            .zip(&snaps.snapshots)
-            .for_each(|(row, snap)| {
-                for (&id, &length) in snap.split_ids.iter().zip(&snap.lengths) {
-                    let col = column_of[id as usize];
-                    if col != u32::MAX {
-                        row[col as usize] = length;
-                    }
-                }
-            });
-    }
+/// A dense column costs every pair one element; a posting list of `k` trees
+/// costs `k²/2` scattered additions, so the list wins below some share of the
+/// trees and loses above it. A quarter was fastest of 5, 25 and 101 per cent on
+/// simulated posteriors from 50 to 20 000 taxa. The boundary changes the speed
+/// and nothing else: any value gives the same distances.
+const DENSE_SHARE: f64 = 0.25;
 
-    let unique_self = snaps
-        .snapshots
+/// `Σ overlap(aₖ, bₖ)` over two rows of equal length, in a fixed order.
+///
+/// Eight running sums rather than one. A single `f64` sum is a chain the
+/// compiler may not reorder, so it can neither vectorise nor pipeline; eight
+/// independent ones can do both. The order is set here rather than by the
+/// compiler, so `sweep(a, a)` and `sweep(a, b)` add the same terms the same way
+/// whenever `a == b`, which is what keeps identical trees at exactly 0.0.
+#[inline]
+fn sweep(a: &[f64], b: &[f64], overlap: &impl Fn(f64, f64) -> f64) -> f64 {
+    const LANES: usize = 8;
+    let (a_blocks, a_rest) = a.as_chunks::<LANES>();
+    let (b_blocks, b_rest) = b.as_chunks::<LANES>();
+
+    let mut sums = [0.0f64; LANES];
+    for (xs, ys) in a_blocks.iter().zip(b_blocks) {
+        for ((sum, &x), &y) in sums.iter_mut().zip(xs).zip(ys) {
+            *sum += overlap(x, y);
+        }
+    }
+    let rest: f64 = a_rest
         .iter()
-        .map(|snap| {
-            snap.split_ids
-                .iter()
-                .zip(&snap.lengths)
-                .filter(|&(&id, _)| column_of[id as usize] == u32::MAX)
-                .map(|(_, &l)| term(l))
-                .sum()
+        .zip(b_rest)
+        .map(|(&x, &y)| overlap(x, y))
+        .sum();
+
+    let [s0, s1, s2, s3, s4, s5, s6, s7] = sums;
+    (((s0 + s1) + (s2 + s3)) + ((s4 + s5) + (s6 + s7))) + rest
+}
+
+/// One tree's posting-list splits as `(column, length)`, in column order.
+///
+/// Both the tree's own `self` term and every shared term it enters are summed
+/// in this order, so two identical trees cancel exactly however their Newick
+/// happened to list the children.
+fn posted_splits(snap: &InternSnap, posting_col: &[u32]) -> Vec<(u32, f64)> {
+    let mut posted: Vec<(u32, f64)> = snap
+        .split_ids
+        .iter()
+        .zip(&snap.lengths)
+        .filter_map(|(&id, &length)| {
+            let col = posting_col[id as usize];
+            (col != u32::MAX).then_some((col, length))
         })
         .collect();
-
-    (rows, unique_self)
+    posted.sort_unstable_by_key(|&(col, _)| col);
+    posted
 }
 
 /// `finish(selfᵢ + selfⱼ − 2·Σ overlap)` — the shape WRF and KF share.
 ///
 /// `term` maps a length to its `self` contribution, `overlap` is the per-split
-/// shared term, `finish` is applied last.
-///
-/// `self` is summed over each row in column order, the same order `overlap`
-/// walks, so identical trees cancel to exactly 0.0. The clamp stops rounding
-/// from handing `finish` a negative.
+/// shared term, `finish` is applied last. `overlap(l, l)` must equal
+/// `term(l)`, as it does for both metrics.
 fn weighted_distances(
     snaps: &Snapshots,
     progress: Option<&AtomicUsize>,
@@ -231,28 +250,120 @@ fn weighted_distances(
     finish: impl Fn(f64) -> f64 + Sync,
 ) -> Vec<f64> {
     let n = snaps.snapshots.len();
+    let min_dense = ((n as f64 * DENSE_SHARE).ceil() as u32).max(2);
+    weighted_distances_split(snaps, progress, min_dense, term, overlap, finish)
+}
+
+/// [`weighted_distances`] with the dense/posting boundary given: a split held
+/// by at least `min_dense` trees gets a dense column, one held by fewer (but at
+/// least two) gets a posting list, and one held by a single tree gets neither,
+/// since it can never be shared. Its length folds into that tree's `self`.
+///
+/// `self` is summed in the same order as the shared term it has to cancel:
+/// dense columns by [`sweep`], posted splits in column order, and the two parts
+/// added last in both. Identical trees therefore come out at exactly 0.0. The
+/// clamp stops rounding from handing `finish` a negative.
+fn weighted_distances_split(
+    snaps: &Snapshots,
+    progress: Option<&AtomicUsize>,
+    min_dense: u32,
+    term: impl Fn(f64) -> f64 + Sync,
+    overlap: impl Fn(f64, f64) -> f64 + Sync,
+    finish: impl Fn(f64) -> f64 + Sync,
+) -> Vec<f64> {
+    let n = snaps.snapshots.len();
     if n == 0 {
         return Vec::new();
     }
+    let counts = &snaps.split_counts;
 
-    let (column_of, stride) = assign_columns(&snaps.split_counts, n, |count| count >= 2);
+    // Dense columns: one flat `n × stride` matrix of lengths, 0.0 where absent.
+    // "Everywhere" splits land here; unlike in RF they do not cancel out of a
+    // weighted score.
+    let (dense_col, stride) = assign_columns(counts, n, |count| count >= min_dense);
+    let mut dense = vec![0.0f64; n * stride];
+    if stride > 0 {
+        dense
+            .par_chunks_mut(stride)
+            .zip(&snaps.snapshots)
+            .for_each(|(row, snap)| {
+                for (&id, &length) in snap.split_ids.iter().zip(&snap.lengths) {
+                    let col = dense_col[id as usize];
+                    if col != u32::MAX {
+                        row[col as usize] = length;
+                    }
+                }
+            });
+    }
 
-    let (rows, unique_self) = shared_length_rows(snaps, &column_of, stride, &term);
-    let self_total: Vec<f64> = (0..n)
-        .map(|i| {
-            row_slice(&rows, i, stride)
+    // Posting lists: for posting column `c`, entries `offsets[c]..offsets[c + 1]`
+    // of `holders` and `held` are the trees holding it and their lengths, with
+    // the trees ascending because they are appended in tree order.
+    let (posting_col, n_posted) =
+        assign_columns(counts, n, |count| count >= 2 && count < min_dense);
+    let mut offsets = vec![0usize; n_posted + 1];
+    for (&count, &col) in counts.iter().zip(&posting_col) {
+        if col != u32::MAX {
+            offsets[col as usize] = count as usize;
+        }
+    }
+    let mut total = 0usize;
+    for slot in offsets.iter_mut() {
+        (*slot, total) = (total, total + *slot);
+    }
+    let mut next = offsets.clone();
+    let mut holders = vec![0u32; total];
+    let mut held = vec![0.0f64; total];
+    for (tree, snap) in snaps.snapshots.iter().enumerate() {
+        for (&id, &length) in snap.split_ids.iter().zip(&snap.lengths) {
+            let col = posting_col[id as usize];
+            if col != u32::MAX {
+                let at = &mut next[col as usize];
+                holders[*at] = tree as u32;
+                held[*at] = length;
+                *at += 1;
+            }
+        }
+    }
+
+    let self_total: Vec<f64> = snaps
+        .snapshots
+        .par_iter()
+        .enumerate()
+        .map(|(i, snap)| {
+            let row = row_slice(&dense, i, stride);
+            let dense_self = sweep(row, row, &overlap);
+            let posted_self = posted_splits(snap, &posting_col)
                 .iter()
-                .map(|&l| term(l))
-                .sum::<f64>()
-                + unique_self[i]
+                .fold(0.0, |sum, &(_, length)| sum + overlap(length, length));
+            let unique_self: f64 = snap
+                .split_ids
+                .iter()
+                .zip(&snap.lengths)
+                .filter(|&(&id, _)| counts[id as usize] < 2)
+                .map(|(_, &length)| term(length))
+                .sum();
+            (dense_self + posted_self) + unique_self
         })
         .collect();
 
-    fill_symmetric(n, progress, |i, j| {
-        let row_i = row_slice(&rows, i, stride);
-        let row_j = row_slice(&rows, j, stride);
-        let shared_term: f64 = row_i.iter().zip(row_j).map(|(&a, &b)| overlap(a, b)).sum();
-        finish((self_total[i] + self_total[j] - 2.0 * shared_term).max(0.0))
+    fill_symmetric(n, progress, |i, row: &mut [f64]| {
+        // Shared terms from the posting lists first, accumulated in place.
+        // Only trees after `i` are wanted: the lower triangle is mirrored.
+        for (col, length) in posted_splits(&snaps.snapshots[i], &posting_col) {
+            let span = offsets[col as usize]..offsets[col as usize + 1];
+            let (trees, lengths) = (&holders[span.clone()], &held[span]);
+            let after = trees.partition_point(|&tree| tree as usize <= i);
+            for (&j, &other) in trees[after..].iter().zip(&lengths[after..]) {
+                row[j as usize] += overlap(length, other);
+            }
+        }
+
+        let own = row_slice(&dense, i, stride);
+        for (j, slot) in row.iter_mut().enumerate().skip(i + 1) {
+            let shared = sweep(own, row_slice(&dense, j, stride), &overlap) + *slot;
+            *slot = finish((self_total[i] + self_total[j] - 2.0 * shared).max(0.0));
+        }
     })
 }
 
@@ -709,7 +820,7 @@ fn kuhner_felsenstein_treedist() {
 
 #[cfg(test)]
 mod tests {
-    use super::{TREEDIST_TREES, assign_columns};
+    use super::{TREEDIST_TREES, assign_columns, weighted_distances_split};
     use crate::snapshot::{InternSnap, Snapshots};
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -1056,6 +1167,89 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// WRF and KF with the dense/posting boundary at `min_dense`, mirroring
+    /// [`super::distance_wrf`] and [`super::distance_kf`].
+    fn weighted_at(snaps: &Snapshots, min_dense: u32) -> (Vec<f64>, Vec<f64>) {
+        (
+            weighted_distances_split(snaps, None, min_dense, |l| l, f64::min, |d| d),
+            weighted_distances_split(snaps, None, min_dense, |l| l * l, |a, b| a * b, f64::sqrt),
+        )
+    }
+
+    /// The boundary decides which path a split takes and must decide nothing
+    /// else: all dense (2), mixed, and all posting lists (`n + 1`) all have to
+    /// match the oracle.
+    #[test]
+    fn weighted_boundary_does_not_change_distances() {
+        for &(n_taxa, n_trees, duplicates, seed) in &[
+            (12usize, 8usize, 4usize, 11u64),
+            (24, 10, 6, 12),
+            (40, 6, 9, 13),
+        ] {
+            let mut state = seed;
+            let mut newicks: Vec<String> = (0..n_trees)
+                .map(|_| random_newick(n_taxa, &mut state))
+                .collect();
+            for k in 0..duplicates {
+                newicks.push(newicks[k % n_trees].clone());
+            }
+            let refs: Vec<&str> = newicks.iter().map(|s| s.as_str()).collect();
+            let snaps = Snapshots::from_newicks(&refs, false).unwrap();
+            let n = snaps.snapshots.len();
+
+            for min_dense in [2, 3, n as u32 / 2, n as u32, n as u32 + 1] {
+                let (wrf, kf) = weighted_at(&snaps, min_dense);
+                for i in 0..n {
+                    for j in 0..n {
+                        let (_, want_wrf, want_kf) =
+                            reference_distances(&snaps.snapshots[i], &snaps.snapshots[j]);
+                        let ctx = format!("seed={seed} min_dense={min_dense} [{i}][{j}]");
+                        assert!(
+                            (wrf[i * n + j] - want_wrf).abs() <= 1e-9 * want_wrf.max(1.0),
+                            "WRF {} vs reference {want_wrf}, {ctx}",
+                            wrf[i * n + j],
+                        );
+                        assert!(
+                            (kf[i * n + j] - want_kf).abs() <= 1e-9 * want_kf.max(1.0),
+                            "KF {} vs reference {want_kf}, {ctx}",
+                            kf[i * n + j],
+                        );
+                        if refs[i] == refs[j] {
+                            assert_eq!(wrf[i * n + j], 0.0, "WRF identical, {ctx}");
+                            assert_eq!(kf[i * n + j], 0.0, "KF identical, {ctx}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The same tree written with its children in a different order parses its
+    /// splits in a different order. Posted splits are summed in column order,
+    /// not parse order, so the copies must still cancel to exactly 0.0 on every
+    /// path.
+    #[test]
+    fn identical_trees_in_any_child_order_cancel_exactly() {
+        let trees = [
+            "(((A:0.31,B:0.17):0.23,(C:0.41,D:0.13):0.29):0.11,((E:0.37,F:0.19):0.07,(G:0.43,H:0.03):0.47):0.53);",
+            "(((H:0.03,G:0.43):0.47,(F:0.19,E:0.37):0.07):0.53,((D:0.13,C:0.41):0.29,(B:0.17,A:0.31):0.23):0.11);",
+            "(((A:0.31,E:0.12):0.33,(C:0.34,G:0.35):0.36):0.37,((B:0.38,F:0.39):0.41,(D:0.42,H:0.43):0.44):0.45);",
+            "(((C:0.41,D:0.13):0.29,(B:0.17,A:0.31):0.23):0.11,((G:0.43,H:0.03):0.47,(E:0.37,F:0.19):0.07):0.53);",
+        ];
+        let snaps = Snapshots::from_newicks(&trees, false).unwrap();
+        let n = snaps.snapshots.len();
+        // 2: all dense. 4: pendants dense, the shared internal splits posted.
+        // n + 1: everything posted.
+        for min_dense in [2, 4, n as u32 + 1] {
+            let (wrf, kf) = weighted_at(&snaps, min_dense);
+            for (i, j) in [(0, 1), (0, 3), (1, 3)] {
+                assert_eq!(wrf[i * n + j], 0.0, "WRF [{i}][{j}] min_dense={min_dense}");
+                assert_eq!(kf[i * n + j], 0.0, "KF [{i}][{j}] min_dense={min_dense}");
+            }
+            assert!(wrf[2] > 0.0, "tree 2 differs, min_dense={min_dense}");
         }
     }
 
