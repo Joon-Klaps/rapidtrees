@@ -16,7 +16,7 @@
 8. [Step 6 — Snapshot: one tree, ready to hand off](#step-6--snapshot-one-tree-ready-to-hand-off)
 9. [Step 7 — Interning: from fingerprints to `u32` IDs](#step-7--interning-from-fingerprints-to-u32-ids)
 10. [Step 8 — Computing RF on integers](#step-8--computing-rf-on-integers)
-11. [Step 9 — Bulk pairwise: the dense and sparse backends](#step-9--bulk-pairwise-the-dense-and-sparse-backends)
+11. [Step 9 — Bulk pairwise: the dense kernel](#step-9--bulk-pairwise-the-dense-kernel)
 12. [Step 10 — Naming the split: the clade table](#step-10--naming-the-split-the-clade-table)
 13. [The full pipeline at a glance](#the-full-pipeline-at-a-glance)
 14. [Cheat sheet: all representations](#cheat-sheet-all-representations)
@@ -297,16 +297,15 @@ Two payoffs:
 
 ## Step 8 — Computing RF on integers
 
-Both `split_ids` lists are sorted, so counting the symmetric difference is a two-pointer merge — one linear pass, no hashing, no allocation:
+RF counts the splits one tree has and the other lacks, so with splits as integers it becomes a question about two lists of IDs. Line them up by ID:
 
 ```text
-t1: [0, 1, 2, 3, 4, 5, 8,  9, 10, 11, 12]
-t2: [0, 1, 2, 3, 5, 6, 7,  8,  9, 10, 12]
-     ✓  ✓  ✓  ✓  ✗  ✓  ✗   ✗   ✓   ✓  ✗   ✓
-                 └── 4 in t1 only, 4 in t2 only... 
+t1: [0, 1, 2, 3, 4, 5,       8, 9, 10, 11, 12]
+t2: [0, 1, 2, 3,    5, 6, 7, 8, 9, 10,     12]
+                 ↑     ↑  ↑            ↑
 ```
 
-More precisely: walk both lists together, count how many IDs are `shared`, then
+IDs 4 and 11 are in `t1` only, 6 and 7 in `t2` only, and the other 9 are `shared`. Then
 
 ```text
 RF = (len(t1) − shared) + (len(t2) − shared)
@@ -314,7 +313,7 @@ RF = (len(t1) − shared) + (len(t2) − shared)
 
 With `shared = 9`, `len = 11` each: `RF = 2 + 2 = 4`. ✅
 
-The weighted metrics use the same merge, but instead of counting they accumulate over the `lengths` arrays:
+The weighted metrics have the same shape, but instead of counting they accumulate over the `lengths` arrays:
 
 | Metric | What it accumulates |
 | --- | --- |
@@ -326,27 +325,19 @@ A split absent from one tree contributes as if its length there were `0.0`.
 
 ---
 
-## Step 9 — Bulk pairwise: the dense and sparse backends
+## Step 9 — Bulk pairwise: the dense kernel
 
-One comparison is now cheap. Eight million of them still need care, and the right strategy depends on how *diverse* the tree set is.
+One comparison is now cheap. Eight million of them still need care.
 
-**Sparse backend** — run the two-pointer merge per pair. Cost scales with how many splits each tree has. Best when trees are diverse, so the split table is large and each tree touches a small slice of it.
-
-**Dense backend** — build a `(n_trees × n_splits)` presence matrix once, then compare rows with bit-parallel operations. A row is a bit-packed word array, and
+`rapidtrees` builds a `(n_trees × n_splits)` presence matrix once: one row per tree, one column per split ID, a set bit where the tree has that split. The lined-up lists of Step 8 are two rows of it. A row is a bit-packed word array, and
 
 ```text
 RF(i, j) = popcount(row_i XOR row_j)
 ```
 
-which handles 64 splits per instruction. Best when trees are similar, so the split table is narrow and the matrix stays small.
+which handles 64 splits per instruction. WRF and KF sweep rows of branch lengths the same way. A pair's cost is set by the width of the split table rather than by how much the two trees share, so the kernel is cheap on an MCMC posterior, where the trees are similar, the table is narrow and the matrix stays small. On a set of unrelated trees the table grows towards `n_trees × (n_taxa − 3)` splits, and the matrix widens with it.
 
-`--backend auto` (the default) picks between them from the observed number of distinct splits, and refuses a dense matrix that would exceed a 5 GB budget. Both backends return **identical** matrices; the choice is purely about speed. The run log names the one that ran:
-
-```text
-Backend: dense (--backend auto)
-```
-
-Two further tricks live in the dense path:
+Two further tricks keep the sweep short:
 
 - **Column ordering.** Splits are sorted by how often they occur, and each tree records the first and last column it touches — so a pair's comparison can skip whole stretches of the matrix.
 - **Dropping dead columns.** A split present in *every* tree (or in none) can never contribute to any RF distance, so its column is removed before the loop starts.
@@ -432,8 +423,7 @@ That last row is the `{A,B}` split — stored as its complement, because the can
             ▼
     InternSnap { split_ids, lengths }                ── per tree, KEPT
             │
-            ├──[distances]── two-pointer merge on u32  →  RF / WRF / KF matrix
-            │                 (dense or sparse kernel)
+            ├──[distances]── one dense row per tree    →  RF / WRF / KF matrix
             │
             └──[export]───── presence matrix, branch-length matrix,
                              bipartition bytes            →  Python / NumPy
@@ -491,7 +481,7 @@ Not every path needs everything, and both extras cost real work:
 | `snapshot/intern.rs` | `Interner`, `InternSnap` — dedupe to `u32` IDs |
 | `snapshot/export.rs` | the flat byte buffers Python reads |
 | `snapshot/mod.rs` | `Snapshots`, the construction pipeline, `Retain` |
-| `distances.rs` | RF / WRF / KF, dense and sparse kernels |
+| `distances.rs` | RF / WRF / KF over dense rows |
 | `snapshot/clades.rs` | the export-only leaf-set table, and its packed ordering |
 | `io.rs` | NEXUS/Newick parsing, BEAST annotation stripping |
 | `api.rs` | PyO3 bindings — glue only, no computation |

@@ -16,7 +16,8 @@ use std::hash::BuildHasher;
 
 /// One tree's bipartitions in interned form (private implementation detail of [`Snapshots`]).
 ///
-/// `split_ids` is sorted ascending so the RF sorted-merge can run on integers.
+/// `split_ids` is sorted ascending, so [`Snapshots::n_distinct_splits`] can
+/// read each tree's largest ID off the end.
 /// `lengths[i]` is the branch length of `split_ids[i]` (parallel arrays).
 #[derive(Debug, Clone)]
 pub(crate) struct InternSnap {
