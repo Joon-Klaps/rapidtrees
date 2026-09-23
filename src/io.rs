@@ -834,7 +834,8 @@ mod load_tests {
         // hiv2.newick holds the same 21 trees as hiv2.trees, so both files must
         // yield identical RF distances regardless of format.
         let (nexus_names, nexus_snaps) = load_beast_trees(hiv2_path(), 0, 0, false, false, None);
-        let (newick_names, newick_snaps) = load_beast_trees(hiv2_newick_path(), 0, 0, false, false, None);
+        let (newick_names, newick_snaps) =
+            load_beast_trees(hiv2_newick_path(), 0, 0, false, false, None);
         assert_eq!(newick_names.len(), nexus_names.len());
         assert_eq!(newick_snaps.len(), nexus_snaps.len());
         assert_eq!(
