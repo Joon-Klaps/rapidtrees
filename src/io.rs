@@ -1,4 +1,4 @@
-use crate::snapshot::Snapshots;
+use crate::snapshot::{Retain, Snapshots};
 use phylotree::tree::Tree;
 use std::collections::HashMap;
 use std::fs;
@@ -172,18 +172,30 @@ fn keep_tree(idx: usize, state: usize, burnin_trees: usize, burnin_states: usize
 /// their `tree` header name, plain Newick trees are named `<file stem>_line<n>`
 /// after the line they start on. Returns `(tree_names, Snapshots)`. On any
 /// error, prints to stderr and returns an empty `Snapshots`.
+///
+/// `retain` says what to build besides the split IDs; pass `None` to keep
+/// everything.
+///
+/// ```no_run
+/// # use rapidtrees::{io::load_beast_trees, Retain};
+/// let (names, snaps) = load_beast_trees("posterior.trees", 0, 0, false, false, None);
+/// let (names, snaps) =
+///     load_beast_trees("posterior.trees", 0, 0, false, false, Retain::for_distances(false));
+/// ```
 pub fn load_beast_trees<P: AsRef<Path>>(
     path: P,
     burnin_trees: usize,
     burnin_states: usize,
     use_real_taxa: bool,
     rooted: bool,
+    retain: impl Into<Option<Retain>>,
 ) -> (Vec<String>, Snapshots) {
+    let retain = retain.into().unwrap_or_else(Retain::everything);
     let (translate_map, tree_pairs) =
         load_beast_raw(&path, burnin_trees, burnin_states, use_real_taxa);
     let (names, newicks): (Vec<String>, Vec<String>) = tree_pairs.into_iter().unzip();
     let entries = newicks.iter().map(|n| (n.as_str(), &translate_map));
-    match Snapshots::from_newick_iter(entries, rooted) {
+    match Snapshots::from_newick_iter_opts(entries, rooted, retain) {
         Ok(snaps) => (names, snaps),
         Err(e) => {
             eprintln!("Failed to parse trees in {:?}: {e}", path.as_ref());
@@ -612,7 +624,7 @@ mod load_tests {
 
     #[test]
     fn test_load_beast_trees_returns_correct_count() {
-        let (names, snaps) = load_beast_trees(hiv2_path(), 0, 0, false, false);
+        let (names, snaps) = load_beast_trees(hiv2_path(), 0, 0, false, false, None);
         assert_eq!(names.len(), 21);
         assert_eq!(snaps.len(), 21);
         assert!(!snaps.leaf_names.is_empty());
@@ -620,16 +632,38 @@ mod load_tests {
 
     #[test]
     fn test_load_beast_trees_burnin_reduces_count() {
-        let (names, snaps) = load_beast_trees(hiv2_path(), 5, 0, false, false);
+        let (names, snaps) = load_beast_trees(hiv2_path(), 5, 0, false, false, None);
         assert_eq!(names.len(), 16);
         assert_eq!(snaps.len(), 16);
     }
 
     #[test]
     fn test_load_beast_trees_nonexistent_returns_empty() {
-        let (names, snaps) = load_beast_trees("nonexistent.trees", 0, 0, false, false);
+        let (names, snaps) = load_beast_trees("nonexistent.trees", 0, 0, false, false, None);
         assert!(names.is_empty());
         assert_eq!(snaps.len(), 0);
+    }
+
+    #[test]
+    fn test_load_beast_trees_for_distances_matches_everything() {
+        // The CLI loads with `Retain::for_distances`, which skips what a matrix
+        // never reads. That must change no distance, and must actually skip it.
+        let load =
+            |retain: Option<Retain>| load_beast_trees(hiv2_path(), 0, 0, false, false, retain).1;
+        let all = load(None);
+        let rf = load(Some(Retain::for_distances(false)));
+        let weighted = load(Some(Retain::for_distances(true)));
+
+        assert_eq!(rf.pairwise_rf(None), all.pairwise_rf(None));
+        assert_eq!(weighted.pairwise_wrf(None), all.pairwise_wrf(None));
+        assert_eq!(weighted.pairwise_kf(None), all.pairwise_kf(None));
+
+        assert_ne!(all.clades.len(), 0);
+        assert_eq!((rf.clades.len(), weighted.clades.len()), (0, 0));
+        for (r, w) in rf.snapshots.iter().zip(&weighted.snapshots) {
+            assert!(r.lengths.is_empty(), "RF path must not store lengths");
+            assert_eq!(w.lengths.len(), w.split_ids.len());
+        }
     }
 
     // ── detect_format ─────────────────────────────────────────────────────────
@@ -821,8 +855,9 @@ mod load_tests {
     fn test_load_beast_trees_newick_matches_nexus() {
         // hiv2.newick holds the same 21 trees as hiv2.trees, so both files must
         // yield identical RF distances regardless of format.
-        let (nexus_names, nexus_snaps) = load_beast_trees(hiv2_path(), 0, 0, false, false);
-        let (newick_names, newick_snaps) = load_beast_trees(hiv2_newick_path(), 0, 0, false, false);
+        let (nexus_names, nexus_snaps) = load_beast_trees(hiv2_path(), 0, 0, false, false, None);
+        let (newick_names, newick_snaps) =
+            load_beast_trees(hiv2_newick_path(), 0, 0, false, false, None);
         assert_eq!(newick_names.len(), nexus_names.len());
         assert_eq!(newick_snaps.len(), nexus_snaps.len());
         assert_eq!(

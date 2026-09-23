@@ -8,6 +8,10 @@ This project uses release names based on random words from [codenamegenerator.co
     - PREFIX: Microsoft Corperation
     - DICTIONARY: Snakes
 
+## [UNRELEASED] - MICROSOFT_COORPERATION SNAKE (YYYY-MM-DD)
+
+- ([#29](https://github.com/Joon-Klaps/rapidtrees/issues/29)) - Modify `load_beast_trees` to use a new (optional) arg, that mentions if branch lengths need to be stored
+
 ## [0.9.0] - Whistler Taipan (2026-09-10)
 
 - ([#24](https://github.com/Joon-Klaps/rapidtrees/issues/24)) - **Benchmarks:** Larger tree datasets, plus one-thread (`*_st`) variants for 1-thread-vs-1-thread comparisons.

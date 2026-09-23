@@ -1,6 +1,6 @@
 use clap::{Parser, ValueEnum};
 use rapidtrees::io::{load_beast_trees, write_matrix_tsv};
-use rapidtrees::{Backend, Kernel};
+use rapidtrees::{Backend, Kernel, Retain};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -71,6 +71,7 @@ fn main() {
         args.burnin_states,
         args.use_real_taxa,
         args.rooted,
+        Retain::for_distances(args.metric != MetricArg::Rf),
     );
 
     log_if(

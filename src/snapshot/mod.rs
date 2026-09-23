@@ -76,20 +76,28 @@ pub struct Snapshots {
 /// an `O(subtree)` walk per distinct split. A path that computes a matrix and
 /// exports nothing wants both off.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Retain {
+pub struct Retain {
     /// Per-edge branch lengths. Required by WRF and KF; dead weight for RF.
-    pub(crate) lengths: bool,
+    pub lengths: bool,
     /// The canonical leaf set per distinct split. Required only to export a
     /// bipartition table to Python or to order export columns.
-    pub(crate) bipartitions: bool,
+    pub bipartitions: bool,
 }
 
 impl Retain {
     /// Keep everything — what the public constructors use.
-    pub(crate) fn everything() -> Self {
+    pub fn everything() -> Self {
         Self {
             lengths: true,
             bipartitions: true,
+        }
+    }
+
+    /// Keep only what a distance matrix needs
+    pub fn for_distances(weighted: bool) -> Self {
+        Self {
+            lengths: weighted,
+            bipartitions: false,
         }
     }
 }
@@ -112,12 +120,12 @@ impl Snapshots {
         Self::from_newick_iter_opts(entries, rooted, Retain::everything())
     }
 
-    /// Like [`Snapshots::from_newick_iter`], but lets internal callers skip work
-    /// they will not read. See [`Retain`].
+    /// Like [`Snapshots::from_newick_iter`], but lets a caller skip work it will
+    /// not read. See [`Retain`].
     ///
-    /// The public constructor retains everything, so the Rust/Python API is
-    /// unaffected.
-    pub(crate) fn from_newick_iter_opts<'a>(
+    /// [`Snapshots::from_newick_iter`] retains everything, so callers that do
+    /// not opt in are unaffected.
+    pub fn from_newick_iter_opts<'a>(
         entries: impl IntoIterator<Item = (&'a str, &'a HashMap<String, String>)>,
         rooted: bool,
         retain: Retain,
