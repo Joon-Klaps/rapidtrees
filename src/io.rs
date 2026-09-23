@@ -644,6 +644,28 @@ mod load_tests {
         assert_eq!(snaps.len(), 0);
     }
 
+    #[test]
+    fn test_load_beast_trees_for_distances_matches_everything() {
+        // The CLI loads with `Retain::for_distances`, which skips what a matrix
+        // never reads. That must change no distance, and must actually skip it.
+        let load =
+            |retain: Option<Retain>| load_beast_trees(hiv2_path(), 0, 0, false, false, retain).1;
+        let all = load(None);
+        let rf = load(Some(Retain::for_distances(false)));
+        let weighted = load(Some(Retain::for_distances(true)));
+
+        assert_eq!(rf.pairwise_rf(None), all.pairwise_rf(None));
+        assert_eq!(weighted.pairwise_wrf(None), all.pairwise_wrf(None));
+        assert_eq!(weighted.pairwise_kf(None), all.pairwise_kf(None));
+
+        assert_ne!(all.clades.len(), 0);
+        assert_eq!((rf.clades.len(), weighted.clades.len()), (0, 0));
+        for (r, w) in rf.snapshots.iter().zip(&weighted.snapshots) {
+            assert!(r.lengths.is_empty(), "RF path must not store lengths");
+            assert_eq!(w.lengths.len(), w.split_ids.len());
+        }
+    }
+
     // ── detect_format ─────────────────────────────────────────────────────────
 
     #[test]
