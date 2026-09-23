@@ -63,6 +63,8 @@ pub struct Snapshots {
     /// The canonical leaf set of split ID `i`. Empty when the caller asked not
     /// to build it — see [`Retain`].
     pub(crate) clades: CladeTable,
+    /// How many trees hold each split, indexed by split ID.
+    pub(crate) split_counts: Vec<u32>,
     pub words_per_bitset: usize,
     /// Alphabetically sorted taxon names shared by all trees in this set.
     pub leaf_names: Vec<String>,
@@ -241,14 +243,10 @@ impl Snapshots {
     /// How many distinct splits this collection contains — the `e` in the
     /// `e²/2¹²⁹` fingerprint-collision bound.
     ///
-    /// Derived from the split IDs rather than the bipartition table, so it is
-    /// correct even on the paths that never materialise one.
+    /// Read off the per-split tree counts rather than the bipartition table, so
+    /// it is correct even on the paths that never materialise one.
     pub fn n_distinct_splits(&self) -> usize {
-        self.snapshots
-            .iter()
-            .filter_map(|s| s.split_ids.last().copied())
-            .max()
-            .map_or(0, |max_id| max_id as usize + 1)
+        self.split_counts.len()
     }
 
     /// Compute all pairwise Robinson–Foulds distances as a symmetric n×n matrix.
@@ -278,6 +276,7 @@ impl Snapshots {
         Self {
             snapshots: Vec::new(),
             clades: CladeTable::new(),
+            split_counts: Vec::new(),
             words_per_bitset: 0,
             leaf_names: Vec::new(),
         }
@@ -335,7 +334,7 @@ fn parse_and_rename(
     translate: &HashMap<String, String>,
     index: usize,
 ) -> Result<PhyloTree, String> {
-    let clean = crate::io::strip_beast_annotations(newick);
+    let clean = crate::io::strip_annotations(newick);
     let mut tree = PhyloTree::from_newick(&clean)
         .map_err(|e| format!("Failed to parse newick at index {index}: {e}"))?;
     crate::io::rename_leaf_nodes(&mut tree, translate);

@@ -272,7 +272,7 @@ Each tree then becomes an `InternSnap` — two parallel arrays, nothing more:
 
 ```rust
 struct InternSnap {
-    split_ids: Vec<u32>,   // sorted ascending
+    split_ids: Vec<u32>,   // in part order
     lengths: Vec<f64>,     // lengths[i] belongs to split_ids[i]
 }
 ```
@@ -340,7 +340,7 @@ which handles 64 splits per instruction. WRF and KF sweep rows of branch lengths
 Two further tricks keep the sweep short:
 
 - **Column ordering.** Splits are sorted by how often they occur, and each tree records the first and last column it touches — so a pair's comparison can skip whole stretches of the matrix.
-- **Dropping dead columns.** A split present in *every* tree (or in none) can never contribute to any RF distance, so its column is removed before the loop starts.
+- **Dropping dead columns.** A split present in *every* tree cancels out of every RF distance, and a split present in only *one* tree can never be shared, so neither gets a column. Both still count towards each tree's own total. On a posterior the second group is most of the distinct splits.
 
 ---
 
@@ -439,7 +439,7 @@ The shape to remember: **all the expensive work happens once per tree, and every
 
 | Structure | Type | Size | Purpose |
 | --- | --- | --- | --- |
-| `snapshots` | `Vec<InternSnap>` | `T × n_bip × 4 B` (+ `× 8 B` with lengths) | one tree = sorted `u32` IDs |
+| `snapshots` | `Vec<InternSnap>` | `T × n_bip × 4 B` (+ `× 8 B` with lengths) | one tree = its `u32` IDs |
 | `clades` | `CladeTable` | `Σ size × 4 B` | which taxa each split names — **export only** |
 | `leaf_names` | `Vec<String>` | `n` strings | alphabetical taxon names |
 

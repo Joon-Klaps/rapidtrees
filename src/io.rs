@@ -1,5 +1,6 @@
 use crate::snapshot::{Retain, Snapshots};
 use phylotree::tree::Tree;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 
@@ -14,6 +15,15 @@ use std::io::Write;
 
 /// Strip BEAST `[&...]` annotations from a Newick string.
 pub fn strip_beast_annotations(newick: &str) -> String {
+    strip_annotations(newick).into_owned()
+}
+
+/// [`strip_beast_annotations`] without the copy when there is nothing to strip,
+/// which is every tree in a plain Newick file.
+pub(crate) fn strip_annotations(newick: &str) -> Cow<'_, str> {
+    if !newick.contains("[&") {
+        return Cow::Borrowed(newick);
+    }
     let mut result = String::with_capacity(newick.len());
     let mut in_annotation = false;
     let mut chars = newick.chars().peekable();
@@ -28,7 +38,7 @@ pub fn strip_beast_annotations(newick: &str) -> String {
         }
     }
 
-    result
+    Cow::Owned(result)
 }
 
 /// Rename leaf nodes in a tree according to a translate map.
@@ -308,7 +318,7 @@ fn collect_nexus_trees(content: &str, base_name: &str) -> Vec<RawTree> {
             RawTree {
                 name: format!("{base_name}_{name}"),
                 state,
-                newick: strip_beast_annotations(body),
+                newick: body.to_string(),
             }
         })
         .collect()
@@ -325,7 +335,7 @@ fn collect_newick_trees(content: &str, base_name: &str) -> Vec<RawTree> {
     let mut start_line = 1;
 
     for (idx, line) in content.lines().enumerate() {
-        let stripped = strip_beast_annotations(line.trim());
+        let stripped = strip_annotations(line.trim());
         let line = stripped.trim();
         if line.is_empty() {
             continue;
@@ -549,12 +559,15 @@ mod load_tests {
         assert!(translate.is_empty());
     }
 
+    /// NEXUS bodies come back as written. The parse strips `[&...]` annotations,
+    /// and it runs in parallel, so the serial reader leaves them in place.
     #[test]
-    fn test_load_beast_raw_strips_annotations() {
+    fn test_load_beast_raw_leaves_annotations_to_the_parse() {
         let (_, pairs) = load_beast_raw(hiv2_path(), 0, 0, false);
+        assert!(pairs.iter().any(|(_, newick)| newick.contains("[&")));
         for (_, newick) in &pairs {
             assert!(
-                !newick.contains("[&"),
+                !strip_annotations(newick).contains("[&"),
                 "newick must not contain BEAST annotations after stripping"
             );
         }
@@ -604,8 +617,7 @@ mod load_tests {
         );
         assert_eq!(pairs.len(), 2);
         assert!(pairs[0].0.ends_with("_STATE_1"), "got {}", pairs[0].0);
-        // Stripping `[&R]` leaves the space that followed it; phylotree tolerates it.
-        assert_eq!(pairs[0].1.trim(), "(A:1,B:1);");
+        assert_eq!(strip_annotations(&pairs[0].1).trim(), "(A:1,B:1);");
     }
 
     #[test]

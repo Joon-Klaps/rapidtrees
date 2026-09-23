@@ -2,9 +2,10 @@
 //!
 //! All three metrics have the form `selfᵢ + selfⱼ − 2·shared`, where `shared` is
 //! a popcount (RF), a running minimum (WRF), or a dot product (KF). That shape
-//! lets each drop the splits that cannot affect `shared` before the O(n²) sweep:
-//! RF drops splits held by every tree, WRF/KF drop splits held by only one. Both
-//! filters are pure optimisations — disabling either changes no distance.
+//! lets each drop the splits that cannot affect `shared` before the O(n²) sweep.
+//! A split held by only one tree is never shared, so every metric drops it; RF
+//! also drops the splits held by every tree, which cancel. Both filters are pure
+//! optimisations — disabling either changes no distance.
 //!
 //! Every metric sweeps dense rows, one per tree, word by word. A pair costs
 //! `⌈U/64⌉` words regardless of how much the two trees share, where `U` is the
@@ -15,7 +16,6 @@
 
 use crate::par::*;
 use crate::snapshot::Snapshots;
-use std::cmp::Reverse;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Fill a symmetric `n × n` matrix from `cell(i, j)`, one rayon task per row.
@@ -60,33 +60,37 @@ fn row_slice<T>(flat: &[T], i: usize, stride: usize) -> &[T] {
     &flat[i * stride..][..stride]
 }
 
-/// How many trees hold each split, indexed by split ID.
-fn split_tree_counts(snaps: &Snapshots) -> Vec<u32> {
-    let mut counts = vec![0u32; snaps.n_distinct_splits()];
-    for snap in &snaps.snapshots {
-        for &id in &snap.split_ids {
-            counts[id as usize] += 1;
-        }
-    }
-    counts
-}
-
 /// Give every split `keep` accepts a packed column index.
 ///
-/// Returns `(column_of, n_columns)`
+/// `counts[id]` is how many of the `n_trees` trees hold split `id`. Returns
+/// `(column_of, n_columns)`.
 /// Columns run in descending tree count, which clusters the widely-held splits
-/// into the low words
-fn assign_columns(counts: &[u32], keep: impl Fn(u32) -> bool) -> (Vec<u32>, usize) {
-    let mut kept: Vec<u32> = (0..counts.len() as u32)
-        .filter(|&id| keep(counts[id as usize]))
-        .collect();
-    kept.sort_unstable_by_key(|&id| Reverse(counts[id as usize]));
-
-    let mut column_of = vec![u32::MAX; counts.len()];
-    for (col, &id) in kept.iter().enumerate() {
-        column_of[id as usize] = col as u32;
+/// into the low words. A count never exceeds `n_trees`, so this is a counting
+/// sort: two passes over the splits and no comparisons. Ties keep ID order.
+fn assign_columns(counts: &[u32], n_trees: usize, keep: impl Fn(u32) -> bool) -> (Vec<u32>, usize) {
+    // `next[c]` becomes the first column of the splits held by `c` trees.
+    let mut next = vec![0u32; n_trees + 1];
+    for &count in counts.iter().filter(|&&count| keep(count)) {
+        next[count as usize] += 1;
     }
-    (column_of, kept.len())
+    let mut kept = 0u32;
+    for slot in next.iter_mut().rev() {
+        (*slot, kept) = (kept, kept + *slot);
+    }
+
+    let column_of = counts
+        .iter()
+        .map(|&count| {
+            if keep(count) {
+                let col = next[count as usize];
+                next[count as usize] += 1;
+                col
+            } else {
+                u32::MAX
+            }
+        })
+        .collect();
+    (column_of, kept as usize)
 }
 
 // ─── Robinson–Foulds ────────────────────────────────────────────────────────
@@ -94,24 +98,30 @@ fn assign_columns(counts: &[u32], keep: impl Fn(u32) -> bool) -> (Vec<u32>, usiz
 /// `RF(i, j) = aᵢ + aⱼ − 2·popcount(rowᵢ & rowⱼ)` over presence bit-rows.
 ///
 /// Splits held by *every* tree add equally to both `a` values and to the shared
-/// count, so they cancel exactly and are dropped before packing.
+/// count, so they cancel exactly and are dropped before packing. Splits held by
+/// one tree count towards that tree's `a` but can never be shared, so they get
+/// no column either. On a posterior that is most of the distinct splits.
 pub(crate) fn distance_rf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> Vec<u32> {
-    let n = snaps.snapshots.len();
-    if n == 0 {
+    let n_trees = snaps.snapshots.len();
+    if n_trees == 0 {
         return Vec::new();
     }
 
-    let counts = split_tree_counts(snaps);
-    let n_splits = counts.len();
-    let (bit_slot, kept) = assign_columns(&counts, |count| count < n as u32);
-    let everywhere = n_splits - kept;
+    let (bit_slot, kept) = assign_columns(&snaps.split_counts, n_trees, |count| {
+        count >= 2 && count < n_trees as u32
+    });
+    let everywhere = snaps
+        .split_counts
+        .iter()
+        .filter(|&&count| count == n_trees as u32)
+        .count();
     let words = kept.div_ceil(64);
 
     // One bitmask row per tree: a set bit means "this tree has that split".
     // `spans[i]` is the first and last non-zero word of row `i`, empty as
     // `(1, 0)`. Tracked while the row is built, so it costs nothing extra.
-    let mut packed = vec![0u64; n * words];
-    let mut spans = vec![(1usize, 0usize); n];
+    let mut packed = vec![0u64; n_trees * words];
+    let mut spans = vec![(1usize, 0usize); n_trees];
     if words > 0 {
         packed
             .par_chunks_mut(words)
@@ -141,7 +151,7 @@ pub(crate) fn distance_rf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> 
         .map(|snap| (snap.split_ids.len() - everywhere) as u32)
         .collect();
 
-    fill_symmetric(n, progress, |i, j| {
+    fill_symmetric(n_trees, progress, |i, j| {
         let (lo, hi) = (spans[i].0.max(spans[j].0), spans[i].1.min(spans[j].1));
         let shared: u32 = if lo > hi {
             0
@@ -225,8 +235,7 @@ fn weighted_distances(
         return Vec::new();
     }
 
-    let counts = split_tree_counts(snaps);
-    let (column_of, stride) = assign_columns(&counts, |count| count >= 2);
+    let (column_of, stride) = assign_columns(&snaps.split_counts, n, |count| count >= 2);
 
     let (rows, unique_self) = shared_length_rows(snaps, &column_of, stride, &term);
     let self_total: Vec<f64> = (0..n)
@@ -700,7 +709,7 @@ fn kuhner_felsenstein_treedist() {
 
 #[cfg(test)]
 mod tests {
-    use super::TREEDIST_TREES;
+    use super::{TREEDIST_TREES, assign_columns};
     use crate::snapshot::{InternSnap, Snapshots};
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -850,13 +859,23 @@ mod tests {
     }
 
     #[test]
-    fn split_ids_sorted_per_snapshot() {
+    fn split_counts_match_a_recount() {
         let snaps = three_snapshots();
+        let mut recount = vec![0u32; snaps.n_distinct_splits()];
         for snap in &snaps.snapshots {
-            for w in snap.split_ids.windows(2) {
-                assert!(w[0] < w[1], "split_ids must be strictly ascending");
+            for &id in &snap.split_ids {
+                recount[id as usize] += 1;
             }
         }
+        assert_eq!(snaps.split_counts, recount);
+    }
+
+    #[test]
+    fn assign_columns_orders_by_descending_count() {
+        // Split 1 is held by one tree, so `count >= 2` drops it.
+        let (column_of, kept) = assign_columns(&[3, 1, 2, 3], 3, |count| count >= 2);
+        assert_eq!(kept, 3);
+        assert_eq!(column_of, vec![0, u32::MAX, 2, 1]);
     }
 
     #[test]

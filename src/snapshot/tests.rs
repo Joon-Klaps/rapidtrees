@@ -327,9 +327,15 @@ fn test_taxon_names_vs_node_ids() {
         vec!["Chimp", "Gorilla", "Human"],
         "bit indices come from alphabetical names, not parse order"
     );
+    let sorted = |ids: &[u32]| {
+        let mut ids = ids.to_vec();
+        ids.sort_unstable();
+        ids
+    };
     assert_eq!(
-        snaps.snapshots[0].split_ids, snaps.snapshots[1].split_ids,
-        "same taxa and topology must intern identically whatever the node IDs"
+        sorted(&snaps.snapshots[0].split_ids),
+        sorted(&snaps.snapshots[1].split_ids),
+        "same taxa and topology must intern to the same IDs whatever the node IDs"
     );
     assert_eq!(snaps.pairwise_rf(None)[1], 0);
 }
@@ -694,10 +700,10 @@ fn test_rf_path_without_lengths_matches() {
     assert_eq!(with_len.pairwise_rf(None), no_len.pairwise_rf(None));
 }
 
-/// `intern` assigns strictly-ascending, deduplicated split IDs, and identical
-/// topologies share the exact same interned IDs.
+/// `intern` gives each tree deduplicated split IDs, and identical topologies
+/// share the exact same interned IDs.
 #[test]
-fn test_intern_split_ids_sorted_and_deduped() {
+fn test_intern_split_ids_deduped() {
     let trees = [
         "((A:1,B:1):1,(C:1,D:1):1);",
         "((A:1,B:1):1,(C:1,D:1):1);",
@@ -706,9 +712,11 @@ fn test_intern_split_ids_sorted_and_deduped() {
     let snaps = snaps_opts(&trees, false, true);
 
     for snap in &snaps.snapshots {
+        let mut ids = snap.split_ids.clone();
+        ids.sort_unstable();
         assert!(
-            snap.split_ids.windows(2).all(|w| w[0] < w[1]),
-            "split IDs must be strictly ascending and unique: {:?}",
+            ids.windows(2).all(|w| w[0] < w[1]),
+            "split IDs must be unique within a tree: {:?}",
             snap.split_ids
         );
         for &id in &snap.split_ids {
