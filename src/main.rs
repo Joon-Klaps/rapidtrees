@@ -65,19 +65,15 @@ fn main() {
     let t_total = Instant::now();
     let t = Instant::now();
 
-    let (names, interned) = match &args.snap_input {
-        Some(path) => load_snapshots(path).unwrap_or_else(|e| {
-            eprintln!("Failed to load trees: {e}");
-            std::process::exit(1);
-        }),
-        None => load_beast_trees(
-            args.input.as_ref().unwrap(),
-            args.burnin_trees,
-            args.burnin_states,
-            args.use_real_taxa,
-            args.rooted,
-        ),
-    };
+    let (names, interned) = load_beast_trees(
+        &args.input,
+        args.burnin_trees,
+        args.burnin_states,
+        args.use_real_taxa,
+        args.rooted,
+        Retain::for_distances(args.metric != MetricArg::Rf),
+    );
+
     log_if(
         quiet,
         format!(
