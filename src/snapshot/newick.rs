@@ -102,12 +102,11 @@ pub(super) fn leaf_names(
 }
 
 /// A leaf's taxon name: its label, or what `translate` maps it to when the tree
-/// comes with a translate table. `None` is an unnamed leaf, which is also what a
-/// label missing from the table becomes.
+/// comes with a translate table. `None` is a label missing from the table, which
+/// is reported as an unnamed leaf. `raw` is never empty: a leaf with no label
+/// is caught by [`walk`] before it gets here.
 fn rename<'a>(raw: &'a str, translate: &'a HashMap<String, String>) -> Option<&'a str> {
-    if raw.is_empty() {
-        None
-    } else if translate.is_empty() {
+    if translate.is_empty() {
         Some(raw)
     } else {
         translate.get(raw).map(String::as_str)

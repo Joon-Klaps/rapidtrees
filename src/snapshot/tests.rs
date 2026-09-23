@@ -873,7 +873,8 @@ fn part_facts(snap: &Snapshot, rooted: bool) -> Vec<Fact> {
 #[test]
 fn reader_ignores_what_does_not_change_the_tree() {
     // Neither mode reads annotations, the rooted-tree flag, internal labels,
-    // support values or blank space, and a missing length is 0.
+    // support values, blank space or a stray ']', and a missing length is 0,
+    // whether the ':' is left out or left empty.
     for (text, plain) in [
         (
             "[&R] ((A[&rate=0.5]:1,B[&rate=0.3]:2)[&posterior=1.0]:1,(C:1,D:1):1);",
@@ -896,6 +897,11 @@ fn reader_ignores_what_does_not_change_the_tree() {
             "((A,B),(C:1e-3,D:2.5E2));",
             "((A:0,B:0):0,(C:0.001,D:250):0);",
         ),
+        (
+            "((A:,B:2):,(C:1,D: [&x] ):1);",
+            "((A:0,B:2):0,(C:1,D:0):1);",
+        ),
+        ("((A]:1,B:2):1,(C:1,D:1)]:1);", "((A:1,B:2):1,(C:1,D:1):1);"),
     ] {
         for rooted in [false, true] {
             assert_eq!(
@@ -927,10 +933,15 @@ fn reader_ignores_what_does_not_change_the_tree() {
 }
 
 /// A double-quoted name is kept whole: quotes, blank space and commas included.
+/// Blank space outside the quotes is dropped, as phylotree dropped it.
 #[test]
 fn reader_keeps_double_quoted_names_whole() {
-    let names = newick::leaf_names("((\"A B\":1,\"C,D\":1):1,E:1,F:1);", &HashMap::new()).unwrap();
-    assert_eq!(names, ["\"A B\"", "\"C,D\"", "E", "F"]);
+    let names = newick::leaf_names(
+        "((\"A B\":1,\"C,D\":1):1,E F:1,G \"H I\":1);",
+        &HashMap::new(),
+    )
+    .unwrap();
+    assert_eq!(names, ["\"A B\"", "\"C,D\"", "EF", "G\"H I\""]);
 }
 
 /// Malformed input fails with the offending tree's index, and never panics.
@@ -943,7 +954,11 @@ fn reader_rejects_malformed_trees() {
         "(A:1,B:1)):1,(C:1,D:1):1);", // a ')' with nothing open
         "((A:x,B:1):1,(C:1,D:1):1);", // not a number
         "((A:1,B:1)[never closed,(C:1,D:1):1);",
-        "A:1,B:1,C:1,D:1;", // siblings with no parent
+        "((A:[&rate=1,B:1):1,(C:1,D:1):1);", // a '[' after ':' never closed
+        "((A:1,B:1):1,(,C:1):1);",           // an anonymous leaf
+        "((A:1,B:1):1(C:1,D:1):1);",         // no ',' between siblings
+        "((A:1,\"B:1):1,(C:1,D:1):1);",      // a '\"' never closed
+        "A:1,B:1,C:1,D:1;",                  // siblings with no parent
         ";",
     ] {
         let err = Snapshots::from_newicks(&[REF, bad], false)
