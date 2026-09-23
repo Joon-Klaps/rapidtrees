@@ -1639,11 +1639,12 @@ class TestProgressCounter:
         t = threading.Thread(target=worker)
         t.start()
         # Poll while the worker runs. We can't guarantee timing on every
-        # platform, but for 1770 pairs there is *some* mid-flight window.
+        # platform, and 1770 pairs can finish before the first poll, so a
+        # sample is taken before the done check: at least one is recorded.
         for _ in range(200):
+            observed.append(pc.value())
             if done_flag.is_set():
                 break
-            observed.append(pc.value())
             time.sleep(0.001)
         t.join()
 
