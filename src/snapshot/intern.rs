@@ -16,8 +16,8 @@ use std::hash::BuildHasher;
 
 /// One tree's bipartitions in interned form (private implementation detail of [`Snapshots`]).
 ///
-/// `split_ids` is sorted ascending, so [`Snapshots::n_distinct_splits`] can
-/// read each tree's largest ID off the end.
+/// `split_ids` follows the order of the tree's parts, not ID order: the kernels
+/// and the export index by ID, so nothing downstream needs it sorted.
 /// `lengths[i]` is the branch length of `split_ids[i]` (parallel arrays).
 #[derive(Debug, Clone)]
 pub(crate) struct InternSnap {
@@ -43,6 +43,8 @@ pub(super) struct Interner {
     /// `(canonical fingerprint, smaller side's cardinality)` per split ID —
     /// what a candidate is matched against.
     keys: Vec<(Fingerprint, u32)>,
+    /// How many trees hold each split ID.
+    counts: Vec<u32>,
     clades: CladeTable,
     snapshots: Vec<InternSnap>,
     words: usize,
@@ -63,6 +65,7 @@ impl Interner {
             hasher: FxBuildHasher,
             table: HashTable::new(),
             keys: Vec::new(),
+            counts: Vec::new(),
             clades: CladeTable::new(),
             snapshots: Vec::with_capacity(n_trees),
             words,
@@ -87,20 +90,25 @@ impl Interner {
         let hasher = &self.hasher;
         let table = &mut self.table;
         let keys = &mut self.keys;
+        let counts = &mut self.counts;
         let clades = &mut self.clades;
         let (num_leaves, rooted, retain) = (self.num_leaves, self.rooted, self.retain);
 
-        let mut paired: Vec<(u32, f64)> = snap
+        let split_ids: Vec<u32> = snap
             .parts
             .iter()
             .map(|part| {
                 let candidate = (part.key, part.size.min(num_leaves as u32 - part.size));
                 let hash = hasher.hash_one(part.key);
-                let id = match table.find(hash, |&id| keys[id as usize] == candidate) {
-                    Some(&id) => id,
+                match table.find(hash, |&id| keys[id as usize] == candidate) {
+                    Some(&id) => {
+                        counts[id as usize] += 1;
+                        id
+                    }
                     None => {
                         let new_id = keys.len() as u32;
                         keys.push(candidate);
+                        counts.push(1);
                         if retain.bipartitions {
                             snap.push_canonical(part, rooted, clades);
                         }
@@ -110,18 +118,15 @@ impl Interner {
                         });
                         new_id
                     }
-                };
-                (id, part.length)
+                }
             })
             .collect();
 
-        paired.sort_unstable_by_key(|&(id, _)| id);
-        // On RF-only paths skip materialising the lengths column entirely
-        // instead of unzipping then discarding it.
-        let (split_ids, lengths): (Vec<u32>, Vec<f64>) = if self.retain.lengths {
-            paired.into_iter().unzip()
+        // On RF-only paths skip materialising the lengths column entirely.
+        let lengths = if retain.lengths {
+            snap.parts.iter().map(|part| part.length).collect()
         } else {
-            (paired.into_iter().map(|(id, _)| id).collect(), Vec::new())
+            Vec::new()
         };
         self.snapshots.push(InternSnap { split_ids, lengths });
     }
@@ -130,6 +135,7 @@ impl Interner {
         Snapshots {
             snapshots: self.snapshots,
             clades: self.clades,
+            split_counts: self.counts,
             words_per_bitset: self.words,
             leaf_names,
         }
