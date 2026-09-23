@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -663,6 +664,26 @@ class TestAPIConsistency:
 
         assert len(matrix_rf) == len(matrix_weighted) == len(matrix_kf)
         assert len(matrix_rf[0]) == len(matrix_weighted[0]) == len(matrix_kf[0])
+
+
+class TestCpuLevel:
+    """The instruction-set level the pairwise loops run at."""
+
+    LEVELS = {"baseline", "x86-64-v2", "x86-64-v3", "x86-64-v4"}
+
+    def test_cpu_level_is_a_known_level(self):
+        assert rtd.cpu_level() in self.LEVELS
+
+    def test_rapidtrees_cpu_caps_the_level(self):
+        # The level is fixed once per process, so the cap needs a fresh one.
+        result = subprocess.run(
+            [sys.executable, "-c", "import rapidtrees; print(rapidtrees.cpu_level())"],
+            env=dict(os.environ, RAPIDTREES_CPU="baseline"),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert result.stdout.strip() == "baseline"
 
 
 class TestRootedRF:

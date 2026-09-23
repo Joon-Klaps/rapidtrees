@@ -93,6 +93,10 @@ Notes:
 - The counter ends at exactly `value == total` (`fraction() == 1.0`) after
   the function returns.
 
+### CPU level
+
+`rapidtrees.cpu_level()` returns the instruction-set level the pairwise loops run at on this machine: `"baseline"`, `"x86-64-v2"`, `"x86-64-v3"` or `"x86-64-v4"`. It is chosen at runtime, so a prebuilt wheel still uses POPCNT, AVX2 or AVX-512 where the CPU has them, and every level returns bit-identical matrices. Set the `RAPIDTREES_CPU` environment variable to one of those names before the first distance call to cap it; the level is fixed once per process. On arm64 it is always `"baseline"`, which already includes NEON.
+
 ### Return types
 
 | Function | Return type | How to decode |

@@ -71,6 +71,10 @@ Install the standalone command-line binary. Requires the [Rust toolchain](https:
 cargo install rapidtrees
 ```
 
+### ⚙️ CPU features
+
+No build flags needed. The pairwise loops are compiled for several x86-64 levels and the best one the CPU supports is picked at runtime, so a PyPI wheel or a plain `cargo install` uses POPCNT, AVX2 or AVX-512 where the machine has them, and every level gives bit-identical results. The CLI's log opens with the level it chose; from Python, call `rapidtrees.cpu_level()`. Set `RAPIDTREES_CPU` to `baseline`, `x86-64-v2`, `x86-64-v3` or `x86-64-v4` to cap it, for instance to measure what it is worth on one machine. On arm64, NEON is part of the baseline and there is nothing to choose.
+
 ### 🛠️ From source
 
 #### Prerequisites

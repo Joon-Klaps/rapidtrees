@@ -518,6 +518,19 @@ fn pairwise_kf_from_newick_iter(
 }
 
 /// Python module definition
+/// The instruction-set level the pairwise loops run at on this machine.
+///
+/// Returns one of ``"baseline"``, ``"x86-64-v2"``, ``"x86-64-v3"`` or
+/// ``"x86-64-v4"``: the best the CPU supports, chosen at runtime, so a
+/// prebuilt wheel still uses POPCNT, AVX2 or AVX-512 where the CPU has them.
+/// Setting the ``RAPIDTREES_CPU`` environment variable to one of these names
+/// before the first distance call caps it. Always ``"baseline"`` off x86-64,
+/// which on arm64 already includes NEON.
+#[pyfunction]
+fn cpu_level() -> &'static str {
+    crate::cpu_level()
+}
+
 #[pymodule]
 fn rapidtrees(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pairwise_rf_from_newick_iter, m)?)?;
@@ -535,6 +548,7 @@ fn rapidtrees(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(pairwise_wrf_from_newick_iter, m)?)?;
     m.add_function(wrap_pyfunction!(pairwise_kf_from_newick_iter, m)?)?;
+    m.add_function(wrap_pyfunction!(cpu_level, m)?)?;
     m.add_class::<ProgressCounter>()?;
     Ok(())
 }

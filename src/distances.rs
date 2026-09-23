@@ -14,25 +14,26 @@
 //! There is no per-pair entry point. To compare two trees, build a two-tree
 //! `Snapshots` and read the off-diagonal cell.
 
+use crate::cpu::{self, Level, RowKernel};
 use crate::par::*;
 use crate::snapshot::Snapshots;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Fill a symmetric `n × n` matrix from `cell(i, j)`, one rayon task per row.
+/// Fill a symmetric `n × n` matrix one row at a time, one rayon task per row,
+/// each row compiled for `level` (see [`crate::cpu`]).
 ///
-/// Only the upper triangle is computed; the diagonal stays at `T::default()`.
+/// Only the upper triangle is computed; the diagonal stays at the default cell.
 /// `progress` is bumped by each row's pair count as that row finishes.
-fn fill_symmetric<T, F>(n: usize, progress: Option<&AtomicUsize>, cell: F) -> Vec<T>
-where
-    T: Copy + Default + Send,
-    F: Fn(usize, usize) -> T + Sync,
-{
-    let mut matrix = vec![T::default(); n * n];
+fn fill_symmetric<K: RowKernel>(
+    n: usize,
+    progress: Option<&AtomicUsize>,
+    level: Level,
+    kernel: &K,
+) -> Vec<K::Cell> {
+    let mut matrix = vec![K::Cell::default(); n * n];
 
     matrix.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
-        for (j, slot) in row.iter_mut().enumerate().skip(i + 1) {
-            *slot = cell(i, j);
-        }
+        cpu::fill_row(level, kernel, i, row);
         if let Some(counter) = progress {
             counter.fetch_add(n.saturating_sub(i + 1), Ordering::Relaxed);
         }
@@ -102,6 +103,11 @@ fn assign_columns(counts: &[u32], n_trees: usize, keep: impl Fn(u32) -> bool) ->
 /// one tree count towards that tree's `a` but can never be shared, so they get
 /// no column either. On a posterior that is most of the distinct splits.
 pub(crate) fn distance_rf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> Vec<u32> {
+    distance_rf_at(snaps, progress, Level::current())
+}
+
+/// [`distance_rf`] with its row loop compiled for `level`.
+fn distance_rf_at(snaps: &Snapshots, progress: Option<&AtomicUsize>, level: Level) -> Vec<u32> {
     let n_trees = snaps.snapshots.len();
     if n_trees == 0 {
         return Vec::new();
@@ -151,19 +157,46 @@ pub(crate) fn distance_rf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> 
         .map(|snap| (snap.split_ids.len() - everywhere) as u32)
         .collect();
 
-    fill_symmetric(n_trees, progress, |i, j| {
-        let (lo, hi) = (spans[i].0.max(spans[j].0), spans[i].1.min(spans[j].1));
-        let shared: u32 = if lo > hi {
-            0
-        } else {
-            row_slice(&packed, i, words)[lo..=hi]
-                .iter()
-                .zip(&row_slice(&packed, j, words)[lo..=hi])
-                .map(|(&x, &y)| (x & y).count_ones())
-                .sum()
-        };
-        kept_per_tree[i] + kept_per_tree[j] - 2 * shared
-    })
+    let kernel = RfRows {
+        packed: &packed,
+        words,
+        spans: &spans,
+        kept_per_tree: &kept_per_tree,
+    };
+    fill_symmetric(n_trees, progress, level, &kernel)
+}
+
+/// One RF row over packed presence bits: see [`distance_rf`].
+struct RfRows<'a> {
+    packed: &'a [u64],
+    words: usize,
+    /// First and last non-zero word of each row, empty as `(1, 0)`.
+    spans: &'a [(usize, usize)],
+    /// Each tree's split count, less the splits every tree holds.
+    kept_per_tree: &'a [u32],
+}
+
+impl RowKernel for RfRows<'_> {
+    type Cell = u32;
+
+    #[inline(always)]
+    fn fill_row(&self, i: usize, row: &mut [u32]) {
+        let (spans, kept) = (self.spans, self.kept_per_tree);
+        let own = row_slice(self.packed, i, self.words);
+        for (j, slot) in row.iter_mut().enumerate().skip(i + 1) {
+            let (lo, hi) = (spans[i].0.max(spans[j].0), spans[i].1.min(spans[j].1));
+            let shared: u32 = if lo > hi {
+                0
+            } else {
+                own[lo..=hi]
+                    .iter()
+                    .zip(&row_slice(self.packed, j, self.words)[lo..=hi])
+                    .map(|(&x, &y)| (x & y).count_ones())
+                    .sum()
+            };
+            *slot = kept[i] + kept[j] - 2 * shared;
+        }
+    }
 }
 
 // ─── weighted metrics (WRF, KF) ─────────────────────────────────────────────
@@ -226,6 +259,7 @@ fn shared_length_rows(
 fn weighted_distances(
     snaps: &Snapshots,
     progress: Option<&AtomicUsize>,
+    level: Level,
     term: impl Fn(f64) -> f64 + Sync,
     overlap: impl Fn(f64, f64) -> f64 + Sync,
     finish: impl Fn(f64) -> f64 + Sync,
@@ -248,12 +282,46 @@ fn weighted_distances(
         })
         .collect();
 
-    fill_symmetric(n, progress, |i, j| {
-        let row_i = row_slice(&rows, i, stride);
-        let row_j = row_slice(&rows, j, stride);
-        let shared_term: f64 = row_i.iter().zip(row_j).map(|(&a, &b)| overlap(a, b)).sum();
-        finish((self_total[i] + self_total[j] - 2.0 * shared_term).max(0.0))
-    })
+    let kernel = WeightedRows {
+        rows: &rows,
+        stride,
+        self_total: &self_total,
+        overlap,
+        finish,
+    };
+    fill_symmetric(n, progress, level, &kernel)
+}
+
+/// One WRF or KF row over dense length rows: see [`weighted_distances`].
+struct WeightedRows<'a, O, F> {
+    rows: &'a [f64],
+    stride: usize,
+    self_total: &'a [f64],
+    overlap: O,
+    finish: F,
+}
+
+impl<O, F> RowKernel for WeightedRows<'_, O, F>
+where
+    O: Fn(f64, f64) -> f64 + Sync,
+    F: Fn(f64) -> f64 + Sync,
+{
+    type Cell = f64;
+
+    #[inline(always)]
+    fn fill_row(&self, i: usize, row: &mut [f64]) {
+        let own = row_slice(self.rows, i, self.stride);
+        for (j, slot) in row.iter_mut().enumerate().skip(i + 1) {
+            let shared_term: f64 = own
+                .iter()
+                .zip(row_slice(self.rows, j, self.stride))
+                .map(|(&a, &b)| (self.overlap)(a, b))
+                .sum();
+            *slot = (self.finish)(
+                (self.self_total[i] + self.self_total[j] - 2.0 * shared_term).max(0.0),
+            );
+        }
+    }
 }
 
 /// `WRF(i, j) = Σ lenᵢ + Σ lenⱼ − 2·Σ min(lenᵢ, lenⱼ)`.
@@ -261,13 +329,23 @@ fn weighted_distances(
 /// The `min` form follows from `|a − b| = a + b − 2·min(a, b)`. Assumes
 /// non-negative branch lengths; missing lengths parse as 0.0.
 pub(crate) fn distance_wrf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> Vec<f64> {
-    weighted_distances(snaps, progress, |l| l, f64::min, |d| d)
+    distance_wrf_at(snaps, progress, Level::current())
+}
+
+/// [`distance_wrf`] with its row loop compiled for `level`.
+fn distance_wrf_at(snaps: &Snapshots, progress: Option<&AtomicUsize>, level: Level) -> Vec<f64> {
+    weighted_distances(snaps, progress, level, |l| l, f64::min, |d| d)
 }
 
 /// `KF(i, j) = sqrt(Σ lenᵢ² + Σ lenⱼ² − 2·Σ lenᵢ·lenⱼ)` — Euclidean distance in
 /// branch-length space.
 pub(crate) fn distance_kf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> Vec<f64> {
-    weighted_distances(snaps, progress, |l| l * l, |a, b| a * b, f64::sqrt)
+    distance_kf_at(snaps, progress, Level::current())
+}
+
+/// [`distance_kf`] with its row loop compiled for `level`.
+fn distance_kf_at(snaps: &Snapshots, progress: Option<&AtomicUsize>, level: Level) -> Vec<f64> {
+    weighted_distances(snaps, progress, level, |l| l * l, |a, b| a * b, f64::sqrt)
 }
 
 /// Twelve 10-taxon trees from the PHYLIP treedist reference suite.
@@ -709,7 +787,8 @@ fn kuhner_felsenstein_treedist() {
 
 #[cfg(test)]
 mod tests {
-    use super::{TREEDIST_TREES, assign_columns};
+    use super::{TREEDIST_TREES, assign_columns, distance_kf_at, distance_rf_at, distance_wrf_at};
+    use crate::cpu::Level;
     use crate::snapshot::{InternSnap, Snapshots};
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -1056,6 +1135,36 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Every instruction-set level this CPU can run must give the baseline's
+    /// matrices bit for bit: dispatch changes the speed, never the answer.
+    #[test]
+    fn every_cpu_level_matches_the_baseline_exactly() {
+        let mut state = 21;
+        let mut newicks: Vec<String> = (0..40).map(|_| random_newick(90, &mut state)).collect();
+        for k in 0..10 {
+            newicks.push(newicks[k].clone());
+        }
+        let refs: Vec<&str> = newicks.iter().map(|s| s.as_str()).collect();
+        let snaps = Snapshots::from_newicks(&refs, false).unwrap();
+
+        let rf = distance_rf_at(&snaps, None, Level::Baseline);
+        let wrf = distance_wrf_at(&snaps, None, Level::Baseline);
+        let kf = distance_kf_at(&snaps, None, Level::Baseline);
+        for level in Level::supported() {
+            assert_eq!(distance_rf_at(&snaps, None, level), rf, "RF at {level:?}");
+            let same_bits =
+                |a: &[f64], b: &[f64]| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+            assert!(
+                same_bits(&distance_wrf_at(&snaps, None, level), &wrf),
+                "WRF at {level:?}"
+            );
+            assert!(
+                same_bits(&distance_kf_at(&snaps, None, level), &kf),
+                "KF at {level:?}"
+            );
         }
     }
 

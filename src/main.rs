@@ -59,6 +59,13 @@ fn main() {
 
     let quiet = args.quiet;
     let t_total = Instant::now();
+    log_if(
+        quiet,
+        format!(
+            "Pairwise loops run at CPU level {}",
+            rapidtrees::cpu_level()
+        ),
+    );
     let t = Instant::now();
 
     let (names, interned) = load_beast_trees(
