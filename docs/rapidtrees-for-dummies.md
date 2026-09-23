@@ -170,9 +170,9 @@ The label table is seeded from a fixed constant, so this is not a source of run-
 
 ---
 
-## Step 4 — The DFS: folding one tree in a single pass
+## Step 4 — Reading the tree: folding it while the text goes by
 
-Each node accumulates three things — the struct is called `Acc`:
+No tree object is ever built. The reader (`snapshot/newick.rs`) walks the Newick text once, byte by byte, keeping a stack of the nodes still open. Each node accumulates three things:
 
 | Field | Meaning |
 | --- | --- |
@@ -182,9 +182,9 @@ Each node accumulates three things — the struct is called `Acc`:
 
 `size` is worth pausing on. It's the leaf count, carried along for free — which means the "is this a pendant?" and "is this trivial?" tests in Step 6 are integer comparisons rather than a full-width popcount over a bitset. Keeping it is what stops the `⌈n/64⌉` cost sneaking back in through the filter.
 
-The traversal is **two iterative passes over one flat array** indexed by node ID (iterative, not recursive — a 3 000-leaf caterpillar tree would blow the stack otherwise):
+The walk keeps its own stack rather than recursing, so a 3 000-leaf caterpillar tree cannot blow the call stack. Two things happen as the text goes by.
 
-**Pass 1 (pre-order)** — each leaf takes the next free slot in `leaf_order`:
+**A leaf name** takes the next free slot in `leaf_order`. Text order is pre-order, so:
 
 ```text
 leaf_order = [0, 1, 2, 3, 4, 5, 6]      // for Tree 1: A B C D E F G
@@ -194,7 +194,7 @@ leaf_order = [0, 1, 2, 3, 4, 5, 6]      // for Tree 1: A B C D E F G
 
 Because leaves are numbered *in traversal order*, every subtree occupies a **contiguous run** of `leaf_order`. That is why `first` + `size` is enough to name a leaf set later, with the tree itself long gone.
 
-**Pass 2 (post-order)** — an internal node is just the XOR of its children:
+**A `)`** closes a node, and an internal node is just the XOR of its children:
 
 ```text
 node({C,D}).fp    = acc[C].fp ⊕ acc[D].fp
@@ -202,7 +202,11 @@ node({C,D}).first = min(acc[C].first, acc[D].first)
 node({C,D}).size  = acc[C].size + acc[D].size
 ```
 
-One XOR, one `min`, one `+` per node. No allocation, no bitset, no popcount.
+One XOR, one `min`, one `+` per node. No allocation, no bitset, no popcount. The run-wide `total` is known before the first tree is read, so the canonical key of Step 5 is ready the moment the node closes.
+
+The same pass does the rest of the per-tree work. Each leaf name goes through the TRANSLATE table and into the run's leaf index, which also checks the leaf set: an unknown, repeated, missing or unnamed taxon is an error there and then. `[...]` comments are skipped wherever they sit, including BEAST's habit of putting them between the colon and the number (`13:[&rate=0.71]16.04`), and labels on internal nodes are ignored.
+
+This replaced parsing with phylotree, which built a `Tree` per input (a `String` for every name and every branch length, a `Node` with its own child vector per node) only for the walk above to read it once and drop it. That round trip was about three quarters of construction time on a posterior.
 
 Each node then becomes a `Part` — one edge of the tree:
 
@@ -237,21 +241,20 @@ Pendant edges are the one exception: they keep their raw fingerprint. Their comp
 
 ## Step 6 — Snapshot: one tree, ready to hand off
 
-A `Snapshot` is one tree's edges after filtering, canonicalizing and sorting:
+A `Snapshot` is one tree's edges after filtering, canonicalizing and merging duplicates:
 
 ```rust
 struct Snapshot {
-    parts: Vec<Part>,       // sorted by key, duplicates merged
+    parts: Vec<Part>,       // post-order, duplicates merged
     leaf_order: Vec<u32>,   // traversal-order leaf indices
     words: usize,           // ⌈n_leaves / 64⌉
 }
 ```
 
-Three things happen on the way in:
+Two things happen as each part is emitted:
 
 1. **Drop the trivial splits.** `size == 1` is a pendant (kept). `size >= n − 1` is a pendant's complement (dropped). Both decided by integer comparison on `size`.
-2. **Sort by `key`.** Note what is being sorted: a 16-byte integer. The bitset version sorted `⌈n/64⌉`-word arrays — at 2 000 taxa, a 256-byte comparison instead of a 16-byte one.
-3. **Merge duplicates.** In a rooted binary tree both children of the root canonicalize to the *same* split; without merging, RF would come out inflated by 2 versus phangorn's `RF.dist(rooted=FALSE)`. When two parts merge, their branch lengths are summed.
+2. **Merge duplicates.** In a rooted binary tree both children of the root canonicalize to the *same* split; without merging, RF would come out inflated by 2 versus phangorn's `RF.dist(rooted=FALSE)`. When two parts merge, their branch lengths are summed. Those two children are the only way two parts of an ordinary tree can share a key, so the reader merges them directly. A unary node (one child) repeats its child's split too; that is rare, and the reader falls back to sorting the tree's parts by key and merging equal ones.
 
 `Snapshot` is deliberately **short-lived**: built per tree, handed straight to the interner, dropped. Trees are processed in chunks sized to a memory budget, so peak memory stays near the *deduplicated* footprint instead of holding every tree's raw data at once.
 
@@ -406,14 +409,10 @@ That last row is the `{A,B}` split — stored as its complement, because the can
 ```text
   "(((A,B),(C,D)),(E,(F,G)));"
             │
-            │  strip BEAST annotations, apply TRANSLATE, parse
-            ▼
-        PhyloTree                                    ── per tree, transient
-            │
-            │  [build]  two iterative passes:
-            │           pre-order  → leaf_order slots
-            │           post-order → fp = XOR of children
-            │           key = min(fp, fp ^ total)
+            │  [newick]  one pass over the text:
+            │            leaf name → TRANSLATE, leaf check, leaf_order slot
+            │            ')'       → fp = XOR of children
+            │            key = min(fp, fp ^ total)
             ▼
     Snapshot { parts, leaf_order }                   ── per tree, dropped after interning
             │
@@ -447,10 +446,9 @@ The shape to remember: **all the expensive work happens once per tree, and every
 
 | Structure | Lifetime | Purpose |
 | --- | --- | --- |
-| `PhyloTree` | one tree | parsed Newick |
-| `Acc` | one node | `(fingerprint, first, size)` during the DFS |
+| `Open` | one node | `(fingerprint, first, children)` while its children are read |
 | `Part` | one edge | `(key, first, size, length)` |
-| `Snapshot` | one tree | all `Part`s, sorted and deduped |
+| `Snapshot` | one tree | all `Part`s, deduplicated |
 
 ### The two run-wide tables
 
@@ -477,11 +475,12 @@ Not every path needs everything, and both extras cost real work:
 | Module | Holds |
 | --- | --- |
 | `snapshot/fingerprint.rs` | the two run-wide tables, and the `Fingerprint` type |
-| `snapshot/build.rs` | `Acc`, `Part`, `Snapshot` — one tree in, one snapshot out |
+| `snapshot/newick.rs` | the reader: Newick text straight to a `Snapshot` |
+| `snapshot/build.rs` | `Part` and `Snapshot`, what one tree becomes |
 | `snapshot/intern.rs` | `Interner`, `InternSnap` — dedupe to `u32` IDs |
 | `snapshot/export.rs` | the flat byte buffers Python reads |
 | `snapshot/mod.rs` | `Snapshots`, the construction pipeline, `Retain` |
 | `distances.rs` | RF / WRF / KF over dense rows |
 | `snapshot/clades.rs` | the export-only leaf-set table, and its packed ordering |
-| `io.rs` | NEXUS/Newick parsing, BEAST annotation stripping |
+| `io.rs` | NEXUS/Newick file reading: tree lines, TRANSLATE, burn-in |
 | `api.rs` | PyO3 bindings — glue only, no computation |

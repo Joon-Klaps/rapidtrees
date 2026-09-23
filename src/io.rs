@@ -1,5 +1,4 @@
 use crate::snapshot::{Retain, Snapshots};
-use phylotree::tree::Tree;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
@@ -39,21 +38,6 @@ pub(crate) fn strip_annotations(newick: &str) -> Cow<'_, str> {
     }
 
     Cow::Owned(result)
-}
-
-/// Rename leaf nodes in a tree according to a translate map.
-///
-/// Used to apply BEAST translate blocks (numeric ID → taxon name). A no-op if
-/// `translate` is empty.
-pub fn rename_leaf_nodes(phylo_tree: &mut Tree, translate: &HashMap<String, String>) {
-    if translate.is_empty() {
-        return;
-    }
-    for leaf_id in phylo_tree.get_leaves() {
-        if let Ok(node) = phylo_tree.get_mut(&leaf_id) {
-            node.name = node.name.as_ref().and_then(|n| translate.get(n).cloned());
-        }
-    }
 }
 
 /// Tree-file formats [`load_beast_trees`] can read.
@@ -486,39 +470,6 @@ mod load_tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].1, "(A:1,B:1);");
         assert_eq!(extract_name_state(lines[0].0), ("STATE_10".into(), 10));
-    }
-
-    // ── rename_leaf_nodes ─────────────────────────────────────────────────────
-
-    #[test]
-    fn test_rename_leaf_nodes_applies_translate() {
-        let translate: HashMap<String, String> = [
-            ("1".to_string(), "Alpha".to_string()),
-            ("2".to_string(), "Beta".to_string()),
-        ]
-        .into();
-        let mut tree = phylotree::tree::Tree::from_newick("(1:1.0,2:1.0);").unwrap();
-        rename_leaf_nodes(&mut tree, &translate);
-        let leaf_names: Vec<_> = tree
-            .get_leaves()
-            .iter()
-            .filter_map(|id| tree.get(id).ok()?.name.clone())
-            .collect();
-        assert!(leaf_names.contains(&"Alpha".to_string()));
-        assert!(leaf_names.contains(&"Beta".to_string()));
-    }
-
-    #[test]
-    fn test_rename_leaf_nodes_noop_on_empty_map() {
-        let mut tree = phylotree::tree::Tree::from_newick("(A:1.0,B:1.0);").unwrap();
-        rename_leaf_nodes(&mut tree, &HashMap::new());
-        let leaf_names: Vec<_> = tree
-            .get_leaves()
-            .iter()
-            .filter_map(|id| tree.get(id).ok()?.name.clone())
-            .collect();
-        assert!(leaf_names.contains(&"A".to_string()));
-        assert!(leaf_names.contains(&"B".to_string()));
     }
 
     // ── load_beast_raw ────────────────────────────────────────────────────────
