@@ -5,6 +5,16 @@ Python **iterator** of newick strings, which lets the library stream through
 arbitrarily large tree files without materialising all strings in memory at
 once.
 
+> **On exactness.** Splits are identified by a 128-bit fingerprint rather than
+> by comparing leaf sets — that is what keeps building a tree linear in its
+> taxon count instead of quadratic. Two *distinct* splits are therefore merged
+> if their fingerprints collide, with probability about `e² / 2¹²⁹` for `e`
+> distinct splits in the run: `1.5 × 10⁻²³` at a hundred million splits, some
+> nineteen orders of magnitude below the rate at which the machine's own RAM
+> flips a bit unnoticed. Results are otherwise deterministic — the same input
+> gives the same split IDs and the same column order on every run and every
+> machine.
+
 ---
 
 ## Functions
@@ -244,15 +254,26 @@ matrix **and** the bipartition presence matrix in a single parse, returning a
 | `bipartition_clade_bytes` | `bytes` | Packed bitmasks, shape `(n_bip, ceil(n_leaves/8))` — see below |
 
 The presence matrix entry `presence[i, j]` is `1` if edge `j` appears in tree
-`i`, otherwise `0`. Column order is deterministic (ascending `Bitset` order)
-and stable across calls on the same tree set.
+`i`, otherwise `0`. Column order is deterministic and stable across calls on
+the same tree set, so the same trees always give the same column indices.
 
 #### Edge table contents
 
 `n_bip` counts **all** edges: pendant (leaf) edges and internal bipartitions.
-Pendant edges appear as single-bit rows (one bit set), sorted before internal
-bipartitions. Since all trees share the same leaf set, pendant columns are always
-`1` in every row of the presence matrix.
+Pendant edges appear as single-bit rows (one bit set). Since all trees share the
+same leaf set, pendant columns are always `1` in every row of the presence
+matrix.
+
+> **Do not slice columns by position.** Pendants are *not* grouped before
+> internal bipartitions — columns are ordered by leaf-set bit pattern, which
+> interleaves them. For `(((A,B),(C,D)),(E,(F,G)));` the column sizes run
+> `1 1 1 1 2 1 2 3 1 1 2 3 5`: the internal split `{C,D}` sorts ahead of the
+> pendant `{E}`. Select columns by testing the row instead:
+>
+> ```python
+> pendants = bip_bool.sum(axis=1) == 1
+> internal = ~pendants
+> ```
 
 #### Canonicalisation note
 
@@ -260,7 +281,7 @@ For internal bipartitions (rows with ≥ 2 bits set) the canonical side is the
 half that does **not** contain the first leaf alphabetically, so bit 0 is never
 set in those rows. Pendant edges are stored verbatim (no flip), so the pendant
 of the first leaf has bit 0 set. The complement of an internal bipartition can
-be derived as `~bip_bool[j] & True` (masked to `n_leaves` bits).
+be derived as `1 - bip_bool[j]`, which is already masked to `n_leaves` bits.
 
 #### Bipartition clade bytes format
 
@@ -349,8 +370,8 @@ returning a 6-tuple:
 `0.0` if that edge is absent. Pendant (leaf-edge) columns are always non-zero
 because every tree has every leaf.
 
-Column order matches `bipartition_clade_bytes` (ascending `Bitset` order,
-deterministic and stable across calls on the same tree set).
+Column order matches `bipartition_clade_bytes`, and is deterministic and
+stable across calls on the same tree set.
 
 #### Decode and compute Fréchet ESS traces
 

@@ -1,5 +1,5 @@
 use cpu_time::ProcessTime;
-use rapidtrees::{Bitset, Snapshots};
+use rapidtrees::Snapshots;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::mem;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -122,16 +122,16 @@ fn format_count(count: u64) -> String {
 /// branch lengths (f64). This is exact when all trees share the same topology
 /// (as in this benchmark).
 fn estimate_size(snaps: &Snapshots) -> usize {
-    let n_bip = snaps.bipartitions.len();
+    let n_bip = snaps.n_distinct_splits();
     let n_trees = snaps.len();
     let words = snaps.words_per_bitset;
 
     // Struct overhead (Vec headers, usize fields)
     let struct_size = mem::size_of::<Snapshots>();
 
-    // bipartitions: Vec<Bitset>, each Bitset has a Vec<u64> on the heap
-    let bip_vec_size =
-        snaps.bipartitions.capacity() * (mem::size_of::<Bitset>() + words * mem::size_of::<u64>());
+    // bipartitions: one bit-packed leaf set per distinct split, each a Vec<u64>
+    // on the heap behind a Vec header.
+    let bip_vec_size = n_bip * (mem::size_of::<Vec<u64>>() + words * mem::size_of::<u64>());
 
     // snapshots (Vec<InternSnap>): per tree = split_ids Vec<u32> + lengths Vec<f64>
     // Vec header (24 bytes) + actual data for each

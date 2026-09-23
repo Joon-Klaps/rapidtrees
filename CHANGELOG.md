@@ -10,7 +10,7 @@ This project uses release names based on random words from [codenamegenerator.co
 
 ## [UNRELEASED] - MICROSOFT_COORPERATION SNAKE (YYYY-MM-DD)
 
--([#29](https://github.com/Joon-Klaps/rapidtrees/issues/29)) - include
+-([#29](https://github.com/Joon-Klaps/rapidtrees/issues/29)) - Modify `load_beast_trees` to use an new (optional) arg, that mentions if branch lenghts need to be stored
 
 ## [0.9.0] - Whistler Taipan (2026-09-10)
 
