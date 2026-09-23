@@ -11,6 +11,7 @@ This project uses release names based on random words from [codenamegenerator.co
 ## [UNRELEASED] - MICROSOFT_COORPERATION SNAKE (YYYY-MM-DD)
 
 - ([#29](https://github.com/Joon-Klaps/rapidtrees/issues/29)) - Modify `load_beast_trees` to use a new (optional) arg, that mentions if branch lengths need to be stored
+- ([#30](https://github.com/Joon-Klaps/rapidtrees/issues/30)) - Remove the sparse backend (it only beat dense on fully independent trees), dropping `--backend` and the Rust `Backend`, `Kernel`, `Distances` and `pairwise_*_with` items
 
 ## [0.9.0] - Whistler Taipan (2026-09-10)
 

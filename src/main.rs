@@ -1,6 +1,6 @@
 use clap::{Parser, ValueEnum};
+use rapidtrees::Retain;
 use rapidtrees::io::{load_beast_trees, write_matrix_tsv};
-use rapidtrees::{Backend, Kernel, Retain};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,10 +41,6 @@ struct Args {
     /// Compute rooted distances (compare clades) instead of unrooted (compare bipartitions)
     #[arg(long = "rooted", default_value_t = false)]
     rooted: bool,
-
-    /// Per-pair kernel: auto | dense | sparse. `auto` picks from tree diversity
-    #[arg(long = "backend", value_enum, default_value_t = Backend::Auto)]
-    backend: Backend,
 
     /// Quiet mode: suppresses progress messages on stdout
     #[arg(short = 'q', long = "quiet", default_value_t = false)]
@@ -108,21 +104,20 @@ fn main() {
     // three tokens say here.
     macro_rules! compute_and_write {
         ($metric:ident) => {{
-            let dist = run_with_progress(n_pairs, show_progress, |counter| {
-                interned.$metric(Some(counter), args.backend)
+            let mat = run_with_progress(n_pairs, show_progress, |counter| {
+                interned.$metric(Some(counter))
             });
-            log_backend(quiet, args.backend, dist.kernel);
             log_computed(quiet, metric_label, &t);
             let t = Instant::now();
-            let r = write_matrix_tsv(output_path, &names, &dist.matrix, interned.len());
+            let r = write_matrix_tsv(output_path, &names, &mat, interned.len());
             (r, t)
         }};
     }
 
     let (write_result, t) = match args.metric {
-        MetricArg::Rf => compute_and_write!(pairwise_rf_with),
-        MetricArg::Weighted => compute_and_write!(pairwise_wrf_with),
-        MetricArg::Kf => compute_and_write!(pairwise_kf_with),
+        MetricArg::Rf => compute_and_write!(pairwise_rf),
+        MetricArg::Weighted => compute_and_write!(pairwise_wrf),
+        MetricArg::Kf => compute_and_write!(pairwise_kf),
     };
     if let Err(e) = write_result {
         eprintln!("Failed to write output {}: {e}", output_path.display());
@@ -170,12 +165,6 @@ fn log_collision_bound(quiet: bool, distinct_splits: usize) {
         quiet,
         format!("Distinct splits e = {distinct_splits}; collision bound e²/2¹²⁹ = {bound:.2e}"),
     );
-}
-
-/// Name the kernel that ran, so `auto`'s choice is in the run log.
-fn log_backend(quiet: bool, requested: Backend, chosen: Kernel) {
-    let requested = format!("{requested:?}").to_lowercase();
-    log_if(quiet, format!("Backend: {chosen} (--backend {requested})"));
 }
 
 fn log_if(quiet: bool, msg: String) {
