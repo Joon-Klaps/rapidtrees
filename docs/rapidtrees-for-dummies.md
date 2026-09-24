@@ -344,6 +344,7 @@ Two further tricks keep the sweep short:
 
 - **Column ordering.** Splits are sorted by how often they occur, and each tree records the first and last column it touches — so a pair's comparison can skip whole stretches of the matrix.
 - **Dropping dead columns.** A split present in *every* tree cancels out of every RF distance, and a split present in only *one* tree can never be shared, so neither gets a column. Both still count towards each tree's own total. On a posterior the second group is most of the distinct splits.
+- **Rare splits skip the rows.** A split held by fewer than 3 % of the trees gets no bit column either. It goes to a posting list, described in the next section, and each row counts those shared splits straight into its output. A bit column is cheap, but every pair pays for it whether or not either tree holds the split. On a posterior most shared splits are held by a handful of trees, so the lists take most of the width out of the sweep.
 
 ### The weighted metrics: dense where common, buckets where rare
 
@@ -496,7 +497,7 @@ Not every path needs everything, and both extras cost real work:
 | `snapshot/intern.rs` | `Interner`, `InternSnap` — dedupe to `u32` IDs |
 | `snapshot/export.rs` | the flat byte buffers Python reads |
 | `snapshot/mod.rs` | `Snapshots`, the construction pipeline, `Retain` |
-| `distances.rs` | RF over dense bit-rows; WRF / KF over dense columns plus posting lists |
+| `distances.rs` | RF over dense bit-rows plus posting lists; WRF / KF over dense columns plus posting lists |
 | `snapshot/clades.rs` | the export-only leaf-set table, and its packed ordering |
 | `io.rs` | NEXUS/Newick file reading: tree lines, TRANSLATE, burn-in |
 | `api.rs` | PyO3 bindings — glue only, no computation |
