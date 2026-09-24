@@ -14,7 +14,7 @@ This project uses release names based on random words from [codenamegenerator.co
 - ([#30](https://github.com/Joon-Klaps/rapidtrees/issues/30)) - Remove the sparse backend (it only beat dense on fully independent trees), dropping `--backend` and the Rust `Backend`, `Kernel`, `Distances` and `pairwise_*_with` items
 - ([#31](https://github.com/Joon-Klaps/rapidtrees/issues/31)) - Refactor interned split IDs handling (no sort), introduce split_counts to track how split frequencies
 - ([#32](https://github.com/Joon-Klaps/rapidtrees/issues/32)) - Replace phylotree parsing with a streaming Newick reader that builds snapshots directly, removing the phylotree dependency.
-- ([#33](https://github.com/Joon-Klaps/rapidtrees/pull/33)) - **Speed (x86-64, runtime CPU dispatch):** The pairwise row loops are compiled for x86-64-v2 (POPCNT), v3 (AVX2) and v4 (AVX-512 with VPOPCNTDQ) as well as the baseline, and the best level the CPU supports is chosen at runtime. PyPI wheels and `cargo install` builds target the baseline, which predates POPCNT, so they previously counted RF bits with an SSE2 bit trick whatever the machine. Every level gives bit-identical matrices. New: `rapidtrees::cpu_level()` / `rapidtrees.cpu_level()` report the level, the CLI logs it, and `RAPIDTREES_CPU` caps it. Minimum Rust is now 1.89 (`rust-version`), for the AVX-512 target features.
+- ([#33](https://github.com/Joon-Klaps/rapidtrees/pull/33)) - __PERFORMANCE__: The pairwise row loops are compiled for several x86-64 instruction-set levels and the best one the CPU supports is chosen at runtime, reported by a new `cpu_level()` and capped by `RAPIDTREES_CPU`.
 
 ## [0.9.0] - Whistler Taipan (2026-09-10)
 
