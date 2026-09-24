@@ -250,15 +250,80 @@ impl Postings {
 
 // ─── Robinson–Foulds ────────────────────────────────────────────────────────
 
-/// `RF(i, j) = aᵢ + aⱼ − 2·shared(i, j)`, where `shared` counts the splits
-/// both trees hold.
+/// One bitmask row per tree over RF's bit columns: bit `c` of row `i` is set
+/// when tree `i` holds the split in column `c`.
 ///
-/// Splits held by *every* tree add equally to both `a` values and to the shared
-/// count, so they cancel exactly and are dropped. Splits held by one tree count
-/// towards that tree's `a` but can never be shared, so they get nothing either.
-/// On a posterior that is most of the distinct splits. The rest are shared by
-/// a popcount over packed bit-rows for the widely held ones and by posting
-/// lists for the rare ones.
+/// `spans[i]` is the half-open range of words where row `i` has bits set,
+/// `(0, 0)` when it has none. Columns run in descending tree count, so a row's
+/// bits cluster and a pair only sweeps the words where both spans overlap.
+struct BitRows {
+    words: usize,
+    packed: Vec<u64>,
+    spans: Vec<(usize, usize)>,
+}
+
+impl BitRows {
+    /// `column_of` and `n_columns` as [`assign_columns`] returns them.
+    fn build(snaps: &Snapshots, column_of: &[u32], n_columns: usize) -> Self {
+        let n = snaps.snapshots.len();
+        let words = n_columns.div_ceil(64);
+        let mut packed = vec![0u64; n * words];
+        if words > 0 {
+            packed
+                .par_chunks_mut(words)
+                .zip(&snaps.snapshots)
+                .for_each(|(row, snap)| {
+                    for col in snap
+                        .split_ids
+                        .iter()
+                        .filter_map(|&id| column(column_of, id))
+                    {
+                        row[col / 64] |= 1u64 << (col % 64);
+                    }
+                });
+        }
+
+        let spans = (0..n)
+            .map(|i| {
+                let row = row_slice(&packed, i, words);
+                let hi = row
+                    .iter()
+                    .rposition(|&word| word != 0)
+                    .map_or(0, |last| last + 1);
+                let lo = row.iter().position(|&word| word != 0).unwrap_or(hi);
+                (lo, hi)
+            })
+            .collect();
+        Self {
+            words,
+            packed,
+            spans,
+        }
+    }
+
+    /// How many bit columns rows `i` and `j` both have set.
+    #[inline]
+    fn shared(&self, i: usize, j: usize) -> u32 {
+        let lo = self.spans[i].0.max(self.spans[j].0);
+        let hi = self.spans[i].1.min(self.spans[j].1);
+        if lo >= hi {
+            return 0;
+        }
+        let a = &row_slice(&self.packed, i, self.words)[lo..hi];
+        let b = &row_slice(&self.packed, j, self.words)[lo..hi];
+        a.iter().zip(b).map(|(&x, &y)| (x & y).count_ones()).sum()
+    }
+}
+
+/// `RF(i, j) = selfᵢ + selfⱼ − 2·shared(i, j)`, where `self` counts a tree's
+/// splits and `shared` the splits both trees hold.
+///
+/// Splits held by *every* tree add equally to both `self` values and to the
+/// shared count, so they cancel exactly and are dropped. Splits held by one tree
+/// count towards that tree's `self` but can never be shared, so they get nothing
+/// either. On a posterior that is most of the distinct splits. The rest are
+/// shared by a popcount over packed bit-rows for the widely held ones and by
+/// posting lists for the rare ones.
 pub(crate) fn distance_rf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> Vec<u32> {
     let min_dense = min_dense(snaps.snapshots.len(), RF_DENSE_SHARE);
     distance_rf_split(snaps, progress, min_dense)
@@ -272,79 +337,41 @@ fn distance_rf_split(
     progress: Option<&AtomicUsize>,
     min_dense: u32,
 ) -> Vec<u32> {
-    let n_trees = snaps.snapshots.len();
-    if n_trees == 0 {
+    let n = snaps.snapshots.len();
+    if n == 0 {
         return Vec::new();
     }
-    let everyone = n_trees as u32;
+    let counts = &snaps.split_counts;
 
-    let (bit_slot, kept) = assign_columns(&snaps.split_counts, n_trees, |count| {
-        count >= min_dense && count < everyone
-    });
-    let postings = Postings::build(snaps, min_dense.min(everyone), false);
-    let everywhere = snaps
-        .split_counts
-        .iter()
-        .filter(|&&count| count == everyone)
-        .count();
-    let words = kept.div_ceil(64);
+    // A split held by all `n` trees cancels, so it gets neither a bit column
+    // nor a posting list.
+    let all = n as u32;
+    let (bit_col, n_bits) = assign_columns(counts, n, |count| (min_dense..all).contains(&count));
+    let bits = BitRows::build(snaps, &bit_col, n_bits);
+    let postings = Postings::build(snaps, min_dense.min(all), false);
 
-    // One bitmask row per tree: a set bit means "this tree has that split".
-    // `spans[i]` is the first and last non-zero word of row `i`, empty as
-    // `(1, 0)`. Tracked while the row is built, so it costs nothing extra.
-    let mut packed = vec![0u64; n_trees * words];
-    let mut spans = vec![(1usize, 0usize); n_trees];
-    if words > 0 {
-        packed
-            .par_chunks_mut(words)
-            .zip(spans.par_chunks_mut(1))
-            .zip(&snaps.snapshots)
-            .for_each(|((row, span), snap)| {
-                let (mut lo, mut hi) = (usize::MAX, 0usize);
-                for slot in snap
-                    .split_ids
-                    .iter()
-                    .filter_map(|&id| column(&bit_slot, id))
-                {
-                    let word = slot >> 6;
-                    row[word] |= 1u64 << (slot & 63);
-                    (lo, hi) = (lo.min(word), hi.max(word));
-                }
-                if lo != usize::MAX {
-                    span[0] = (lo, hi);
-                }
-            });
-    }
-
-    // Every tree holds all the everywhere-splits, so `a` is just its total minus
-    // that fixed count.
-    let kept_per_tree: Vec<u32> = snaps
+    // Every tree holds each of the `n_universal` splits, so its `self` is its
+    // split count minus that fixed number.
+    let n_universal = counts.iter().filter(|&&count| count == all).count();
+    let self_count: Vec<u32> = snaps
         .snapshots
         .iter()
-        .map(|snap| (snap.split_ids.len() - everywhere) as u32)
+        .map(|snap| (snap.split_ids.len() - n_universal) as u32)
         .collect();
 
-    fill_symmetric(n_trees, progress, |i, row: &mut [u32]| {
+    fill_symmetric(n, progress, |i, row: &mut [u32]| {
         // Shared splits from the posting lists first, counted in place.
-        let posted = snaps.snapshots[i].split_ids.iter();
-        for col in posted.filter_map(|&id| postings.column(id)) {
-            for &j in postings.after(col, i).0 {
+        let split_ids = &snaps.snapshots[i].split_ids;
+        for col in split_ids.iter().filter_map(|&id| postings.column(id)) {
+            let (trees, _) = postings.after(col, i);
+            for &j in trees {
                 row[j as usize] += 1;
             }
         }
 
         for (j, slot) in row.iter_mut().enumerate().skip(i + 1) {
-            let (lo, hi) = (spans[i].0.max(spans[j].0), spans[i].1.min(spans[j].1));
-            let shared: u32 = if lo > hi {
-                0
-            } else {
-                row_slice(&packed, i, words)[lo..=hi]
-                    .iter()
-                    .zip(&row_slice(&packed, j, words)[lo..=hi])
-                    .map(|(&x, &y)| (x & y).count_ones())
-                    .sum()
-            };
-            *slot = kept_per_tree[i] + kept_per_tree[j] - 2 * (shared + *slot);
+            let shared = bits.shared(i, j) + *slot;
+            *slot = self_count[i] + self_count[j] - 2 * shared;
         }
     })
 }
