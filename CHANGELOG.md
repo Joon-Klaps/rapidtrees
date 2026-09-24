@@ -14,6 +14,7 @@ This project uses release names based on random words from [codenamegenerator.co
 - ([#30](https://github.com/Joon-Klaps/rapidtrees/pull/30)) - __PERFORMANCE__ __BREAKING API CHANGE__: The sparse backend is removed, together with `--backend` and the Rust `Backend`, `Kernel`, `Distances` and `pairwise_*_with` items.
 - ([#31](https://github.com/Joon-Klaps/rapidtrees/pull/31)) - __PERFORMANCE__: Interned split IDs are no longer sorted, and per-split tree counts (`split_counts`) drive the column layout.
 - ([#32](https://github.com/Joon-Klaps/rapidtrees/pull/32)) - __PERFORMANCE__ __BREAKING API CHANGE__: A streaming Newick reader builds snapshots directly, removing the phylotree dependency and `io::rename_leaf_nodes`.
+- ([#35](https://github.com/Joon-Klaps/rapidtrees/pull/35)) - __PERFORMANCE__: Weighted RF and KF keep dense columns only for widely held splits and give rarely held splits posting lists, so a pair no longer sweeps every shared split.
 
 ## [0.9.0] - Whistler Taipan (2026-09-10)
 
