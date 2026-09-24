@@ -15,6 +15,7 @@ This project uses release names based on random words from [codenamegenerator.co
 - ([#31](https://github.com/Joon-Klaps/rapidtrees/issues/31)) - Refactor interned split IDs handling (no sort), introduce split_counts to track how split frequencies
 - ([#32](https://github.com/Joon-Klaps/rapidtrees/issues/32)) - Replace phylotree parsing with a streaming Newick reader that builds snapshots directly, removing the phylotree dependency.
 - ([#35](https://github.com/Joon-Klaps/rapidtrees/pull/35)) - __PERFORMANCE__: Weighted RF and KF keep dense columns only for widely held splits and give rarely held splits posting lists, so a pair no longer sweeps every shared split.
+- ([#38](https://github.com/Joon-Klaps/rapidtrees/pull/38)) - __PERFORMANCE__: RF gives rarely held splits posting lists instead of bit columns, as the weighted metrics do.
 
 ## [0.9.0] - Whistler Taipan (2026-09-10)
 
