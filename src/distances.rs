@@ -61,17 +61,48 @@ const RF_DENSE_SHARE: f64 = 0.03;
 const WEIGHTED_DENSE_SHARE: f64 = 0.25;
 
 /// Fewest trees at which RF gives any split a posting list.
-///
-/// Below this the whole RF matrix takes well under a millisecond, and a
-/// posting list's fixed cost (a second pass over every tree's splits, one
-/// allocation per tree) outweighs the bit columns it saves: at 100 trees the
-/// lists made RF 1.5 to 1.7 times slower, at 300 trees 1.6 times faster. The
-/// weighted metrics need no such floor, since an `f64` column costs 64 times
-/// what a bit does.
 const RF_MIN_TREES_FOR_POSTINGS: usize = 256;
 
 /// Marks a split that [`assign_columns`] gave no column.
 const NO_COLUMN: u32 = u32::MAX;
+
+// ─── dense/posting boundary ─────────────────────────────────────────────────
+
+/// `default`, unless `value` is a finite, non-negative number.
+///
+fn parse_share(value: Option<&str>, default: f64) -> f64 {
+    value
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|share| share.is_finite() && *share >= 0.0)
+        .unwrap_or(default)
+}
+
+/// [`RF_DENSE_SHARE`], or `RAPIDTREES_RF_DENSE_SHARE` when that is set. Read
+/// once per process. The variable exists to re-tune the boundary on other data
+/// or hardware; it changes the speed and never a distance.
+fn rf_dense_share() -> f64 {
+    static SHARE: OnceLock<f64> = OnceLock::new();
+    *SHARE.get_or_init(|| {
+        parse_share(
+            std::env::var("RAPIDTREES_RF_DENSE_SHARE").ok().as_deref(),
+            RF_DENSE_SHARE,
+        )
+    })
+}
+
+/// [`WEIGHTED_DENSE_SHARE`], or `RAPIDTREES_WEIGHTED_DENSE_SHARE` when that is
+/// set. See [`rf_dense_share`].
+fn weighted_dense_share() -> f64 {
+    static SHARE: OnceLock<f64> = OnceLock::new();
+    *SHARE.get_or_init(|| {
+        parse_share(
+            std::env::var("RAPIDTREES_WEIGHTED_DENSE_SHARE")
+                .ok()
+                .as_deref(),
+            WEIGHTED_DENSE_SHARE,
+        )
+    })
+}
 
 /// Fill a symmetric `n × n` matrix one row at a time, one rayon task per row.
 ///
@@ -163,47 +194,6 @@ fn assign_columns(counts: &[u32], n_trees: usize, keep: impl Fn(u32) -> bool) ->
         })
         .collect();
     (column_of, kept as usize)
-}
-
-// ─── dense/posting boundary ─────────────────────────────────────────────────
-
-/// `default`, unless `value` is a finite, non-negative number.
-///
-/// The value is the share of trees a split must be held by to keep a dense
-/// column. Anything above 1 posts every split and 0 keeps every split dense;
-/// every value gives the same distances, only at a different speed.
-fn parse_share(value: Option<&str>, default: f64) -> f64 {
-    value
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|share| share.is_finite() && *share >= 0.0)
-        .unwrap_or(default)
-}
-
-/// [`RF_DENSE_SHARE`], or `RAPIDTREES_RF_DENSE_SHARE` when that is set. Read
-/// once per process. The variable exists to re-tune the boundary on other data
-/// or hardware; it changes the speed and never a distance.
-fn rf_dense_share() -> f64 {
-    static SHARE: OnceLock<f64> = OnceLock::new();
-    *SHARE.get_or_init(|| {
-        parse_share(
-            std::env::var("RAPIDTREES_RF_DENSE_SHARE").ok().as_deref(),
-            RF_DENSE_SHARE,
-        )
-    })
-}
-
-/// [`WEIGHTED_DENSE_SHARE`], or `RAPIDTREES_WEIGHTED_DENSE_SHARE` when that is
-/// set. See [`rf_dense_share`].
-fn weighted_dense_share() -> f64 {
-    static SHARE: OnceLock<f64> = OnceLock::new();
-    *SHARE.get_or_init(|| {
-        parse_share(
-            std::env::var("RAPIDTREES_WEIGHTED_DENSE_SHARE")
-                .ok()
-                .as_deref(),
-            WEIGHTED_DENSE_SHARE,
-        )
-    })
 }
 
 /// The fewest trees that must hold a split for it to keep a dense column:
