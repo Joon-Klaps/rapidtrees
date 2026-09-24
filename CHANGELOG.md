@@ -14,7 +14,6 @@ This project uses release names based on random words from [codenamegenerator.co
 - ([#30](https://github.com/Joon-Klaps/rapidtrees/issues/30)) - Remove the sparse backend (it only beat dense on fully independent trees), dropping `--backend` and the Rust `Backend`, `Kernel`, `Distances` and `pairwise_*_with` items
 - ([#31](https://github.com/Joon-Klaps/rapidtrees/issues/31)) - Refactor interned split IDs handling (no sort), introduce split_counts to track how split frequencies
 - ([#32](https://github.com/Joon-Klaps/rapidtrees/issues/32)) - Replace phylotree parsing with a streaming Newick reader that builds snapshots directly, removing the phylotree dependency.
-- **Speed (CLI output):** `write_matrix_tsv` formats blocks of rows in parallel and writes them in order, so the text formatting no longer runs on one thread. Writing a 10 000-tree matrix, 8 threads: RF **1.43 → 0.19 s**, KF **6.64 → 0.87 s** (before, the KF write took longer than the distances themselves). Output is byte-identical; one thread is unchanged.
 
 ## [0.9.0] - Whistler Taipan (2026-09-10)
 
