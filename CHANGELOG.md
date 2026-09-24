@@ -11,6 +11,7 @@ This project uses release names based on random words from [codenamegenerator.co
 ## [UNRELEASED] - MICROSOFT_COORPERATION SNAKE (YYYY-MM-DD)
 
 ## [0.10.0] - Surface Copperhead (2026-09-24)
+
 - ([#29](https://github.com/Joon-Klaps/rapidtrees/pull/29)) - __FEATURE__ __BREAKING API CHANGE__: `load_beast_trees` takes an optional `Retain` argument saying whether branch lengths and bipartitions need to be kept.
 - ([#30](https://github.com/Joon-Klaps/rapidtrees/pull/30)) - __PERFORMANCE__ __BREAKING API CHANGE__: The sparse backend is removed, together with `--backend` and the Rust `Backend`, `Kernel`, `Distances` and `pairwise_*_with` items.
 - ([#31](https://github.com/Joon-Klaps/rapidtrees/pull/31)) - __PERFORMANCE__: Interned split IDs are no longer sorted, and per-split tree counts (`split_counts`) drive the column layout.
