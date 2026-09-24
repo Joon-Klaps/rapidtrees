@@ -10,6 +10,8 @@ This project uses release names based on random words from [codenamegenerator.co
 
 ## [UNRELEASED] - MICROSOFT_COORPERATION SNAKE (YYYY-MM-DD)
 
+## [0.10.0] - Surface Copperhead (2026-09-24)
+
 - ([#29](https://github.com/Joon-Klaps/rapidtrees/issues/29)) - Modify `load_beast_trees` to use a new (optional) arg, that mentions if branch lengths need to be stored
 - ([#30](https://github.com/Joon-Klaps/rapidtrees/issues/30)) - Remove the sparse backend (it only beat dense on fully independent trees), dropping `--backend` and the Rust `Backend`, `Kernel`, `Distances` and `pairwise_*_with` items
 - ([#31](https://github.com/Joon-Klaps/rapidtrees/issues/31)) - Refactor interned split IDs handling (no sort), introduce split_counts to track how split frequencies
