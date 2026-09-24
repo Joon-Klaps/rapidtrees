@@ -16,6 +16,7 @@ This project uses release names based on random words from [codenamegenerator.co
 - ([#32](https://github.com/Joon-Klaps/rapidtrees/pull/32)) - __PERFORMANCE__ __BREAKING API CHANGE__: A streaming Newick reader builds snapshots directly, removing the phylotree dependency and `io::rename_leaf_nodes`.
 - ([#35](https://github.com/Joon-Klaps/rapidtrees/pull/35)) - __PERFORMANCE__: Weighted RF and KF keep dense columns only for widely held splits and give rarely held splits posting lists, so a pair no longer sweeps every shared split.
 - ([#38](https://github.com/Joon-Klaps/rapidtrees/pull/38)) - __PERFORMANCE__: RF gives rarely held splits posting lists instead of bit columns, as the weighted metrics do.
+- ([#40](https://github.com/Joon-Klaps/rapidtrees/pull/40)) - __FEATURE__: `RAPIDTREES_RF_DENSE_SHARE` and `RAPIDTREES_WEIGHTED_DENSE_SHARE` override the default dense/posting boundaries without a rebuild.
 
 ## [0.9.0] - Whistler Taipan (2026-09-10)
 
