@@ -338,12 +338,29 @@ One comparison is now cheap. Eight million of them still need care.
 RF(i, j) = popcount(row_i XOR row_j)
 ```
 
-which handles 64 splits per instruction. WRF and KF sweep rows of branch lengths the same way. A pair's cost is set by the width of the split table rather than by how much the two trees share, so the kernel is cheap on an MCMC posterior, where the trees are similar, the table is narrow and the matrix stays small. On a set of unrelated trees the table grows towards `n_trees × (n_taxa − 3)` splits, and the matrix widens with it.
+which handles 64 splits per instruction. A pair's cost is set by the width of the split table rather than by how much the two trees share, so the kernel is cheap on an MCMC posterior, where the trees are similar, the table is narrow and the matrix stays small. On a set of unrelated trees the table grows towards `n_trees × (n_taxa − 3)` splits, and the matrix widens with it.
 
 Two further tricks keep the sweep short:
 
 - **Column ordering.** Splits are sorted by how often they occur, and each tree records the first and last column it touches — so a pair's comparison can skip whole stretches of the matrix.
 - **Dropping dead columns.** A split present in *every* tree cancels out of every RF distance, and a split present in only *one* tree can never be shared, so neither gets a column. Both still count towards each tree's own total. On a posterior the second group is most of the distinct splits.
+- **Rare splits skip the rows.** A split held by fewer than 3 % of the trees gets no bit column either. It goes to a posting list, described in the next section, and each row counts those shared splits straight into its output. A bit column is cheap, but every pair pays for it whether or not either tree holds the split. On a posterior most shared splits are held by a handful of trees, so the lists take most of the width out of the sweep.
+
+### The weighted metrics: dense where common, buckets where rare
+
+WRF and KF carry a branch length per split, an `f64`, so they cannot pack 64 splits into a word. A dense row of lengths over every shared split would cost one element per split for every pair, and on a posterior most of those elements are zero: a split held by 3 trees out of 10 000 still gets a column that all 50 million pairs sweep.
+
+So the columns are split by how many trees hold them:
+
+| Held by | Where it goes | Cost |
+| --- | --- | --- |
+| at least a quarter of the trees | a dense column, swept like RF's rows | one element per pair |
+| between 2 trees and a quarter | a **posting list**: the trees that hold it, with their lengths | `k²/2` additions for `k` holders |
+| one tree only | nowhere — it can never be shared | folds into that tree's own total |
+
+A posting list is HashRF's bucket. Row `i` walks tree `i`'s posted splits, and for each one adds `overlap(length_i, length_j)` into cell `j` for every later tree `j` on the list, straight into the output row. The dense columns are then swept and added on top. A bucket of `k` trees costs `k²` — ruinous for a split every tree holds, and exactly why only the rare splits go there.
+
+Two details keep the answer exact. The dense sweep runs eight independent running sums in a fixed order, so the compiler can vectorise it without changing the result. And each tree sums its posted splits in column order, the same order its shared terms are added in, so two identical trees cancel to exactly `0.0` however their Newick listed the children.
 
 ---
 
@@ -480,7 +497,7 @@ Not every path needs everything, and both extras cost real work:
 | `snapshot/intern.rs` | `Interner`, `InternSnap` — dedupe to `u32` IDs |
 | `snapshot/export.rs` | the flat byte buffers Python reads |
 | `snapshot/mod.rs` | `Snapshots`, the construction pipeline, `Retain` |
-| `distances.rs` | RF / WRF / KF over dense rows |
+| `distances.rs` | RF over dense bit-rows plus posting lists; WRF / KF over dense columns plus posting lists |
 | `snapshot/clades.rs` | the export-only leaf-set table, and its packed ordering |
 | `io.rs` | NEXUS/Newick file reading: tree lines, TRANSLATE, burn-in |
 | `api.rs` | PyO3 bindings — glue only, no computation |

@@ -75,6 +75,10 @@ cargo install rapidtrees
 
 No build flags needed. The pairwise loops are compiled for several x86-64 levels and the best one the CPU supports is picked at runtime, so a PyPI wheel or a plain `cargo install` uses POPCNT, AVX2 or AVX-512 where the machine has them, and every level gives bit-identical results. The CLI's log opens with the level it chose; from Python, call `rapidtrees.cpu_level()`. Set `RAPIDTREES_CPU` to `baseline`, `x86-64-v2`, `x86-64-v3` or `x86-64-v4` to cap it, for instance to measure what it is worth on one machine. On arm64, NEON is part of the baseline and there is nothing to choose.
 
+### 🎛️ Tuning the kernels
+
+Every metric keeps a dense column only for splits held by a large enough share of the trees, and gives the rarer ones posting lists. The defaults were tuned on simulated posteriors. `RAPIDTREES_RF_DENSE_SHARE` (default `0.03`) and `RAPIDTREES_WEIGHTED_DENSE_SHARE` (default `0.25`) override them, for re-tuning on other data or hardware. They change the speed only, never a distance.
+
 ### 🛠️ From source
 
 #### Prerequisites
