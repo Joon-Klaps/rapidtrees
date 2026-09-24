@@ -7,17 +7,18 @@
 //! also drops the splits held by every tree, which cancel. Both filters are pure
 //! optimisations — disabling either changes no distance.
 //!
-//! RF sweeps dense bit-rows, one per tree, word by word. A pair costs `⌈U/64⌉`
-//! words regardless of how much the two trees share, where `U` is the count of
-//! splits left after filtering — cheap on a posterior.
-//!
-//! The weighted metrics cannot pack 64 splits into a word, so a dense row of
-//! `f64` lengths over every shared split would cost one element per split per
-//! pair, most of them zero. They split their columns instead. A split held by
-//! at least [`DENSE_SHARE`] of the trees keeps a dense column; a rarer one keeps
-//! a posting list of the trees that hold it, and each row adds those shared
-//! terms straight into the output. A posting list of `k` trees costs `k²/2`
-//! additions — HashRF's bucket — which is why only the rare splits get one.
+//! Every metric splits its columns by how many trees hold them. A widely held
+//! split keeps a dense column: a bit in RF's packed rows, an `f64` in the
+//! weighted metrics' rows, swept word by word for every pair. A rarely held one
+//! keeps a posting list of the trees that hold it instead, and each row adds
+//! those shared terms straight into its output. A posting list of `k` trees
+//! costs `k²/2` additions — HashRF's bucket — which is why only the rare splits
+//! get one. A dense column costs every pair the same whether or not either
+//! tree holds the split, so on a posterior, where most distinct shared splits
+//! are held by a handful of trees, the lists take most of the width out of the
+//! sweep. RF's bit columns are 64 to a word, so a split has to be much rarer to
+//! be worth a list there ([`RF_DENSE_SHARE`]) than in the weighted metrics
+//! ([`WEIGHTED_DENSE_SHARE`]).
 //!
 //! There is no per-pair entry point. To compare two trees, build a two-tree
 //! `Snapshots` and read the off-diagonal cell.
@@ -102,23 +103,127 @@ fn assign_columns(counts: &[u32], n_trees: usize, keep: impl Fn(u32) -> bool) ->
     (column_of, kept as usize)
 }
 
+// ─── posting lists ──────────────────────────────────────────────────────────
+
+/// The trees holding each rarely held split: HashRF's bucket.
+///
+/// Posting column `c` owns entries `offsets[c]..offsets[c + 1]` of `trees`,
+/// ascending because the trees are appended in order, and of `lengths` when
+/// they were asked for. A row walks its own posted splits and adds one term
+/// per later tree holding each, so a split held by `k` trees costs `k²/2`
+/// additions in all, however many trees the collection has.
+struct Postings {
+    offsets: Vec<usize>,
+    trees: Vec<u32>,
+    lengths: Vec<f64>,
+}
+
+impl Postings {
+    /// One list per split that `column_of` gives a column, carrying branch
+    /// lengths when `with_lengths`.
+    fn build(snaps: &Snapshots, column_of: &[u32], n_columns: usize, with_lengths: bool) -> Self {
+        let mut offsets = vec![0usize; n_columns + 1];
+        for (&count, &col) in snaps.split_counts.iter().zip(column_of) {
+            if col != u32::MAX {
+                offsets[col as usize] = count as usize;
+            }
+        }
+        let mut total = 0usize;
+        for slot in offsets.iter_mut() {
+            (*slot, total) = (total, total + *slot);
+        }
+
+        let mut next = offsets.clone();
+        let mut trees = vec![0u32; total];
+        let mut lengths = if with_lengths {
+            vec![0.0f64; total]
+        } else {
+            Vec::new()
+        };
+        for (tree, snap) in snaps.snapshots.iter().enumerate() {
+            for (k, &id) in snap.split_ids.iter().enumerate() {
+                let col = column_of[id as usize];
+                if col != u32::MAX {
+                    let at = &mut next[col as usize];
+                    trees[*at] = tree as u32;
+                    if with_lengths {
+                        lengths[*at] = snap.lengths[k];
+                    }
+                    *at += 1;
+                }
+            }
+        }
+        Self {
+            offsets,
+            trees,
+            lengths,
+        }
+    }
+
+    /// The trees after `i` that hold posting column `col`, with their branch
+    /// lengths (empty when built without them). Only those are wanted: the
+    /// lower triangle is mirrored.
+    #[inline]
+    fn after(&self, col: u32, i: usize) -> (&[u32], &[f64]) {
+        let span = self.offsets[col as usize]..self.offsets[col as usize + 1];
+        let trees = &self.trees[span.clone()];
+        let from = trees.partition_point(|&tree| tree as usize <= i);
+        let lengths = if self.lengths.is_empty() {
+            &[][..]
+        } else {
+            &self.lengths[span][from..]
+        };
+        (&trees[from..], lengths)
+    }
+}
+
 // ─── Robinson–Foulds ────────────────────────────────────────────────────────
 
-/// `RF(i, j) = aᵢ + aⱼ − 2·popcount(rowᵢ & rowⱼ)` over presence bit-rows.
+/// Share of the trees a split must be held by to keep its bit column in RF.
+/// Rarer splits get a posting list instead.
+///
+/// A bit column costs every pair a sixty-fourth of a word, so a split has to be
+/// far rarer than in the weighted metrics before its list wins: 3 per cent was
+/// the best all-round of 1, 3, 7 and 15 per cent on simulated posteriors from
+/// 50 to 20 000 taxa. The boundary changes the speed and nothing else.
+const RF_DENSE_SHARE: f64 = 0.03;
+
+/// `RF(i, j) = aᵢ + aⱼ − 2·shared(i, j)`, where `shared` counts the splits
+/// both trees hold.
 ///
 /// Splits held by *every* tree add equally to both `a` values and to the shared
-/// count, so they cancel exactly and are dropped before packing. Splits held by
-/// one tree count towards that tree's `a` but can never be shared, so they get
-/// no column either. On a posterior that is most of the distinct splits.
+/// count, so they cancel exactly and are dropped. Splits held by one tree count
+/// towards that tree's `a` but can never be shared, so they get nothing either.
+/// On a posterior that is most of the distinct splits. The rest are shared by
+/// a popcount over packed bit-rows for the widely held ones and by posting
+/// lists for the rare ones.
 pub(crate) fn distance_rf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> Vec<u32> {
+    let n = snaps.snapshots.len();
+    let min_dense = ((n as f64 * RF_DENSE_SHARE).ceil() as u32).max(2);
+    distance_rf_split(snaps, progress, min_dense)
+}
+
+/// [`distance_rf`] with the bit/posting boundary given: a split held by at
+/// least `min_dense` trees (but not all) gets a bit column, one held by fewer
+/// (but at least two) gets a posting list.
+fn distance_rf_split(
+    snaps: &Snapshots,
+    progress: Option<&AtomicUsize>,
+    min_dense: u32,
+) -> Vec<u32> {
     let n_trees = snaps.snapshots.len();
     if n_trees == 0 {
         return Vec::new();
     }
+    let everyone = n_trees as u32;
 
     let (bit_slot, kept) = assign_columns(&snaps.split_counts, n_trees, |count| {
-        count >= 2 && count < n_trees as u32
+        count >= min_dense && count < everyone
     });
+    let (posting_col, n_posted) = assign_columns(&snaps.split_counts, n_trees, |count| {
+        count >= 2 && count < min_dense.min(everyone)
+    });
+    let postings = Postings::build(snaps, &posting_col, n_posted, false);
     let everywhere = snaps
         .split_counts
         .iter()
@@ -160,7 +265,17 @@ pub(crate) fn distance_rf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> 
         .map(|snap| (snap.split_ids.len() - everywhere) as u32)
         .collect();
 
-    fill_symmetric(n_trees, progress, |i, row| {
+    fill_symmetric(n_trees, progress, |i, row: &mut [u32]| {
+        // Shared splits from the posting lists first, counted in place.
+        for &id in &snaps.snapshots[i].split_ids {
+            let col = posting_col[id as usize];
+            if col != u32::MAX {
+                for &j in postings.after(col, i).0 {
+                    row[j as usize] += 1;
+                }
+            }
+        }
+
         for (j, slot) in row.iter_mut().enumerate().skip(i + 1) {
             let (lo, hi) = (spans[i].0.max(spans[j].0), spans[i].1.min(spans[j].1));
             let shared: u32 = if lo > hi {
@@ -172,7 +287,7 @@ pub(crate) fn distance_rf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> 
                     .map(|(&x, &y)| (x & y).count_ones())
                     .sum()
             };
-            *slot = kept_per_tree[i] + kept_per_tree[j] - 2 * shared;
+            *slot = kept_per_tree[i] + kept_per_tree[j] - 2 * (shared + *slot);
         }
     })
 }
@@ -187,7 +302,7 @@ pub(crate) fn distance_rf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> 
 /// trees and loses above it. A quarter was fastest of 5, 25 and 101 per cent on
 /// simulated posteriors from 50 to 20 000 taxa. The boundary changes the speed
 /// and nothing else: any value gives the same distances.
-const DENSE_SHARE: f64 = 0.25;
+const WEIGHTED_DENSE_SHARE: f64 = 0.25;
 
 /// `Σ overlap(aₖ, bₖ)` over two rows of equal length, in a fixed order.
 ///
@@ -250,7 +365,7 @@ fn weighted_distances(
     finish: impl Fn(f64) -> f64 + Sync,
 ) -> Vec<f64> {
     let n = snaps.snapshots.len();
-    let min_dense = ((n as f64 * DENSE_SHARE).ceil() as u32).max(2);
+    let min_dense = ((n as f64 * WEIGHTED_DENSE_SHARE).ceil() as u32).max(2);
     weighted_distances_split(snaps, progress, min_dense, term, overlap, finish)
 }
 
@@ -296,35 +411,9 @@ fn weighted_distances_split(
             });
     }
 
-    // Posting lists: for posting column `c`, entries `offsets[c]..offsets[c + 1]`
-    // of `holders` and `held` are the trees holding it and their lengths, with
-    // the trees ascending because they are appended in tree order.
     let (posting_col, n_posted) =
         assign_columns(counts, n, |count| count >= 2 && count < min_dense);
-    let mut offsets = vec![0usize; n_posted + 1];
-    for (&count, &col) in counts.iter().zip(&posting_col) {
-        if col != u32::MAX {
-            offsets[col as usize] = count as usize;
-        }
-    }
-    let mut total = 0usize;
-    for slot in offsets.iter_mut() {
-        (*slot, total) = (total, total + *slot);
-    }
-    let mut next = offsets.clone();
-    let mut holders = vec![0u32; total];
-    let mut held = vec![0.0f64; total];
-    for (tree, snap) in snaps.snapshots.iter().enumerate() {
-        for (&id, &length) in snap.split_ids.iter().zip(&snap.lengths) {
-            let col = posting_col[id as usize];
-            if col != u32::MAX {
-                let at = &mut next[col as usize];
-                holders[*at] = tree as u32;
-                held[*at] = length;
-                *at += 1;
-            }
-        }
-    }
+    let postings = Postings::build(snaps, &posting_col, n_posted, true);
 
     let self_total: Vec<f64> = snaps
         .snapshots
@@ -349,12 +438,9 @@ fn weighted_distances_split(
 
     fill_symmetric(n, progress, |i, row: &mut [f64]| {
         // Shared terms from the posting lists first, accumulated in place.
-        // Only trees after `i` are wanted: the lower triangle is mirrored.
         for (col, length) in posted_splits(&snaps.snapshots[i], &posting_col) {
-            let span = offsets[col as usize]..offsets[col as usize + 1];
-            let (trees, lengths) = (&holders[span.clone()], &held[span]);
-            let after = trees.partition_point(|&tree| tree as usize <= i);
-            for (&j, &other) in trees[after..].iter().zip(&lengths[after..]) {
+            let (trees, lengths) = postings.after(col, i);
+            for (&j, &other) in trees.iter().zip(lengths) {
                 row[j as usize] += overlap(length, other);
             }
         }
@@ -820,7 +906,7 @@ fn kuhner_felsenstein_treedist() {
 
 #[cfg(test)]
 mod tests {
-    use super::{TREEDIST_TREES, assign_columns, weighted_distances_split};
+    use super::{TREEDIST_TREES, assign_columns, distance_rf_split, weighted_distances_split};
     use crate::snapshot::{InternSnap, Snapshots};
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -1221,6 +1307,44 @@ mod tests {
                             assert_eq!(wrf[i * n + j], 0.0, "WRF identical, {ctx}");
                             assert_eq!(kf[i * n + j], 0.0, "KF identical, {ctx}");
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Same as [`weighted_boundary_does_not_change_distances`] for RF: all
+    /// posting lists (2), mixed, and all bit columns (`n + 1`) must match the
+    /// oracle exactly.
+    #[test]
+    fn rf_boundary_does_not_change_distances() {
+        for &(n_taxa, n_trees, duplicates, seed) in &[
+            (12usize, 8usize, 4usize, 31u64),
+            (24, 10, 6, 32),
+            (40, 6, 9, 33),
+        ] {
+            let mut state = seed;
+            let mut newicks: Vec<String> = (0..n_trees)
+                .map(|_| random_newick(n_taxa, &mut state))
+                .collect();
+            for k in 0..duplicates {
+                newicks.push(newicks[k % n_trees].clone());
+            }
+            let refs: Vec<&str> = newicks.iter().map(|s| s.as_str()).collect();
+            let snaps = Snapshots::from_newicks(&refs, false).unwrap();
+            let n = snaps.snapshots.len();
+
+            for min_dense in [2, 3, n as u32 / 2, n as u32, n as u32 + 1] {
+                let rf = distance_rf_split(&snaps, None, min_dense);
+                for i in 0..n {
+                    for j in 0..n {
+                        let (want, _, _) =
+                            reference_distances(&snaps.snapshots[i], &snaps.snapshots[j]);
+                        assert_eq!(
+                            rf[i * n + j] as usize,
+                            want,
+                            "RF seed={seed} min_dense={min_dense} [{i}][{j}]"
+                        );
                     }
                 }
             }
