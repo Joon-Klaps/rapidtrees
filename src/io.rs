@@ -255,11 +255,6 @@ const BLOCK_BYTES: usize = 64 << 20;
 
 /// Write the matrix body, `rows_per_block` rows at a time: each block's rows
 /// are formatted in parallel, then written in order.
-///
-/// Formatting is most of the writer's cost — tens of nanoseconds a cell, and
-/// 10⁸ cells at 10 000 trees — and one thread doing all of it cost more than
-/// the distance kernel. Output is byte-identical to formatting the rows one
-/// after another.
 #[cfg(feature = "cli")]
 fn write_rows<T: std::fmt::Display + Sync>(
     out: &mut dyn Write,
