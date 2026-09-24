@@ -1,6 +1,13 @@
 //! CodSpeed regression benches: snapshot construction + the pairwise backends
 //! (RF, WRF, KF).
 //!
+//! Two kinds of tree set. `posterior` is what rapidtrees is for: one random
+//! base topology, and in every tree each internal edge collapsed with
+//! probability [`DIVERSITY`] and re-resolved at random, the generator of the
+//! manuscript benchmark (`simulate_trees.py --diversity`). Splits are held by
+//! every share of the trees, as in a real BEAST posterior. `diverse` is the
+//! adversarial case: independent topologies, where almost every split is
+//! unique to one tree.
 //!
 //! Build/run locally with `cargo codspeed build && cargo codspeed run` (add
 //! `-m memory` for the memory instrument), or just `cargo bench --bench codspeed`
@@ -26,8 +33,13 @@ const WIDE: Shape = (4000, 50);
 /// Adversarial large-`U` cell; kept small because dense cost grows with trees.
 const DIVERSE: Shape = (500, 300);
 
-/// Leaf swaps per tree in the `similar` regime.
-const SWAPS: usize = 3;
+/// Share of internal edges each `posterior` tree collapses and re-resolves.
+/// Normalised pairwise RF comes out near `1 − (1 − q)²`, so 0.4 lands on the
+/// real BEAST posteriors the manuscript measured (0.49–0.69).
+const DIVERSITY: f64 = 0.4;
+
+/// Mean branch length; lengths are exponential, as in the simulator.
+const BRANCH_SCALE: f64 = 0.1;
 
 // --- tree generation (self-contained) --------------
 
@@ -64,16 +76,74 @@ fn shuffled_labels(n: usize, seed: u64) -> Vec<u32> {
     v
 }
 
-/// Identity labels with `swaps` random transpositions — shares most splits.
-fn nearly_sorted_labels(n: usize, seed: u64, swaps: usize) -> Vec<u32> {
-    let mut v: Vec<u32> = (0..n as u32).collect();
-    let mut s = seed ^ 0xD1B5_4A32_D192_ED03;
-    for _ in 0..swaps {
-        let a = (next_rand(&mut s) as usize) % n;
-        let b = (next_rand(&mut s) as usize) % n;
-        v.swap(a, b);
+/// A rooted tree over leaves `0..n`, with any arity while it is being built.
+enum Node {
+    Leaf(u32),
+    Inner(Vec<Node>),
+}
+
+/// Uniform in `[0, 1)` from the LCG's 31 bits.
+fn uniform(state: &mut u64) -> f64 {
+    next_rand(state) as f64 / (1u64 << 31) as f64
+}
+
+/// A random binary tree over `comps`, by joining random pairs until one is
+/// left.
+fn resolve(mut comps: Vec<Node>, state: &mut u64) -> Node {
+    while comps.len() > 1 {
+        let a = comps.swap_remove((next_rand(state) as usize) % comps.len());
+        let b = comps.swap_remove((next_rand(state) as usize) % comps.len());
+        comps.push(Node::Inner(vec![a, b]));
     }
-    v
+    comps.pop().expect("at least one component")
+}
+
+/// What `node` hands its parent once its internal child edges have each been
+/// collapsed with probability `q` (the child's own components are absorbed)
+/// or kept (the child is re-resolved into one subtree). A kept edge's split
+/// survives exactly; a collapsed one's is replaced by random ones.
+fn components(node: &Node, q: f64, state: &mut u64) -> Vec<Node> {
+    let Node::Inner(children) = node else {
+        unreachable!("only internal nodes are expanded")
+    };
+    let mut comps = Vec::with_capacity(children.len());
+    for child in children {
+        match child {
+            Node::Leaf(leaf) => comps.push(Node::Leaf(*leaf)),
+            Node::Inner(_) => {
+                let sub = components(child, q, state);
+                if uniform(state) < q {
+                    comps.extend(sub);
+                } else {
+                    comps.push(resolve(sub, state));
+                }
+            }
+        }
+    }
+    comps
+}
+
+/// Newick for `node`, with exponential branch lengths of mean
+/// [`BRANCH_SCALE`] on every edge.
+fn write_newick(node: &Node, state: &mut u64, out: &mut String) {
+    match node {
+        Node::Leaf(leaf) => {
+            out.push_str("leaf_");
+            out.push_str(&leaf.to_string());
+        }
+        Node::Inner(children) => {
+            out.push('(');
+            for (k, child) in children.iter().enumerate() {
+                if k > 0 {
+                    out.push(',');
+                }
+                write_newick(child, state, out);
+                let length = -(1.0 - uniform(state)).ln() * BRANCH_SCALE;
+                out.push_str(&format!(":{length:.6}"));
+            }
+            out.push(')');
+        }
+    }
 }
 
 fn newick_from_labels(labels: &[u32]) -> String {
@@ -83,9 +153,19 @@ fn newick_from_labels(labels: &[u32]) -> String {
     s
 }
 
-fn similar_newicks((tips, trees): Shape) -> Vec<String> {
+/// A posterior-like set: one random base topology, re-resolved per tree at
+/// [`DIVERSITY`]. Seeded, so every run benchmarks the same trees.
+fn posterior_newicks((tips, trees): Shape) -> Vec<String> {
+    let mut state = 0x5EED_0000_0000_0040;
+    let base = resolve((0..tips as u32).map(Node::Leaf).collect(), &mut state);
     (0..trees)
-        .map(|i| newick_from_labels(&nearly_sorted_labels(tips, i as u64, SWAPS)))
+        .map(|_| {
+            let tree = resolve(components(&base, DIVERSITY, &mut state), &mut state);
+            let mut newick = String::new();
+            write_newick(&tree, &mut state, &mut newick);
+            newick.push(';');
+            newick
+        })
         .collect()
 }
 
@@ -113,8 +193,8 @@ fn single_thread_pool() -> rayon::ThreadPool {
 // so the memory instrument gates the persistent `Snapshots` footprint here.
 
 #[divan::bench]
-fn construct_similar(bencher: divan::Bencher) {
-    let newicks = similar_newicks(SMALL);
+fn construct_posterior(bencher: divan::Bencher) {
+    let newicks = posterior_newicks(SMALL);
     bencher.bench_local(|| snaps_from(&newicks));
 }
 
@@ -125,14 +205,14 @@ fn construct_diverse(bencher: divan::Bencher) {
 }
 
 #[divan::bench]
-fn construct_similar_wide(bencher: divan::Bencher) {
-    let newicks = similar_newicks(WIDE);
+fn construct_posterior_wide(bencher: divan::Bencher) {
+    let newicks = posterior_newicks(WIDE);
     bencher.bench_local(|| snaps_from(&newicks));
 }
 
 #[divan::bench]
-fn construct_similar_wide_st(bencher: divan::Bencher) {
-    let newicks = similar_newicks(WIDE);
+fn construct_posterior_wide_st(bencher: divan::Bencher) {
+    let newicks = posterior_newicks(WIDE);
     let pool = single_thread_pool();
     bencher.bench_local(|| pool.install(|| snaps_from(&newicks)));
 }
@@ -140,8 +220,8 @@ fn construct_similar_wide_st(bencher: divan::Bencher) {
 // --- pairwise benches: build snaps untimed, measure only the pairwise call --
 
 #[divan::bench]
-fn rf_similar(bencher: divan::Bencher) {
-    let snaps = snaps_from(&similar_newicks(SMALL));
+fn rf_posterior(bencher: divan::Bencher) {
+    let snaps = snaps_from(&posterior_newicks(SMALL));
     bencher.bench_local(|| snaps.pairwise_rf(None));
 }
 
@@ -152,14 +232,14 @@ fn rf_diverse(bencher: divan::Bencher) {
 }
 
 #[divan::bench]
-fn rf_similar_sweep(bencher: divan::Bencher) {
-    let snaps = snaps_from(&similar_newicks(SWEEP));
+fn rf_posterior_sweep(bencher: divan::Bencher) {
+    let snaps = snaps_from(&posterior_newicks(SWEEP));
     bencher.bench_local(|| snaps.pairwise_rf(None));
 }
 
 #[divan::bench]
-fn rf_similar_sweep_st(bencher: divan::Bencher) {
-    let snaps = snaps_from(&similar_newicks(SWEEP));
+fn rf_posterior_sweep_st(bencher: divan::Bencher) {
+    let snaps = snaps_from(&posterior_newicks(SWEEP));
     let pool = single_thread_pool();
     bencher.bench_local(|| pool.install(|| snaps.pairwise_rf(None)));
 }
@@ -178,14 +258,14 @@ fn rf_diverse_sweep_st(bencher: divan::Bencher) {
 }
 
 #[divan::bench]
-fn rf_similar_wide(bencher: divan::Bencher) {
-    let snaps = snaps_from(&similar_newicks(WIDE));
+fn rf_posterior_wide(bencher: divan::Bencher) {
+    let snaps = snaps_from(&posterior_newicks(WIDE));
     bencher.bench_local(|| snaps.pairwise_rf(None));
 }
 
 #[divan::bench]
-fn wrf_similar(bencher: divan::Bencher) {
-    let snaps = snaps_from(&similar_newicks(SMALL));
+fn wrf_posterior(bencher: divan::Bencher) {
+    let snaps = snaps_from(&posterior_newicks(SMALL));
     bencher.bench_local(|| snaps.pairwise_wrf(None));
 }
 
@@ -202,8 +282,20 @@ fn wrf_diverse_sweep(bencher: divan::Bencher) {
 }
 
 #[divan::bench]
-fn kf_similar(bencher: divan::Bencher) {
-    let snaps = snaps_from(&similar_newicks(SMALL));
+fn wrf_posterior_sweep(bencher: divan::Bencher) {
+    let snaps = snaps_from(&posterior_newicks(SWEEP));
+    bencher.bench_local(|| snaps.pairwise_wrf(None));
+}
+
+#[divan::bench]
+fn kf_posterior_sweep(bencher: divan::Bencher) {
+    let snaps = snaps_from(&posterior_newicks(SWEEP));
+    bencher.bench_local(|| snaps.pairwise_kf(None));
+}
+
+#[divan::bench]
+fn kf_posterior(bencher: divan::Bencher) {
+    let snaps = snaps_from(&posterior_newicks(SMALL));
     bencher.bench_local(|| snaps.pairwise_kf(None));
 }
 
