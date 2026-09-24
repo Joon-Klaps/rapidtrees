@@ -25,6 +25,7 @@
 
 use crate::par::*;
 use crate::snapshot::{InternSnap, Snapshots};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Fill a symmetric `n × n` matrix one row at a time, one rayon task per row.
@@ -101,6 +102,47 @@ fn assign_columns(counts: &[u32], n_trees: usize, keep: impl Fn(u32) -> bool) ->
         })
         .collect();
     (column_of, kept as usize)
+}
+
+// ─── dense/posting boundary ─────────────────────────────────────────────────
+
+/// `default`, unless `value` is a finite, non-negative number.
+///
+/// The value is the share of trees a split must be held by to keep a dense
+/// column. Anything above 1 posts every split and 0 keeps every split dense;
+/// every value gives the same distances, only at a different speed.
+fn parse_share(value: Option<&str>, default: f64) -> f64 {
+    value
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|share| share.is_finite() && *share >= 0.0)
+        .unwrap_or(default)
+}
+
+/// [`RF_DENSE_SHARE`], or `RAPIDTREES_RF_DENSE_SHARE` when that is set. Read
+/// once per process. The variable exists to re-tune the boundary on other data
+/// or hardware; it changes the speed and never a distance.
+fn rf_dense_share() -> f64 {
+    static SHARE: OnceLock<f64> = OnceLock::new();
+    *SHARE.get_or_init(|| {
+        parse_share(
+            std::env::var("RAPIDTREES_RF_DENSE_SHARE").ok().as_deref(),
+            RF_DENSE_SHARE,
+        )
+    })
+}
+
+/// [`WEIGHTED_DENSE_SHARE`], or `RAPIDTREES_WEIGHTED_DENSE_SHARE` when that is
+/// set. See [`rf_dense_share`].
+fn weighted_dense_share() -> f64 {
+    static SHARE: OnceLock<f64> = OnceLock::new();
+    *SHARE.get_or_init(|| {
+        parse_share(
+            std::env::var("RAPIDTREES_WEIGHTED_DENSE_SHARE")
+                .ok()
+                .as_deref(),
+            WEIGHTED_DENSE_SHARE,
+        )
+    })
 }
 
 // ─── posting lists ──────────────────────────────────────────────────────────
@@ -186,6 +228,7 @@ impl Postings {
 /// far rarer than in the weighted metrics before its list wins: 3 per cent was
 /// the best all-round of 1, 3, 7 and 15 per cent on simulated posteriors from
 /// 50 to 20 000 taxa. The boundary changes the speed and nothing else.
+/// `RAPIDTREES_RF_DENSE_SHARE` overrides it.
 const RF_DENSE_SHARE: f64 = 0.03;
 
 /// `RF(i, j) = aᵢ + aⱼ − 2·shared(i, j)`, where `shared` counts the splits
@@ -199,7 +242,7 @@ const RF_DENSE_SHARE: f64 = 0.03;
 /// lists for the rare ones.
 pub(crate) fn distance_rf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> Vec<u32> {
     let n = snaps.snapshots.len();
-    let min_dense = ((n as f64 * RF_DENSE_SHARE).ceil() as u32).max(2);
+    let min_dense = ((n as f64 * rf_dense_share()).ceil() as u32).max(2);
     distance_rf_split(snaps, progress, min_dense)
 }
 
@@ -302,6 +345,7 @@ fn distance_rf_split(
 /// trees and loses above it. A quarter was fastest of 5, 25 and 101 per cent on
 /// simulated posteriors from 50 to 20 000 taxa. The boundary changes the speed
 /// and nothing else: any value gives the same distances.
+/// `RAPIDTREES_WEIGHTED_DENSE_SHARE` overrides it.
 const WEIGHTED_DENSE_SHARE: f64 = 0.25;
 
 /// `Σ overlap(aₖ, bₖ)` over two rows of equal length, in a fixed order.
@@ -365,7 +409,7 @@ fn weighted_distances(
     finish: impl Fn(f64) -> f64 + Sync,
 ) -> Vec<f64> {
     let n = snaps.snapshots.len();
-    let min_dense = ((n as f64 * WEIGHTED_DENSE_SHARE).ceil() as u32).max(2);
+    let min_dense = ((n as f64 * weighted_dense_share()).ceil() as u32).max(2);
     weighted_distances_split(snaps, progress, min_dense, term, overlap, finish)
 }
 
@@ -906,7 +950,9 @@ fn kuhner_felsenstein_treedist() {
 
 #[cfg(test)]
 mod tests {
-    use super::{TREEDIST_TREES, assign_columns, distance_rf_split, weighted_distances_split};
+    use super::{
+        TREEDIST_TREES, assign_columns, distance_rf_split, parse_share, weighted_distances_split,
+    };
     use crate::snapshot::{InternSnap, Snapshots};
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -1316,6 +1362,17 @@ mod tests {
     /// Same as [`weighted_boundary_does_not_change_distances`] for RF: all
     /// posting lists (2), mixed, and all bit columns (`n + 1`) must match the
     /// oracle exactly.
+    #[test]
+    fn share_override_accepts_only_finite_non_negative_numbers() {
+        assert_eq!(parse_share(None, 0.25), 0.25);
+        assert_eq!(parse_share(Some(" 0.1 "), 0.25), 0.1);
+        assert_eq!(parse_share(Some("0"), 0.25), 0.0);
+        assert_eq!(parse_share(Some("2"), 0.25), 2.0);
+        for bad in ["", "quarter", "-0.1", "NaN", "inf"] {
+            assert_eq!(parse_share(Some(bad), 0.25), 0.25, "{bad:?}");
+        }
+    }
+
     #[test]
     fn rf_boundary_does_not_change_distances() {
         for &(n_taxa, n_trees, duplicates, seed) in &[
