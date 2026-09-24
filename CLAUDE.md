@@ -124,7 +124,20 @@ Invoke with `/skill-name` in chat.
 1. **Keep Rust and Python APIs in sync** — any change to a public function signature must update the PyO3 binding, the Python tests, and the docs (`docs/python-api.md`, `README.md`) in the same PR.
 2. **Document all public API** — every `pub fn`, `pub struct`, and `#[pyfunction]` must have a doc comment.
 3. **Always add tests** — new functions need unit tests; new distance metrics need a known-value regression test.
-4. **Update `CHANGELOG.md`** for every user-visible change.
+4. **Update `CHANGELOG.md`** for every user-visible change, in the format below.
+5. **Nothing reaches `master` without a pull request.** Never push to `master`, and never let a branch track it: `git checkout -b X origin/master` makes `origin/master` the new branch's upstream, and an editor's sync will then push the branch straight to `master`. Create branches with `git checkout --no-track -b X <base>` and push them at once with `git push -u origin X`.
+
+### Changelog format
+
+One line per PR under `[UNRELEASED]`, one sentence that summarises what the PR changes:
+
+```markdown
+- ([#NN](https://github.com/Joon-Klaps/rapidtrees/pull/NN)) - __PERFORMANCE__: One sentence summarising the change.
+```
+
+- The tag is exactly one of `__PERFORMANCE__`, `__BUGFIX__` or `__FEATURE__`.
+- A PR that breaks the public Rust or Python API adds `__BREAKING API CHANGE__` after the tag: `- ([#NN](...)) - __FEATURE__ __BREAKING API CHANGE__: ...`
+- No benchmark numbers, speedups, memory figures or implementation detail. Those belong in the PR description.
 
 ---
 

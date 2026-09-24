@@ -71,6 +71,10 @@ Install the standalone command-line binary. Requires the [Rust toolchain](https:
 cargo install rapidtrees
 ```
 
+### 🎛️ Tuning the kernels
+
+Every metric keeps a dense column only for splits held by a large enough share of the trees, and gives the rarer ones posting lists. The defaults were tuned on simulated posteriors. `RAPIDTREES_RF_DENSE_SHARE` (default `0.03`) and `RAPIDTREES_WEIGHTED_DENSE_SHARE` (default `0.25`) override them, for re-tuning on other data or hardware. They change the speed only, never a distance.
+
 ### 🛠️ From source
 
 #### Prerequisites
