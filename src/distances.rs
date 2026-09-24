@@ -1079,7 +1079,10 @@ mod tests {
         NO_COLUMN, TREEDIST_TREES, assign_columns, distance_rf_split, parse_share,
         weighted_distances_split,
     };
-    use crate::snapshot::{InternSnap, Snapshots};
+    use crate::{
+        distances::{RF_DENSE_SHARE, WEIGHTED_DENSE_SHARE, rf_dense_share, weighted_dense_share},
+        snapshot::{InternSnap, Snapshots},
+    };
     use std::collections::{BTreeMap, BTreeSet};
 
     const T0: &str = "(A:0.1,(B:0.1,(H:0.1,(D:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);";
@@ -1424,9 +1427,6 @@ mod tests {
         }
     }
 
-    /// Same as [`weighted_boundary_does_not_change_distances`] for RF: all
-    /// posting lists (2), mixed, and all bit columns (`n + 1`) must match the
-    /// oracle exactly.
     #[test]
     fn share_override_accepts_only_finite_non_negative_numbers() {
         assert_eq!(parse_share(None, 0.25), 0.25);
@@ -1438,6 +1438,31 @@ mod tests {
         }
     }
 
+    /// Each share is its default unless the environment overrides it. The test
+    /// sets no variable: the shares are read once per process, and tests share
+    /// that process, so a test that set one would leak into the others.
+    #[test]
+    fn dense_shares_follow_the_environment() {
+        for (share, var, default) in [
+            (
+                rf_dense_share(),
+                "RAPIDTREES_RF_DENSE_SHARE",
+                RF_DENSE_SHARE,
+            ),
+            (
+                weighted_dense_share(),
+                "RAPIDTREES_WEIGHTED_DENSE_SHARE",
+                WEIGHTED_DENSE_SHARE,
+            ),
+        ] {
+            let expected = parse_share(std::env::var(var).ok().as_deref(), default);
+            assert_eq!(share, expected, "{var}");
+        }
+    }
+
+    /// Same as [`weighted_boundary_does_not_change_distances`] for RF: all
+    /// posting lists (2), mixed, and all bit columns (`n + 1`) must match the
+    /// oracle exactly.
     #[test]
     fn rf_boundary_does_not_change_distances() {
         for &(n_taxa, n_trees, duplicates, seed) in &[
