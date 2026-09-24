@@ -10,10 +10,10 @@ This project uses release names based on random words from [codenamegenerator.co
 
 ## [UNRELEASED] - MICROSOFT_COORPERATION SNAKE (YYYY-MM-DD)
 
-- ([#29](https://github.com/Joon-Klaps/rapidtrees/issues/29)) - Modify `load_beast_trees` to use a new (optional) arg, that mentions if branch lengths need to be stored
-- ([#30](https://github.com/Joon-Klaps/rapidtrees/issues/30)) - Remove the sparse backend (it only beat dense on fully independent trees), dropping `--backend` and the Rust `Backend`, `Kernel`, `Distances` and `pairwise_*_with` items
-- ([#31](https://github.com/Joon-Klaps/rapidtrees/issues/31)) - Refactor interned split IDs handling (no sort), introduce split_counts to track how split frequencies
-- ([#32](https://github.com/Joon-Klaps/rapidtrees/issues/32)) - Replace phylotree parsing with a streaming Newick reader that builds snapshots directly, removing the phylotree dependency.
+- ([#29](https://github.com/Joon-Klaps/rapidtrees/pull/29)) - __FEATURE__ __BREAKING API CHANGE__: `load_beast_trees` takes an optional `Retain` argument saying whether branch lengths and bipartitions need to be kept.
+- ([#30](https://github.com/Joon-Klaps/rapidtrees/pull/30)) - __PERFORMANCE__ __BREAKING API CHANGE__: The sparse backend is removed, together with `--backend` and the Rust `Backend`, `Kernel`, `Distances` and `pairwise_*_with` items.
+- ([#31](https://github.com/Joon-Klaps/rapidtrees/pull/31)) - __PERFORMANCE__: Interned split IDs are no longer sorted, and per-split tree counts (`split_counts`) drive the column layout.
+- ([#32](https://github.com/Joon-Klaps/rapidtrees/pull/32)) - __PERFORMANCE__ __BREAKING API CHANGE__: A streaming Newick reader builds snapshots directly, removing the phylotree dependency and `io::rename_leaf_nodes`.
 
 ## [0.9.0] - Whistler Taipan (2026-09-10)
 
