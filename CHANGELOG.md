@@ -14,7 +14,7 @@ This project uses release names based on random words from [codenamegenerator.co
 - ([#30](https://github.com/Joon-Klaps/rapidtrees/issues/30)) - Remove the sparse backend (it only beat dense on fully independent trees), dropping `--backend` and the Rust `Backend`, `Kernel`, `Distances` and `pairwise_*_with` items
 - ([#31](https://github.com/Joon-Klaps/rapidtrees/issues/31)) - Refactor interned split IDs handling (no sort), introduce split_counts to track how split frequencies
 - ([#32](https://github.com/Joon-Klaps/rapidtrees/issues/32)) - Replace phylotree parsing with a streaming Newick reader that builds snapshots directly, removing the phylotree dependency.
-- **Speed & memory (WRF/KF):** The weighted metrics keep a dense column only for splits held by at least a quarter of the trees. Rarer splits get a posting list of the trees that hold them, and each row adds those shared terms straight into the output, so a pair no longer sweeps one `f64` per distinct shared split. The dense sweep runs eight fixed-order running sums, so it vectorises without changing the result. KF on simulated posteriors, 8 threads: 50 taxa × 10 000 trees **26.6 → 0.28 s**, 500 × 5 000 **56.2 → 0.63 s**, 20 000 × 500 **6.4 → 0.44 s**; on 3 000 independent 500-taxon topologies **67 → 0.11 s** and 3.1 → 0.34 GB peak. RF is unchanged. Results match the dense kernel to within rounding (4e-15 relative), and identical trees still give exactly `0.0`.
+- ([#35](https://github.com/Joon-Klaps/rapidtrees/pull/35)) - __PERFORMANCE__: Weighted RF and KF keep dense columns only for widely held splits and give rarely held splits posting lists, so a pair no longer sweeps every shared split.
 
 ## [0.9.0] - Whistler Taipan (2026-09-10)
 
