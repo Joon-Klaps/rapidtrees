@@ -14,7 +14,7 @@ use super::rooted_facts::{
     InternedRootedFacts, ROOT_ID, RawCladeRef, RawRootedFacts, RootedFactsBuilder,
 };
 use hashbrown::HashTable;
-use rustc_hash::FxBuildHasher;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::hash::BuildHasher;
 
 /// One tree's bipartitions in interned form (private implementation detail of [`Snapshots`]).
@@ -188,34 +188,32 @@ impl Interner {
             ));
         }
 
-        let resolve_in_tree = |clade: RawCladeRef| -> Result<u32, String> {
-            let id = self.resolve_rooted_clade(clade)?;
-            if !tree_split_ids.contains(&id) {
+        // The direct parser emits both `Snapshot::parts` and raw node facts in
+        // the same postorder. Master intentionally keeps interned IDs in that
+        // order (they are no longer sorted), so validate the alignment without
+        // sorting either side and retain heights in matching order.
+        let mut id_by_clade = FxHashMap::default();
+        let mut node_heights = Vec::with_capacity(nodes.len());
+        for (node, &expected_id) in nodes.into_iter().zip(tree_split_ids) {
+            let id = self.resolve_rooted_clade(node.clade)?;
+            if id != expected_id {
                 return Err(format!(
-                    "resolved clade ID {id} is absent from snapshot row {sidecar_rows}"
+                    "rooted facts are not aligned with snapshot clades for row {sidecar_rows}"
                 ));
             }
-            Ok(id)
-        };
+            if id_by_clade.insert(node.clade, id).is_some() {
+                return Err(format!(
+                    "rooted facts contain a duplicate clade in row {sidecar_rows}"
+                ));
+            }
+            node_heights.push(node.height);
+        }
 
-        let mut resolved_nodes = Vec::with_capacity(nodes.len());
-        for node in nodes {
-            resolved_nodes.push((resolve_in_tree(node.clade)?, node.height));
-        }
-        resolved_nodes.sort_unstable_by_key(|&(id, _)| id);
-        if resolved_nodes
-            .iter()
-            .map(|&(id, _)| id)
-            .ne(tree_split_ids.iter().copied())
-        {
-            return Err(format!(
-                "rooted facts do not contain exactly the snapshot clades for row {sidecar_rows}"
-            ));
-        }
-        let node_heights = resolved_nodes
-            .into_iter()
-            .map(|(_, height)| height)
-            .collect();
+        let resolve_in_tree = |clade: RawCladeRef| -> Result<u32, String> {
+            id_by_clade.get(&clade).copied().ok_or_else(|| {
+                format!("rooted split references a clade absent from snapshot row {sidecar_rows}")
+            })
+        };
 
         let mut resolved_splits = Vec::with_capacity(splits.len());
         for split in splits {

@@ -246,10 +246,10 @@ fn rooted_facts_sidecar_is_interned_and_tree_aligned() {
             .map(|&id| store.split_table[id as usize])
         {
             if parent != ROOT_ID {
-                assert!(snapshot.split_ids.binary_search(&parent).is_ok());
+                assert!(snapshot.split_ids.contains(&parent));
             }
-            assert!(snapshot.split_ids.binary_search(&left).is_ok());
-            assert!(snapshot.split_ids.binary_search(&right).is_ok());
+            assert!(snapshot.split_ids.contains(&left));
+            assert!(snapshot.split_ids.contains(&right));
             assert!(left < right, "children must be canonicalized");
         }
     }

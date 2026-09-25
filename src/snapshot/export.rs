@@ -9,6 +9,7 @@ use super::Snapshots;
 use super::clades::cmp_packed;
 use super::rooted_facts::ROOT_ID;
 use crate::par::*;
+use rustc_hash::FxHashSet;
 
 /// Compact tree-major buffers for the optional rooted-tree facts.
 ///
@@ -344,12 +345,14 @@ impl Snapshots {
 
             let node_base = tree_index * nodes_per_tree;
             let mut nodes = Vec::with_capacity(nodes_per_tree);
+            let mut present_ids = FxHashSet::default();
             for (&id, &height) in snapshot.split_ids.iter().zip(&facts.node_heights) {
                 if !height.is_finite() {
                     return Err(format!(
                         "rooted-fact row {tree_index} has a non-finite node height"
                     ));
                 }
+                present_ids.insert(id);
                 let column = exported_column(id, &id_to_col, tree_index, "node")?;
                 nodes.push((column, height));
             }
@@ -379,14 +382,12 @@ impl Snapshots {
                     })?;
                 if split[0] == ROOT_ID {
                     root_splits += 1;
-                } else if snapshot.split_ids.binary_search(&split[0]).is_err() {
+                } else if !present_ids.contains(&split[0]) {
                     return Err(format!(
                         "rooted-fact row {tree_index} split parent is absent from its clades"
                     ));
                 }
-                if snapshot.split_ids.binary_search(&split[1]).is_err()
-                    || snapshot.split_ids.binary_search(&split[2]).is_err()
-                {
+                if !present_ids.contains(&split[1]) || !present_ids.contains(&split[2]) {
                     return Err(format!(
                         "rooted-fact row {tree_index} split child is absent from its clades"
                     ));

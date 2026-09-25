@@ -167,12 +167,6 @@ impl RawRootedFacts {
 
         let expected_nodes = tip_count.saturating_mul(2).saturating_sub(2);
         let expected_splits = tip_count.saturating_sub(1);
-        if snapshot.parts.len() != expected_nodes {
-            return Err(format!(
-                "strictly binary tree with {tip_count} tips must contain {expected_nodes} non-root nodes; found {}",
-                snapshot.parts.len()
-            ));
-        }
 
         if tip_count == 1 {
             return Ok(Self {
