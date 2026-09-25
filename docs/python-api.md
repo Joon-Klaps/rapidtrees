@@ -442,16 +442,16 @@ node heights, and directly observed binary splits:
     map_indices,
 )
 
-assert facts["format_version"] == 2
+assert facts["format_version"] == 3
 n_trees = len(tree_names)
 
 clade_columns = np.frombuffer(
     facts["clade_columns"], dtype=np.uint32
 ).reshape(n_trees, facts["nodes_per_tree"])
 node_heights = np.frombuffer(
-    facts["node_heights"], dtype=np.float64
+    facts["node_heights"], dtype=np.float32
 ).reshape(clade_columns.shape)
-root_heights = np.frombuffer(facts["root_heights"], dtype=np.float64)
+root_heights = np.frombuffer(facts["root_heights"], dtype=np.float32)
 split_ids = np.frombuffer(
     facts["split_ids"], dtype=np.uint32
 ).reshape(n_trees, facts["splits_per_tree"])
@@ -468,14 +468,14 @@ The facts dictionary contains native-endian buffers:
 
 | Key | Type | Description |
 | --- | --- | --- |
-| `format_version` | `int` | Currently `2` |
+| `format_version` | `int` | Currently `3` |
 | `root_column` | `int` | Root sentinel; always equal to `n_clades` |
 | `nodes_per_tree` | `int` | Non-root nodes per binary tree: `2 * n_leaves - 2` |
 | `splits_per_tree` | `int` | Directly observed internal splits per tree: `n_leaves - 1` |
 | `n_observed_splits` | `int` | Number of distinct rows in `split_table` |
 | `clade_columns` | `bytes` | `uint32`, shape `(n_trees, nodes_per_tree)` |
-| `node_heights` | `bytes` | `float64`, aligned with `clade_columns` |
-| `root_heights` | `bytes` | `float64`, shape `(n_trees,)` |
+| `node_heights` | `bytes` | `float32`, aligned with `clade_columns` |
+| `root_heights` | `bytes` | `float32`, shape `(n_trees,)` |
 | `split_ids` | `bytes` | `uint32`, shape `(n_trees, splits_per_tree)` |
 | `split_table` | `bytes` | `uint32`, shape `(n_observed_splits, 3)` |
 
@@ -498,6 +498,11 @@ root_distance(child) = root_distance(parent) + branch_length(child)
 root_height = max(root_distance(tip))
 node_height(node) = root_height - root_distance(node)
 ```
+
+RapidTrees performs those calculations in `float64`. Each completed finite
+height is then range-checked and quantized to `float32` before retention and
+export. A value outside the finite `float32` range raises `ValueError` rather
+than becoming an infinity.
 
 The endpoint requires strictly binary rooted trees and an explicit finite
 branch length on every non-root edge. It has no `rooted` argument.

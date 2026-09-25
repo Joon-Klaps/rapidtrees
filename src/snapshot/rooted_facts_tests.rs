@@ -5,15 +5,11 @@ use super::*;
 use crate::snapshot::fingerprint::Fingerprint;
 use std::collections::HashSet;
 
-/// Decode a native-endian `f64` buffer emitted by a snapshot exporter.
-fn decode_f64(bytes: &[u8]) -> Vec<f64> {
-    bytes
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .copied()
-        .map(f64::from_ne_bytes)
-        .collect()
+/// Decode a native-endian `f32` buffer emitted by a snapshot exporter.
+fn decode_f32(bytes: &[u8]) -> Vec<f32> {
+    let (chunks, remainder) = bytes.as_chunks::<4>();
+    assert!(remainder.is_empty(), "f32 buffer must contain whole values");
+    chunks.iter().copied().map(f32::from_ne_bytes).collect()
 }
 
 /// Decode a native-endian `u32` buffer emitted by a snapshot exporter.
@@ -76,17 +72,17 @@ fn rooted_snapshots_opts(newicks: &[&str], retain_rooted_facts: bool) -> Result<
 /// The optional collector uses max root-to-tip distance as root height and
 /// retains heights for every exact non-root clade, including singleton tips.
 #[test]
-fn rooted_facts_collect_exact_non_ultrametric_heights() {
+fn rooted_facts_collect_non_ultrametric_heights() {
     let (facts, labels) =
         rooted_facts_of("((A:1,B:2):3,(C:4,D:5):6);").expect("collect rooted facts");
 
-    assert_eq!(facts.root_height, 11.0);
+    assert_eq!(facts.root_height, 11.0_f32);
     assert_eq!(facts.nodes.len(), 6);
 
     let heights: std::collections::HashMap<Fingerprint, f64> = facts
         .nodes
         .iter()
-        .map(|fact| (fact.clade.key, fact.height))
+        .map(|fact| (fact.clade.key, f64::from(fact.height)))
         .collect();
     assert_eq!(heights[&labels[0]], 7.0, "A");
     assert_eq!(heights[&labels[1]], 6.0, "B");
@@ -94,6 +90,22 @@ fn rooted_facts_collect_exact_non_ultrametric_heights() {
     assert_eq!(heights[&labels[2]], 1.0, "C");
     assert_eq!(heights[&labels[3]], 0.0, "D");
     assert_eq!(heights[&(labels[2] ^ labels[3])], 5.0, "{{C,D}}");
+}
+
+/// Quantizing branch lengths or cumulative distances before subtraction would
+/// round 100000001 to 100000000 and incorrectly make the {B,C} height zero.
+#[test]
+fn rooted_facts_quantize_only_completed_heights() {
+    let (facts, labels) =
+        rooted_facts_of("(A:100000001,(B:1,C:1):100000000);").expect("collect rooted facts");
+    let bc = labels[1] ^ labels[2];
+    let height = facts
+        .nodes
+        .iter()
+        .find_map(|fact| (fact.clade.key == bc).then_some(fact.height))
+        .expect("{B,C} clade height");
+
+    assert_eq!(height, 1.0_f32);
 }
 
 /// Every emitted split is a parent paired with its two immediate source-tree
@@ -158,17 +170,27 @@ fn rooted_facts_reject_non_finite_cumulative_distances() {
     );
 }
 
-/// Negative lengths are not silently rejected: current TreeTracer ingestion
-/// accepts any finite length and validates only the resulting arithmetic.
+#[test]
+fn rooted_facts_reject_heights_outside_float32_range() {
+    let error = rooted_facts_of("(A:1e39,B:1);")
+        .expect_err("finite f64 height outside float32 range must fail");
+    assert!(
+        error.contains("outside the finite float32 range"),
+        "unexpected error: {error}"
+    );
+}
+
+/// Negative lengths are not silently rejected: RapidTrees accepts any finite
+/// length here and validates representation and arithmetic.
 #[test]
 fn rooted_facts_accept_finite_negative_branch_lengths() {
     let (facts, labels) = rooted_facts_of("(A:-1,B:2);").expect("finite lengths");
     let heights: std::collections::HashMap<Fingerprint, f64> = facts
         .nodes
         .iter()
-        .map(|fact| (fact.clade.key, fact.height))
+        .map(|fact| (fact.clade.key, f64::from(fact.height)))
         .collect();
-    assert_eq!(facts.root_height, 2.0);
+    assert_eq!(facts.root_height, 2.0_f32);
     assert_eq!(heights[&labels[0]], 3.0);
     assert_eq!(heights[&labels[1]], 0.0);
 }
@@ -201,7 +223,7 @@ fn rooted_facts_sidecar_is_interned_and_tree_aligned() {
         store
             .trees
             .iter()
-            .map(|facts| facts.root_height)
+            .map(|facts| f64::from(facts.root_height))
             .collect::<Vec<_>>(),
         vec![11.0, 13.0]
     );
@@ -244,9 +266,9 @@ fn rooted_facts_sidecar_is_interned_and_tree_aligned() {
             .find_map(|(&id, &height)| (snaps.clades.get(id as usize) == wanted).then_some(height))
             .unwrap_or_else(|| panic!("missing clade {wanted:?}"))
     };
-    assert_eq!(height_for(&[0]), 7.0);
-    assert_eq!(height_for(&[0, 1]), 8.0);
-    assert_eq!(height_for(&[2, 3]), 5.0);
+    assert_eq!(height_for(&[0]), 7.0_f32);
+    assert_eq!(height_for(&[0, 1]), 8.0_f32);
+    assert_eq!(height_for(&[2, 3]), 5.0_f32);
 }
 
 /// Rooted facts use the stable clade-table columns, keep heights aligned with
@@ -272,9 +294,9 @@ fn rooted_fact_export_has_stable_columns_and_fixed_shapes() {
     );
     assert_eq!(
         facts.node_heights.len(),
-        n_trees * facts.nodes_per_tree * size_of::<f64>()
+        n_trees * facts.nodes_per_tree * size_of::<f32>()
     );
-    assert_eq!(facts.root_heights.len(), n_trees * size_of::<f64>());
+    assert_eq!(facts.root_heights.len(), n_trees * size_of::<f32>());
     assert_eq!(
         facts.split_ids.len(),
         n_trees * facts.splits_per_tree * size_of::<u32>()
@@ -285,14 +307,14 @@ fn rooted_fact_export_has_stable_columns_and_fixed_shapes() {
     );
 
     let clade_columns = decode_u32(&facts.clade_columns);
-    let node_heights = decode_f64(&facts.node_heights);
-    let root_heights = decode_f64(&facts.root_heights);
+    let node_heights = decode_f32(&facts.node_heights);
+    let root_heights = decode_f32(&facts.root_heights);
     let split_ids = decode_u32(&facts.split_ids);
     let split_table = decode_u32(&facts.split_table)
         .chunks_exact(3)
         .map(|triple| [triple[0], triple[1], triple[2]])
         .collect::<Vec<_>>();
-    assert_eq!(root_heights, vec![11.0, 13.0]);
+    assert_eq!(root_heights, vec![11.0_f32, 13.0_f32]);
     assert_eq!(split_table.len(), facts.n_observed_splits);
     assert!(
         split_table.windows(2).all(|pair| pair[0] < pair[1]),
@@ -384,9 +406,9 @@ fn rooted_fact_export_has_stable_columns_and_fixed_shapes() {
             .expect("node column");
         first_heights[offset]
     };
-    assert_eq!(height_at(a), 7.0);
-    assert_eq!(height_at(ab), 8.0);
-    assert_eq!(height_at(cd), 5.0);
+    assert_eq!(height_at(a), 7.0_f32);
+    assert_eq!(height_at(ab), 8.0_f32);
+    assert_eq!(height_at(cd), 5.0_f32);
 }
 
 /// ID-to-column conversion is driven by the supplied mapping, and children
@@ -401,7 +423,7 @@ fn rooted_fact_export_translates_before_canonicalizing_children() {
         .build_rooted_fact_buffers(&reversed_columns)
         .expect("export on supplied columns");
     let exported_nodes = decode_u32(&buffers.clade_columns);
-    let exported_heights = decode_f64(&buffers.node_heights);
+    let exported_heights = decode_f32(&buffers.node_heights);
     let exported_split_ids = decode_u32(&buffers.split_ids);
     let exported_split_table = decode_u32(&buffers.split_table)
         .chunks_exact(3)

@@ -474,14 +474,14 @@ fn pairwise_rf_with_sparse_snapshots_from_newick_iter(
 ///
 /// ```python
 /// {
-///     "format_version": 2,
+///     "format_version": 3,
 ///     "root_column": C,
 ///     "nodes_per_tree": 2 * L - 2,
 ///     "splits_per_tree": L - 1,
 ///     "n_observed_splits": S,
 ///     "clade_columns": bytes,  # native-endian uint32[T, 2L-2]
-///     "node_heights": bytes,   # native-endian float64[T, 2L-2]
-///     "root_heights": bytes,   # native-endian float64[T]
+///     "node_heights": bytes,   # native-endian float32[T, 2L-2]
+///     "root_heights": bytes,   # native-endian float32[T]
 ///     "split_ids": bytes,      # native-endian uint32[T, L-1]
 ///     "split_table": bytes,    # native-endian uint32[S, 3]
 /// }
@@ -504,7 +504,10 @@ fn pairwise_rf_with_sparse_snapshots_from_newick_iter(
 /// node_height(node) = root_height - root_distance(node)
 /// ```
 ///
-/// This supports non-ultrametric trees and includes singleton-tip heights.
+/// Parsing and all distance and height arithmetic use ``f64``. Each completed
+/// height is validated and then quantized to ``f32`` for retention and export;
+/// a value outside the finite ``f32`` range is rejected. This supports
+/// non-ultrametric trees and includes singleton-tip heights.
 /// Tree rows preserve input order. Buffers use native endianness, matching the
 /// existing RapidTrees snapshot API.
 ///
@@ -583,7 +586,7 @@ fn pairwise_rf_with_rooted_facts_from_newick_iter(
     let split_table = rooted.split_table;
 
     let facts = PyDict::new(py);
-    facts.set_item("format_version", 2u8)?;
+    facts.set_item("format_version", 3u8)?;
     facts.set_item("root_column", root_column)?;
     facts.set_item("nodes_per_tree", nodes_per_tree)?;
     facts.set_item("splits_per_tree", splits_per_tree)?;

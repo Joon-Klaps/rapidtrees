@@ -197,8 +197,8 @@ impl Snapshots {
     /// The buffers are native-endian and tree-major:
     ///
     /// - `clade_columns`: `u32[T, 2L - 2]`
-    /// - `node_heights`: `f64[T, 2L - 2]`
-    /// - `root_heights`: `f64[T]`
+    /// - `node_heights`: `f32[T, 2L - 2]`
+    /// - `root_heights`: `f32[T]`
     /// - `split_ids`: `u32[T, L - 1]`
     /// - `split_table`: `u32[S, 3]`
     ///
@@ -316,8 +316,8 @@ impl Snapshots {
         let mut clade_columns =
             vec![0; checked_bytes(node_values, size_of::<u32>(), "clade column")?];
         let mut node_heights =
-            vec![0; checked_bytes(node_values, size_of::<f64>(), "node height")?];
-        let mut root_heights = vec![0; checked_bytes(n_trees, size_of::<f64>(), "root height")?];
+            vec![0; checked_bytes(node_values, size_of::<f32>(), "node height")?];
+        let mut root_heights = vec![0; checked_bytes(n_trees, size_of::<f32>(), "root height")?];
         let mut split_ids = vec![0; checked_bytes(split_values, size_of::<u32>(), "split ID")?];
 
         for (tree_index, (snapshot, facts)) in self.snapshots.iter().zip(&store.trees).enumerate() {
@@ -361,9 +361,9 @@ impl Snapshots {
             }
             for (offset, (column, height)) in nodes.into_iter().enumerate() {
                 write_u32(&mut clade_columns, node_base + offset, column);
-                write_f64(&mut node_heights, node_base + offset, height);
+                write_f32(&mut node_heights, node_base + offset, height);
             }
-            write_f64(&mut root_heights, tree_index, facts.root_height);
+            write_f32(&mut root_heights, tree_index, facts.root_height);
 
             let expected_root_splits = usize::from(splits_per_tree > 0);
             let mut root_splits = 0;
@@ -553,7 +553,7 @@ fn write_u64(bytes: &mut [u8], index: usize, value: u64) {
     bytes[start..start + size_of::<u64>()].copy_from_slice(&value.to_ne_bytes());
 }
 
-fn write_f64(bytes: &mut [u8], index: usize, value: f64) {
-    let start = index * size_of::<f64>();
-    bytes[start..start + size_of::<f64>()].copy_from_slice(&value.to_ne_bytes());
+fn write_f32(bytes: &mut [u8], index: usize, value: f32) {
+    let start = index * size_of::<f32>();
+    bytes[start..start + size_of::<f32>()].copy_from_slice(&value.to_ne_bytes());
 }

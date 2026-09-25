@@ -234,8 +234,11 @@ identical to the established dense endpoint, and it supports rooted, unrooted,
 binary, and non-binary trees. Integer buffers use native endianness, matching
 the established snapshot API.
 
-For MrHIPSTR-style consumers, the rooted-facts endpoint adds exact node heights
-and directly observed `(parent, left, right)` splits without reparsing the trees:
+For MrHIPSTR-style consumers, the rooted-facts endpoint adds node heights and
+directly observed `(parent, left, right)` splits without reparsing the trees.
+Branch lengths, cumulative distances, and heights are calculated as `float64`;
+completed heights are range-checked and quantized to `float32` for retention
+and export:
 
 ```python
 (
@@ -248,7 +251,7 @@ and directly observed `(parent, left, right)` splits without reparsing the trees
 clade_columns = np.frombuffer(facts["clade_columns"], np.uint32).reshape(
     len(tree_names), facts["nodes_per_tree"]
 )
-node_heights = np.frombuffer(facts["node_heights"], np.float64).reshape(
+node_heights = np.frombuffer(facts["node_heights"], np.float32).reshape(
     clade_columns.shape
 )
 split_ids = np.frombuffer(facts["split_ids"], np.uint32).reshape(
@@ -270,8 +273,9 @@ the same clade catalog as `clade_bytes`, while
 `split_table` deduplicates triples shared by multiple trees. This endpoint is
 rooted by definition, has no `rooted` argument, and requires strictly binary
 trees with an explicit finite branch length on every non-root edge. The facts
-payload currently has `format_version == 2`; its integer and floating-point
-buffers use native endianness.
+payload currently has `format_version == 3`; its integer and floating-point
+buffers use native endianness. Heights outside the finite `float32` range are
+rejected instead of being exported as infinities.
 
 For BEAST `.trees` files, translate maps, the snapshot API, and multi-file usage see **[docs/python-api.md](docs/python-api.md)**.
 

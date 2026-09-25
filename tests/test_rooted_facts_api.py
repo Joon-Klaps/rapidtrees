@@ -69,7 +69,7 @@ def _decode(result):
     assert isinstance(clade_bytes, bytes)
     assert isinstance(facts, dict)
     assert set(facts) == FACT_KEYS
-    assert facts["format_version"] == 2
+    assert facts["format_version"] == 3
     assert facts["root_column"] == n_clades
 
     n_trees = len(tree_names)
@@ -92,10 +92,10 @@ def _decode(result):
     clade_columns = np.frombuffer(facts["clade_columns"], dtype=np.uint32).reshape(
         n_trees, nodes_per_tree
     )
-    node_heights = np.frombuffer(facts["node_heights"], dtype=np.float64).reshape(
+    node_heights = np.frombuffer(facts["node_heights"], dtype=np.float32).reshape(
         n_trees, nodes_per_tree
     )
-    root_heights = np.frombuffer(facts["root_heights"], dtype=np.float64).reshape(n_trees)
+    root_heights = np.frombuffer(facts["root_heights"], dtype=np.float32).reshape(n_trees)
     split_ids = np.frombuffer(facts["split_ids"], dtype=np.uint32).reshape(
         n_trees, splits_per_tree
     )
@@ -117,8 +117,8 @@ def _decode(result):
     assert rf.dtype == np.dtype(np.uint32)
     assert presence.dtype == np.dtype(np.uint8)
     assert clade_columns.dtype == np.dtype(np.uint32)
-    assert node_heights.dtype == np.dtype(np.float64)
-    assert root_heights.dtype == np.dtype(np.float64)
+    assert node_heights.dtype == np.dtype(np.float32)
+    assert root_heights.dtype == np.dtype(np.float32)
     assert split_ids.dtype == np.dtype(np.uint32)
     assert split_table.dtype == np.dtype(np.uint32)
     assert split_columns.dtype == np.dtype(np.uint32)
@@ -302,6 +302,7 @@ def test_repeated_calls_are_byte_for_byte_deterministic():
             ("((A:1e308,B:1e308):1e308,C:1);",) * 2,
             "non-finite cumulative root distance",
         ),
+        (("(A:1e39,B:1);",) * 2, "outside the finite float32 range"),
         (("(A:1,B:1);", "(A:1,C:1);"), "leaf set"),
     ],
 )

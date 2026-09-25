@@ -16,10 +16,15 @@ fn decode_u32(bytes: &[u8]) -> Vec<u32> {
     values.iter().copied().map(u32::from_ne_bytes).collect()
 }
 
-fn decode_f64(bytes: &[u8]) -> Vec<f64> {
-    let (values, remainder) = bytes.as_chunks::<8>();
+fn decode_f32(bytes: &[u8]) -> Vec<f64> {
+    let (values, remainder) = bytes.as_chunks::<4>();
     assert!(remainder.is_empty());
-    values.iter().copied().map(f64::from_ne_bytes).collect()
+    values
+        .iter()
+        .copied()
+        .map(f32::from_ne_bytes)
+        .map(f64::from)
+        .collect()
 }
 
 #[test]
@@ -91,7 +96,7 @@ fn rooted_facts_endpoint_returns_versioned_fixed_width_buffers() {
         let split_id_bytes: Vec<u8> = dict_item(facts, "split_ids").extract().unwrap();
         let split_table_bytes: Vec<u8> = dict_item(facts, "split_table").extract().unwrap();
 
-        assert_eq!(format_version, 2);
+        assert_eq!(format_version, 3);
         assert_eq!(root_column, n_clades as u32);
         assert_eq!(nodes_per_tree, 4);
         assert_eq!(splits_per_tree, 2);
@@ -101,9 +106,9 @@ fn rooted_facts_endpoint_returns_versioned_fixed_width_buffers() {
         );
         assert_eq!(
             node_height_bytes.len(),
-            3 * nodes_per_tree * size_of::<f64>()
+            3 * nodes_per_tree * size_of::<f32>()
         );
-        assert_eq!(root_height_bytes.len(), 3 * size_of::<f64>());
+        assert_eq!(root_height_bytes.len(), 3 * size_of::<f32>());
         assert_eq!(split_id_bytes.len(), 3 * splits_per_tree * size_of::<u32>());
         assert_eq!(
             split_table_bytes.len(),
@@ -118,13 +123,13 @@ fn rooted_facts_endpoint_returns_versioned_fixed_width_buffers() {
                 .all(|row| row.windows(2).all(|pair| pair[0] < pair[1]))
         );
 
-        let node_heights = decode_f64(&node_height_bytes);
+        let node_heights = decode_f32(&node_height_bytes);
         assert!(node_heights.iter().all(|height| height.is_finite()));
-        let root_heights = decode_f64(&root_height_bytes);
+        let root_heights = decode_f32(&root_height_bytes);
         assert!(
             root_heights
                 .iter()
-                .all(|height| (height - 0.2).abs() < 1e-12)
+                .all(|height| (height - 0.2).abs() < 1e-3)
         );
 
         let split_ids = decode_u32(&split_id_bytes);

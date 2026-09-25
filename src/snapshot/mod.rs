@@ -89,7 +89,8 @@ pub struct Retain {
     /// The canonical leaf set per distinct split. Required only to export a
     /// bipartition table to Python or to order export columns.
     pub bipartitions: bool,
-    /// Exact node heights and observed child splits for rooted summary trees.
+    /// Quantized `f32` node heights and observed child splits for rooted
+    /// summary trees.
     /// Existing public constructors and distance APIs deliberately leave this
     /// off; the dedicated rooted-facts endpoint will opt in.
     pub rooted_facts: bool,

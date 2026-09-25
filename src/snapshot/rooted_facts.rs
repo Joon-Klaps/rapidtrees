@@ -14,6 +14,7 @@
 
 use super::build::{Part, Snapshot};
 use super::fingerprint::Fingerprint;
+use rustc_hash::FxHashMap;
 
 /// Internal parent ID for the implicit all-taxa root.
 ///
@@ -37,7 +38,7 @@ pub(super) struct RawCladeRef {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct RawNodeFact {
     pub(super) clade: RawCladeRef,
-    pub(super) height: f64,
+    pub(super) height: f32,
 }
 
 /// One directly observed binary resolution.
@@ -54,7 +55,7 @@ pub(super) struct RawSplitFact {
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct RawRootedFacts {
     pub(super) nodes: Vec<RawNodeFact>,
-    pub(super) root_height: f64,
+    pub(super) root_height: f32,
     pub(super) splits: Vec<RawSplitFact>,
 }
 
@@ -66,8 +67,8 @@ pub(super) struct RawRootedFacts {
 /// observed-split table on [`RootedFactsStore`].
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct InternedRootedFacts {
-    pub(super) node_heights: Vec<f64>,
-    pub(super) root_height: f64,
+    pub(super) node_heights: Vec<f32>,
+    pub(super) root_height: f32,
     pub(super) split_ids: Vec<u32>,
 }
 
@@ -238,8 +239,8 @@ impl RawRootedFacts {
             }
         }
 
-        let root_height = root_height.ok_or_else(|| "tree has no tips".to_string())?;
-        if !root_height.is_finite() {
+        let root_height_f64 = root_height.ok_or_else(|| "tree has no tips".to_string())?;
+        if !root_height_f64.is_finite() {
             return Err("calculated a non-finite root height".to_string());
         }
 
@@ -247,12 +248,17 @@ impl RawRootedFacts {
         let mut nodes = Vec::with_capacity(expected_nodes);
         let mut splits = Vec::with_capacity(expected_splits);
         for (index, part) in snapshot.parts.iter().enumerate() {
-            let height = root_height - distances[index];
-            if !height.is_finite() {
+            let height_f64 = root_height_f64 - distances[index];
+            if !height_f64.is_finite() {
                 return Err(format!(
                     "calculated a non-finite height at snapshot node {index}"
                 ));
             }
+            let height = quantize_height(height_f64).ok_or_else(|| {
+                format!(
+                    "calculated height at snapshot node {index} {height_f64} is outside the finite float32 range"
+                )
+            })?;
             nodes.push(RawNodeFact {
                 clade: raw_clade(part),
                 height,
@@ -275,6 +281,9 @@ impl RawRootedFacts {
             children: root_split_children,
         });
 
+        let root_height = quantize_height(root_height_f64).ok_or_else(|| {
+            format!("calculated root height {root_height_f64} is outside the finite float32 range")
+        })?;
         if nodes.len() != expected_nodes || splits.len() != expected_splits {
             return Err(format!(
                 "strictly binary tree with {} tips must contain {expected_nodes} non-root nodes and {expected_splits} internal splits; found {} and {}",
@@ -340,4 +349,10 @@ fn validate_root_children(snapshot: &Snapshot, children: [usize; 2]) -> Result<(
         return Err("root children do not cover the complete contiguous leaf order".to_string());
     }
     Ok(())
+}
+
+fn quantize_height(value: f64) -> Option<f32> {
+    debug_assert!(value.is_finite());
+    let quantized = value as f32;
+    quantized.is_finite().then_some(quantized)
 }
