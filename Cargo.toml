@@ -1,6 +1,6 @@
 [package]
 name = "rapidtrees"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 # 1.89 stabilised the AVX-512 target features the x86-64-v4 row loops use.
 rust-version = "1.89"
