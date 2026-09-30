@@ -147,10 +147,11 @@ struct Open {
 ///
 /// Parts arrive in post-order, filtered and canonicalised as
 /// [`Snapshot`] documents. Two nodes can only share a canonical key when one
-/// sits above the other through unary nodes, or when they are the two children
-/// of a bifurcating root, whose splits are each other's complement. The second
-/// case is the usual rooted binary tree and is merged directly; the first is rare
-/// and falls back to sorting the tree's parts and merging equal keys.
+/// sits above the other through unary nodes, or, unrooted, when they are the
+/// two children of a bifurcating root, whose splits are each other's
+/// complement. The second case is every binary tree read unrooted and is merged
+/// directly. The first is rare and merges equal keys after the walk, sorting
+/// the parts first when unrooted.
 fn walk(
     newick: &str,
     index: usize,
@@ -265,22 +266,28 @@ fn walk(
         return Err(syntax("the tree is empty"));
     }
 
-    if !shape.rooted {
-        if unary {
+    if unary {
+        if shape.rooted {
+            // A unary node's part is emitted straight after its only child's,
+            // so equal keys are already neighbours. A unary root's child holds
+            // every taxon, which is the root clade, and no rooted tree has one.
+            parts.retain(|p| p.size as usize != shape.num_leaves);
+        } else {
             parts.sort_unstable_by_key(|p| p.key);
-            parts.dedup_by(|later, kept| {
-                later.key == kept.key && {
-                    kept.length += later.length;
-                    true
-                }
-            });
-        } else if root_arity == 2
-            && let [Some(a), Some(b)] = root_children
-            && parts[a].key == parts[b].key
-        {
-            parts[a].length += parts[b].length;
-            parts.remove(b);
         }
+        parts.dedup_by(|later, kept| {
+            later.key == kept.key && {
+                kept.length += later.length;
+                true
+            }
+        });
+    } else if !shape.rooted
+        && root_arity == 2
+        && let [Some(a), Some(b)] = root_children
+        && parts[a].key == parts[b].key
+    {
+        parts[a].length += parts[b].length;
+        parts.remove(b);
     }
     Ok((leaf_order, parts))
 }
@@ -289,7 +296,8 @@ fn walk(
 /// return its index.
 fn emit(parts: &mut Vec<Part>, node: Closed, shape: Shape) -> Option<usize> {
     // A split of `n - 1` leaves is the other side of a pendant edge, which is
-    // kept as the pendant itself. Rooted clades are all kept.
+    // kept as the pendant itself. Rooted clades are all kept here; `walk`
+    // drops the root clade a unary root leaves behind.
     if !shape.rooted && node.size != 1 && node.size as usize >= shape.num_leaves.saturating_sub(1) {
         return None;
     }
