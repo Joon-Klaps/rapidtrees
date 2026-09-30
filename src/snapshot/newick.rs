@@ -30,6 +30,10 @@ pub(super) struct RunTables<'a> {
     /// split's complement is `fp ^ total`.
     pub(super) total: Fingerprint,
     pub(super) rooted: bool,
+    /// Rooted-facts collection distinguishes an omitted edge length from an
+    /// explicit zero; ordinary distance paths keep the historical default of
+    /// treating an omitted length as zero.
+    pub(super) require_explicit_lengths: bool,
 }
 
 /// Parse one tree into a [`Snapshot`], checking its leaf set against the run's.
@@ -55,6 +59,7 @@ pub(super) fn snapshot(
         rooted: run.rooted,
         num_leaves,
         total: run.total,
+        require_explicit_lengths: run.require_explicit_lengths,
     };
     let (leaf_order, parts) = walk(newick, index, shape, |raw| {
         let name = rename(raw, translate).ok_or_else(|| unnamed(index))?;
@@ -93,6 +98,7 @@ pub(super) fn leaf_names(
         rooted: true,
         num_leaves: 0,
         total: 0,
+        require_explicit_lengths: false,
     };
     walk(newick, 0, shape, |raw| {
         names.push(rename(raw, translate).ok_or_else(|| unnamed(0))?.to_owned());
@@ -123,6 +129,7 @@ struct Shape {
     rooted: bool,
     num_leaves: usize,
     total: Fingerprint,
+    require_explicit_lengths: bool,
 }
 
 /// A node whose subtree is complete and whose edge is still being read: a
@@ -132,7 +139,7 @@ struct Closed {
     fp: Fingerprint,
     first: u32,
     size: u32,
-    length: f64,
+    length: Option<f64>,
 }
 
 /// An internal node still reading its children.
@@ -194,6 +201,16 @@ fn walk(
                 };
                 // Nothing read since the last delimiter is an anonymous leaf.
                 let child = closed.take().ok_or_else(|| unnamed(index))?;
+                if shape.require_explicit_lengths && child.length.is_none() {
+                    return Err(syntax(
+                        "a non-root node is missing an explicit branch length",
+                    ));
+                }
+                if shape.require_explicit_lengths
+                    && child.length.is_some_and(|length| !length.is_finite())
+                {
+                    return Err(syntax("a non-root node has a non-finite branch length"));
+                }
                 parent.fp ^= child.fp;
                 parent.children += 1;
                 let children = parent.children;
@@ -212,7 +229,7 @@ fn walk(
                         fp: node.fp,
                         first: node.first,
                         size: leaf_order.len() as u32 - node.first,
-                        length: 0.0,
+                        length: None,
                     });
                 }
                 i += 1;
@@ -226,11 +243,12 @@ fn walk(
                     .ok_or_else(|| syntax("a '[' comment is never closed"))?;
                 let (text, next) = token(newick, start);
                 // An empty length is a missing one, which phylotree read as 0.0.
-                if !text.is_empty() {
-                    node.length = text
-                        .parse::<f64>()
-                        .map_err(|e| syntax(&format!("invalid branch length {text:?}: {e}")))?;
-                }
+                node.length = Some(if text.is_empty() {
+                    0.0
+                } else {
+                    text.parse::<f64>()
+                        .map_err(|e| syntax(&format!("invalid branch length {text:?}: {e}")))?
+                });
                 i = next;
             }
             b'[' => {
@@ -250,7 +268,7 @@ fn walk(
                         fp: label,
                         first: leaf_order.len() as u32,
                         size: 1,
-                        length: 0.0,
+                        length: None,
                     });
                     leaf_order.push(bit);
                 }
@@ -304,7 +322,7 @@ fn emit(parts: &mut Vec<Part>, node: Closed, shape: Shape) -> Option<usize> {
         key,
         first: node.first,
         size: node.size,
-        length: node.length,
+        length: node.length.unwrap_or(0.0),
     });
     Some(parts.len() - 1)
 }

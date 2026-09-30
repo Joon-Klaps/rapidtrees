@@ -31,6 +31,7 @@ fn snapshot_of(newick: &str, rooted: bool) -> Snapshot {
         labels: &labels,
         total: labels.iter().fold(0, |acc, &label| acc ^ label),
         rooted,
+        require_explicit_lengths: false,
     };
     newick::snapshot(newick, &no_translate, 0, &run).unwrap()
 }
@@ -669,6 +670,7 @@ fn snaps_opts(newicks: &[&str], rooted: bool, store_lengths: bool) -> Snapshots 
     let retain = Retain {
         lengths: store_lengths,
         bipartitions: true,
+        rooted_facts: false,
     };
     Snapshots::from_newick_iter_opts(newicks.iter().map(|&n| (n, &empty)), rooted, retain).unwrap()
 }

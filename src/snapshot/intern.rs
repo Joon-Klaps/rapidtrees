@@ -10,8 +10,11 @@ use super::Snapshots;
 use super::build::Snapshot;
 use super::clades::CladeTable;
 use super::fingerprint::Fingerprint;
+use super::rooted_facts::{
+    InternedRootedFacts, ROOT_ID, RawCladeRef, RawRootedFacts, RootedFactsBuilder,
+};
 use hashbrown::HashTable;
-use rustc_hash::FxBuildHasher;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::hash::BuildHasher;
 
 /// One tree's bipartitions in interned form (private implementation detail of [`Snapshots`]).
@@ -47,6 +50,7 @@ pub(super) struct Interner {
     counts: Vec<u32>,
     clades: CladeTable,
     snapshots: Vec<InternSnap>,
+    rooted_facts: Option<RootedFactsBuilder>,
     words: usize,
     num_leaves: usize,
     rooted: bool,
@@ -68,6 +72,9 @@ impl Interner {
             counts: Vec::new(),
             clades: CladeTable::new(),
             snapshots: Vec::with_capacity(n_trees),
+            rooted_facts: retain
+                .rooted_facts
+                .then(|| RootedFactsBuilder::with_capacity(n_trees)),
             words,
             num_leaves,
             rooted,
@@ -131,13 +138,158 @@ impl Interner {
         self.snapshots.push(InternSnap { split_ids, lengths });
     }
 
+    /// Resolve one tree's optional rooted facts after its ordinary snapshot.
+    ///
+    /// [`Interner::push`] has already assigned every clade ID for this tree.
+    /// This method therefore performs lookup only: it cannot create IDs or
+    /// alter first-seen ordering. The completed facts are appended to a
+    /// separate tree-aligned sidecar, leaving [`InternSnap`] unchanged.
+    pub(super) fn push_rooted_facts(&mut self, raw: RawRootedFacts) -> Result<(), String> {
+        if !self.rooted {
+            return Err("cannot intern rooted facts in unrooted mode".to_string());
+        }
+        let sidecar_rows = self
+            .rooted_facts
+            .as_ref()
+            .ok_or_else(|| "rooted-facts retention is not enabled".to_string())?
+            .len();
+        if self.snapshots.len() != sidecar_rows + 1 {
+            return Err(format!(
+                "rooted-facts row {sidecar_rows} has no matching newly interned snapshot"
+            ));
+        }
+
+        let RawRootedFacts {
+            nodes,
+            root_height,
+            splits,
+        } = raw;
+        let tree_split_ids = &self.snapshots[sidecar_rows].split_ids;
+        if nodes.len() != tree_split_ids.len() {
+            return Err(format!(
+                "rooted facts contain {} non-root nodes but snapshot row {sidecar_rows} contains {} clades",
+                nodes.len(),
+                tree_split_ids.len()
+            ));
+        }
+        let expected_splits = self.num_leaves.saturating_sub(1);
+        if splits.len() != expected_splits {
+            return Err(format!(
+                "rooted facts contain {} splits but a binary {}-taxon tree requires {expected_splits}",
+                splits.len(),
+                self.num_leaves
+            ));
+        }
+        let expected_root_splits = usize::from(expected_splits > 0);
+        let root_splits = splits.iter().filter(|split| split.parent.is_none()).count();
+        if root_splits != expected_root_splits {
+            return Err(format!(
+                "rooted facts contain {root_splits} root splits; expected {expected_root_splits}"
+            ));
+        }
+
+        // The direct parser emits both `Snapshot::parts` and raw node facts in
+        // the same postorder. Master intentionally keeps interned IDs in that
+        // order (they are no longer sorted), so validate the alignment without
+        // sorting either side and retain heights in matching order.
+        let mut id_by_clade = FxHashMap::default();
+        let mut node_heights = Vec::with_capacity(nodes.len());
+        for (node, &expected_id) in nodes.into_iter().zip(tree_split_ids) {
+            let id = self.resolve_rooted_clade(node.clade)?;
+            if id != expected_id {
+                return Err(format!(
+                    "rooted facts are not aligned with snapshot clades for row {sidecar_rows}"
+                ));
+            }
+            if id_by_clade.insert(node.clade, id).is_some() {
+                return Err(format!(
+                    "rooted facts contain a duplicate clade in row {sidecar_rows}"
+                ));
+            }
+            node_heights.push(node.height);
+        }
+
+        let resolve_in_tree = |clade: RawCladeRef| -> Result<u32, String> {
+            id_by_clade.get(&clade).copied().ok_or_else(|| {
+                format!("rooted split references a clade absent from snapshot row {sidecar_rows}")
+            })
+        };
+
+        let mut resolved_splits = Vec::with_capacity(splits.len());
+        for split in splits {
+            let parent = match split.parent {
+                Some(parent) => resolve_in_tree(parent)?,
+                None => ROOT_ID,
+            };
+            let mut children = [
+                resolve_in_tree(split.children[0])?,
+                resolve_in_tree(split.children[1])?,
+            ];
+            children.sort_unstable();
+            resolved_splits.push([parent, children[0], children[1]]);
+        }
+
+        let builder = self
+            .rooted_facts
+            .as_mut()
+            .ok_or_else(|| "rooted-facts retention was disabled during interning".to_string())?;
+        let mut split_ids = Vec::with_capacity(resolved_splits.len());
+        for split in resolved_splits {
+            split_ids.push(builder.intern_split(split)?);
+        }
+        split_ids.sort_unstable();
+        if split_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(format!(
+                "rooted facts contain a duplicate observed split in row {sidecar_rows}"
+            ));
+        }
+        builder.push(InternedRootedFacts {
+            node_heights,
+            root_height,
+            split_ids,
+        });
+        Ok(())
+    }
+
+    /// Find the existing global ID for one rooted raw-clade reference.
+    fn resolve_rooted_clade(&self, clade: RawCladeRef) -> Result<u32, String> {
+        let num_leaves = u32::try_from(self.num_leaves)
+            .map_err(|_| "rooted facts cannot represent more than u32::MAX taxa".to_string())?;
+        if clade.size == 0 || clade.size >= num_leaves {
+            return Err(format!(
+                "invalid non-root clade size {} for a {num_leaves}-taxon tree",
+                clade.size
+            ));
+        }
+
+        let candidate = (clade.key, clade.size.min(num_leaves - clade.size));
+        let hash = self.hasher.hash_one(clade.key);
+        self.table
+            .find(hash, |&id| self.keys[id as usize] == candidate)
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "rooted clade 0x{:032x}/{} was not interned by its snapshot",
+                    clade.key, clade.size
+                )
+            })
+    }
+
     pub(super) fn finish(self, leaf_names: Vec<String>) -> Snapshots {
+        debug_assert!(
+            self.rooted_facts
+                .as_ref()
+                .is_none_or(|facts| facts.len() == self.snapshots.len()),
+            "rooted facts must stay aligned with snapshot rows"
+        );
+        let rooted_facts = self.rooted_facts.map(RootedFactsBuilder::finish);
         Snapshots {
             snapshots: self.snapshots,
             clades: self.clades,
             split_counts: self.counts,
             words_per_bitset: self.words,
             leaf_names,
+            rooted_facts,
         }
     }
 }
