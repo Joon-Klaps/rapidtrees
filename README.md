@@ -273,7 +273,7 @@ the same clade catalog as `clade_bytes`, while
 `split_table` deduplicates triples shared by multiple trees. This endpoint is
 rooted by definition, has no `rooted` argument, and requires strictly binary
 trees with an explicit finite branch length on every non-root edge. The facts
-payload currently has `format_version == 3`; its integer and floating-point
+payload starts at `format_version == 1`; its integer and floating-point
 buffers use native endianness. Heights outside the finite `float32` range are
 rejected instead of being exported as infinities.
 

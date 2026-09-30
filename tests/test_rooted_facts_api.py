@@ -69,7 +69,7 @@ def _decode(result):
     assert isinstance(clade_bytes, bytes)
     assert isinstance(facts, dict)
     assert set(facts) == FACT_KEYS
-    assert facts["format_version"] == 3
+    assert facts["format_version"] == 1
     assert facts["root_column"] == n_clades
 
     n_trees = len(tree_names)

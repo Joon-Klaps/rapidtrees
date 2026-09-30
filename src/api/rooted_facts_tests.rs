@@ -96,7 +96,7 @@ fn rooted_facts_endpoint_returns_versioned_fixed_width_buffers() {
         let split_id_bytes: Vec<u8> = dict_item(facts, "split_ids").extract().unwrap();
         let split_table_bytes: Vec<u8> = dict_item(facts, "split_table").extract().unwrap();
 
-        assert_eq!(format_version, 3);
+        assert_eq!(format_version, 1);
         assert_eq!(root_column, n_clades as u32);
         assert_eq!(nodes_per_tree, 4);
         assert_eq!(splits_per_tree, 2);
