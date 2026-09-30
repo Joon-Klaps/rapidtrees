@@ -209,7 +209,7 @@ impl Snapshots {
             rooted,
             retain,
         );
-        interner.push(first_snap);
+        interner.push_chunk(vec![first_snap])?;
 
         let mut base = 1usize; // tree 0 is already interned
         loop {
@@ -229,11 +229,9 @@ impl Snapshots {
             base += batch.len();
             drop(batch);
 
-            // Sequential fold: each raw snapshot is dropped right after it is
-            // interned, so peak stays near the deduplicated footprint.
-            for snap in raw {
-                interner.push(snap);
-            }
+            // The chunk's raw parts are dropped as soon as it is interned, so
+            // peak stays near the deduplicated footprint.
+            interner.push_chunk(raw)?;
         }
 
         Ok(interner.finish(sorted_leaf_names))

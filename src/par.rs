@@ -40,17 +40,24 @@ pub use sequential::*;
 
 #[cfg(not(feature = "parallel"))]
 mod sequential {
-    use std::slice::{Chunks, ChunksMut, Iter};
+    use std::slice::{Chunks, ChunksMut, Iter, IterMut};
 
-    /// Sequential stand-in for `rayon::prelude::ParallelSliceMut`.
+    /// Sequential stand-in for `rayon::prelude::ParallelSliceMut` and
+    /// `rayon::prelude::IntoParallelRefMutIterator`.
     pub trait ParallelSliceMut<T> {
         fn par_chunks_mut(&mut self, chunk_size: usize) -> ChunksMut<'_, T>;
+        fn par_iter_mut(&mut self) -> IterMut<'_, T>;
     }
 
     impl<T> ParallelSliceMut<T> for [T] {
         #[inline]
         fn par_chunks_mut(&mut self, chunk_size: usize) -> ChunksMut<'_, T> {
             self.chunks_mut(chunk_size)
+        }
+
+        #[inline]
+        fn par_iter_mut(&mut self) -> IterMut<'_, T> {
+            self.iter_mut()
         }
     }
 

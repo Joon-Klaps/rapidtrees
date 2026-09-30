@@ -153,7 +153,10 @@ fn test_interning_is_reproducible() {
 fn test_two_taxa_pendants_stay_distinct() {
     let snaps = Snapshots::from_newicks(&["(A:1,B:2);", "(A:3,B:4);"], false).unwrap();
     assert_eq!(snaps.clades.len(), 2);
-    assert_eq!(snaps.snapshots[0].split_ids, vec![0, 1]);
+    let ids = &snaps.snapshots[0].split_ids;
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1]);
+    assert_eq!(&snaps.snapshots[1].split_ids, ids);
 }
 
 /// A caterpillar tree nests as deep as it has leaves. The DFS is iterative so
@@ -1324,4 +1327,53 @@ fn no_trees_build_an_empty_collection() {
     let snaps = Snapshots::from_newicks(&[], false).unwrap();
     assert!(snaps.is_empty());
     assert_eq!(snaps.n_distinct_splits(), 0);
+}
+
+/// Interning is sharded across threads, but the IDs depend on the input alone:
+/// a one-thread and a four-thread pool give the same collection.
+#[test]
+fn split_ids_do_not_depend_on_the_thread_count() {
+    let trees = random_trees(31);
+    let refs: Vec<&str> = trees.iter().map(String::as_str).collect();
+    let build = |threads: usize| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(|| Snapshots::from_newicks(&refs, false).unwrap())
+    };
+    let (one, four) = (build(1), build(4));
+
+    assert_eq!(one.split_counts, four.split_counts);
+    for (a, b) in one.snapshots.iter().zip(&four.snapshots) {
+        assert_eq!(a.split_ids, b.split_ids);
+        assert_eq!(a.lengths, b.lengths);
+    }
+    for id in 0..one.clades.len() {
+        assert_eq!(one.clades.get(id), four.clades.get(id));
+    }
+}
+
+/// Every part's split ID names that part's canonical leaf set: the shards'
+/// clade tables, their concatenation and the dense renumbering agree.
+#[test]
+fn every_split_id_names_its_parts_clade() {
+    let trees = random_trees(17);
+    let refs: Vec<&str> = trees.iter().map(String::as_str).collect();
+    for rooted in [false, true] {
+        let snaps = Snapshots::from_newicks(&refs, rooted).unwrap();
+        assert_eq!(snaps.clades.len(), snaps.n_distinct_splits());
+        for (newick, interned) in refs.iter().zip(&snaps.snapshots) {
+            let snap = snapshot_of(newick, rooted);
+            for (part, &id) in snap.parts.iter().zip(&interned.split_ids) {
+                let mut clade = CladeTable::new();
+                snap.push_canonical(part, rooted, &mut clade);
+                assert_eq!(
+                    snaps.clades.get(id as usize),
+                    clade.get(0),
+                    "rooted={rooted}"
+                );
+            }
+        }
+    }
 }

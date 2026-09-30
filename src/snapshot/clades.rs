@@ -55,6 +55,14 @@ impl CladeTable {
         &self.leaves[lo..hi]
     }
 
+    /// Append every clade of `other`, in order.
+    pub(crate) fn append(&mut self, other: CladeTable) {
+        let base = self.leaves.len() as u32;
+        self.leaves.extend_from_slice(&other.leaves);
+        self.starts
+            .extend(other.starts[1..].iter().map(|&start| start + base));
+    }
+
     /// Append one clade from the leaves it contains, in any order.
     pub(crate) fn push(&mut self, leaves: impl IntoIterator<Item = u32>) {
         let start = self.leaves.len();
@@ -130,6 +138,17 @@ mod tests {
         assert_eq!(t.len(), 2);
         assert_eq!(t.get(0), &[0, 2]);
         assert_eq!(t.get(1), &[1, 3, 5]);
+    }
+
+    #[test]
+    fn append_keeps_both_tables_clades_in_order() {
+        let mut first = table(&[&[2, 0], &[1]]);
+        first.append(table(&[&[4, 3], &[], &[5]]));
+        assert_eq!(first.len(), 5);
+        assert_eq!(first.get(0), &[0, 2]);
+        assert_eq!(first.get(2), &[3, 4]);
+        assert_eq!(first.get(3), &[] as &[u32]);
+        assert_eq!(first.get(4), &[5]);
     }
 
     #[test]
