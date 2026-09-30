@@ -139,10 +139,7 @@ fn rooted_facts_endpoint_returns_versioned_fixed_width_buffers() {
                 .chunks_exact(splits_per_tree)
                 .all(|row| row.windows(2).all(|pair| pair[0] < pair[1]))
         );
-        let triples = decode_u32(&split_table_bytes)
-            .chunks_exact(3)
-            .map(|triple| [triple[0], triple[1], triple[2]])
-            .collect::<Vec<_>>();
+        let triples = decode_u32(&split_table_bytes).as_chunks::<3>().0.to_vec();
         assert!(triples.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(
             split_ids

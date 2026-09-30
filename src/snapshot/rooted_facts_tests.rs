@@ -310,10 +310,7 @@ fn rooted_fact_export_has_stable_columns_and_fixed_shapes() {
     let node_heights = decode_f32(&facts.node_heights);
     let root_heights = decode_f32(&facts.root_heights);
     let split_ids = decode_u32(&facts.split_ids);
-    let split_table = decode_u32(&facts.split_table)
-        .chunks_exact(3)
-        .map(|triple| [triple[0], triple[1], triple[2]])
-        .collect::<Vec<_>>();
+    let split_table = decode_u32(&facts.split_table).as_chunks::<3>().0.to_vec();
     assert_eq!(root_heights, vec![11.0_f32, 13.0_f32]);
     assert_eq!(split_table.len(), facts.n_observed_splits);
     assert!(
@@ -425,10 +422,7 @@ fn rooted_fact_export_translates_before_canonicalizing_children() {
     let exported_nodes = decode_u32(&buffers.clade_columns);
     let exported_heights = decode_f32(&buffers.node_heights);
     let exported_split_ids = decode_u32(&buffers.split_ids);
-    let exported_split_table = decode_u32(&buffers.split_table)
-        .chunks_exact(3)
-        .map(|triple| [triple[0], triple[1], triple[2]])
-        .collect::<Vec<_>>();
+    let exported_split_table = decode_u32(&buffers.split_table).as_chunks::<3>().0.to_vec();
     let store = snaps.rooted_facts.as_ref().unwrap();
     let stored = &store.trees[0];
 
