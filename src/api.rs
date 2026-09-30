@@ -43,25 +43,39 @@ struct IterInput<'py, 'a> {
 
 /// Collect tree snapshots from a lazy Python iterator of newick strings.
 ///
+/// The iterator is pulled a chunk of trees at a time and each chunk's strings
+/// are dropped once parsed, so a generator reading a file streams straight
+/// through rather than being collected first. The first item that is not a
+/// string, or that the iterator fails to produce, raises its own error.
+///
 /// `retain` says what to build beyond the split IDs — see [`Retain`]. Each entry
 /// point asks only for what it actually returns.
 fn collect_snapshots_from_iter(input: IterInput<'_, '_>, retain: Retain) -> PyResult<Snapshots> {
-    let newicks: Vec<String> = input
+    let translate_maps = input.translate_maps;
+    let mut failed = None;
+    let entries = input
         .newick_iter
-        .map(|item| item?.extract::<String>())
-        .collect::<PyResult<_>>()?;
-
-    if newicks.len() < 2 {
+        .zip(input.map_indices)
+        .map_while(
+            |(item, &idx)| match item.and_then(|obj| obj.extract::<String>()) {
+                Ok(newick) => Some((newick, &translate_maps[idx])),
+                Err(e) => {
+                    failed = Some(e);
+                    None
+                }
+            },
+        );
+    let built = Snapshots::from_newick_iter_opts(entries, input.rooted, retain);
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    let snaps = built.map_err(PyValueError::new_err)?;
+    if snaps.len() < 2 {
         return Err(PyValueError::new_err(
             "Need at least 2 trees to compute pairwise distances",
         ));
     }
-
-    let entries = newicks
-        .iter()
-        .zip(input.map_indices.iter())
-        .map(|(n, &idx)| (n.as_str(), &input.translate_maps[idx]));
-    Snapshots::from_newick_iter_opts(entries, input.rooted, retain).map_err(PyValueError::new_err)
+    Ok(snaps)
 }
 
 /// A pairwise weighted metric, as a plain function pointer so WRF and KF can
@@ -881,6 +895,61 @@ mod py_integration_tests {
                 ))
                 .expect_err("expected ValueError when the iterator is shorter than names");
             assert!(err.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+        });
+    }
+
+    /// The newick iterator is pulled lazily: a generator streams straight
+    /// through and gives the matrix a list gives.
+    #[test]
+    fn generator_input_matches_list_input() {
+        ensure_python();
+        Python::attach(|py| {
+            let m = py.import("rapidtrees").unwrap();
+            let func = m.getattr("pairwise_rf_from_newick_iter").unwrap();
+            let (names, trees) = fixture(py);
+            let call = |newicks| {
+                func.call1((
+                    names.clone(),
+                    newicks,
+                    PyList::new(py, [PyDict::new(py)]).unwrap(),
+                    PyList::new(py, [0i64, 0, 0]).unwrap(),
+                ))
+                .unwrap()
+            };
+            let from_list = call(trees.try_iter().unwrap().into_any());
+            let generator = py
+                .eval(
+                    c"(t for t in ['(A:0.1,(B:0.1,C:0.1):0.1);', '(A:0.1,(C:0.1,B:0.1):0.1);', '((A:0.1,B:0.1):0.1,C:0.1);'])",
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert!(from_list.eq(call(generator)).unwrap());
+        });
+    }
+
+    /// An item that is not a string, and an exception the iterator raises
+    /// itself, surface as they are rather than as a parse error.
+    #[test]
+    fn iterator_errors_propagate_unchanged() {
+        ensure_python();
+        Python::attach(|py| {
+            let m = py.import("rapidtrees").unwrap();
+            let func = m.getattr("pairwise_rf_from_newick_iter").unwrap();
+            let call = |code: &std::ffi::CStr| {
+                func.call1((
+                    PyList::new(py, ["t0", "t1", "t2"]).unwrap(),
+                    py.eval(code, None, None).unwrap(),
+                    PyList::new(py, [PyDict::new(py)]).unwrap(),
+                    PyList::new(py, [0i64, 0, 0]).unwrap(),
+                ))
+                .expect_err("a bad iterator was accepted")
+            };
+            let err = call(c"iter(['(A:1,B:1,C:1);', 7, '(A:1,B:1,C:1);'])");
+            assert!(err.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
+            let err =
+                call(c"(t if i < 2 else 1 // 0 for i, t in enumerate(['(A:1,B:1,C:1);'] * 3))");
+            assert!(err.is_instance_of::<pyo3::exceptions::PyZeroDivisionError>(py));
         });
     }
 
