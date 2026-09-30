@@ -1253,3 +1253,75 @@ fn reader_keeps_leaf_set_error_messages() {
         "Tree 0 has an unnamed leaf. All leaves must be named."
     );
 }
+
+/// `n` random 12-taxon trees with branch lengths, from a fixed LCG seed, so a
+/// failure always reproduces.
+fn random_trees(n: usize) -> Vec<String> {
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let mut below = move |bound: usize| {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) as usize % bound
+    };
+    (0..n)
+        .map(|_| {
+            let mut parts: Vec<String> = (0..12).map(|i| format!("T{i}")).collect();
+            while parts.len() > 1 {
+                let a = parts.swap_remove(below(parts.len()));
+                let b = parts.swap_remove(below(parts.len()));
+                parts.push(format!(
+                    "({a}:0.{},{b}:0.{})",
+                    below(90) + 10,
+                    below(90) + 10
+                ));
+            }
+            format!("{};", parts[0])
+        })
+        .collect()
+}
+
+/// However the stream is cut into chunks, the collection is the same: the
+/// interner sees the same trees in the same order either way.
+#[test]
+fn chunking_does_not_change_the_collection() {
+    let trees = random_trees(23);
+    let empty = HashMap::new();
+    let entries = || trees.iter().map(|t| (t.as_str(), &empty));
+    let whole = Snapshots::from_chunks(entries(), false, Retain::everything(), usize::MAX).unwrap();
+    // A one-byte budget leaves a single round of the pool per chunk.
+    let chunked = Snapshots::from_chunks(entries(), false, Retain::everything(), 1).unwrap();
+
+    assert_eq!(whole.split_counts, chunked.split_counts);
+    for (a, b) in whole.snapshots.iter().zip(&chunked.snapshots) {
+        assert_eq!(a.split_ids, b.split_ids);
+        assert_eq!(a.lengths, b.lengths);
+    }
+    assert_eq!(whole.pairwise_rf(None), chunked.pairwise_rf(None));
+    assert_eq!(whole.pairwise_wrf(None), chunked.pairwise_wrf(None));
+}
+
+/// Owned strings stream in exactly as borrowed ones do.
+#[test]
+fn owned_newicks_build_the_same_collection() {
+    let trees = random_trees(9);
+    let empty = HashMap::new();
+    let borrowed: Vec<&str> = trees.iter().map(String::as_str).collect();
+    let owned = Snapshots::from_newick_iter_opts(
+        trees.iter().cloned().map(|t| (t, &empty)),
+        false,
+        Retain::everything(),
+    )
+    .unwrap();
+    let reference = Snapshots::from_newicks(&borrowed, false).unwrap();
+
+    assert_eq!(owned.split_counts, reference.split_counts);
+    assert_eq!(owned.pairwise_rf(None), reference.pairwise_rf(None));
+}
+
+#[test]
+fn no_trees_build_an_empty_collection() {
+    let snaps = Snapshots::from_newicks(&[], false).unwrap();
+    assert!(snaps.is_empty());
+    assert_eq!(snaps.n_distinct_splits(), 0);
+}

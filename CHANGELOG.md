@@ -10,6 +10,8 @@ This project uses release names based on random words from [codenamegenerator.co
 
 ## [UNRELEASED] - MICROSOFT_COORPERATION SNAKE (YYYY-MM-DD)
 
+- ([#44](https://github.com/Joon-Klaps/rapidtrees/pull/44)) - __PERFORMANCE__: Tree files are streamed a chunk of trees at a time instead of being read whole and copied, so memory no longer grows with the size of the input file.
+
 ## [0.10.0] - Surface Copperhead (2026-09-24)
 
 - ([#29](https://github.com/Joon-Klaps/rapidtrees/pull/29)) - __FEATURE__ __BREAKING API CHANGE__: `load_beast_trees` takes an optional `Retain` argument saying whether branch lengths and bipartitions need to be kept.

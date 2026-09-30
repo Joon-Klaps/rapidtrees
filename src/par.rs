@@ -22,6 +22,19 @@
 #[cfg(feature = "parallel")]
 pub use rayon::prelude::*;
 
+/// Threads in the pool the parallel loops run on; 1 without the `parallel`
+/// feature.
+pub fn current_num_threads() -> usize {
+    #[cfg(feature = "parallel")]
+    {
+        rayon::current_num_threads()
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        1
+    }
+}
+
 #[cfg(not(feature = "parallel"))]
 pub use sequential::*;
 
