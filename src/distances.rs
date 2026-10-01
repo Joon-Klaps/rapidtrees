@@ -680,7 +680,7 @@ fn distance_rf_split(input: Input<'_>, progress: Option<&AtomicUsize>, min_dense
         false,
         |layout, snap, row: &mut [u64]| {
             let mut posted = Vec::new();
-            for &id in &snap.split_ids {
+            for id in snap.ids() {
                 match layout.place(id) {
                     Some(Column::Dense(col)) => row[col / 64] |= 1u64 << (col % 64),
                     Some(Column::Posted(col)) => posted.push((col, 0.0)),
@@ -688,7 +688,7 @@ fn distance_rf_split(input: Input<'_>, progress: Option<&AtomicUsize>, min_dense
                 }
             }
             posted.sort_unstable_by_key(|&(col, _)| col);
-            (posted, (snap.split_ids.len() - n_universal) as u32)
+            (posted, (snap.n_splits() - n_universal) as u32)
         },
     );
     let bits = BitRows::new(rows, n);
@@ -792,7 +792,7 @@ fn weighted_lay_out(
         |layout, snap, row: &mut [f64]| {
             let mut posted = Vec::new();
             let mut unique_self = 0.0;
-            for (&id, &length) in snap.split_ids.iter().zip(&snap.lengths) {
+            for (id, &length) in snap.ids().zip(&snap.lengths) {
                 match layout.place(id) {
                     Some(Column::Dense(col)) => row[col] = length,
                     Some(Column::Posted(col)) => posted.push((col, length)),
@@ -1432,7 +1432,7 @@ mod tests {
         let snaps = three_snapshots();
         let mut recount = vec![0u32; snaps.n_distinct_splits()];
         for snap in &snaps.snapshots {
-            for &id in &snap.split_ids {
+            for id in snap.ids() {
                 recount[id as usize] += 1;
             }
         }
@@ -1451,7 +1451,7 @@ mod tests {
     fn lengths_aligned_with_split_ids() {
         let snaps = three_snapshots();
         for snap in &snaps.snapshots {
-            assert_eq!(snap.split_ids.len(), snap.lengths.len());
+            assert_eq!(snap.n_splits(), snap.lengths.len());
         }
     }
 
@@ -1462,11 +1462,7 @@ mod tests {
     /// so it cannot reproduce a backend bug by construction.
     fn reference_distances(a: &InternSnap, b: &InternSnap) -> (usize, f64, f64) {
         let lengths_by_split = |s: &InternSnap| -> BTreeMap<u32, f64> {
-            s.split_ids
-                .iter()
-                .copied()
-                .zip(s.lengths.iter().copied())
-                .collect()
+            s.ids().zip(s.lengths.iter().copied()).collect()
         };
         let (ma, mb) = (lengths_by_split(a), lengths_by_split(b));
 

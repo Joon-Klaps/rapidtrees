@@ -268,7 +268,7 @@ Across 4 000 trees the *same* splits recur constantly — that's what it means f
 
 The split table is cut into 256 **shards** by the low bits of the fingerprint, and every shard interns a chunk of trees at the same time as the others, on its own thread. A shard numbers the splits it has not seen in the order it meets them, walking the chunk tree by tree, and the shards are then numbered one after another. The IDs therefore depend on the trees alone, not on the thread count or the chunk size:
 
-Pendant edges never reach a shard. Every tree has all of them, so the pendant of leaf `k` is split `k` outright, and the shards number the internal splits after them. A tree's IDs open with its pendants in leaf order, followed by its internal splits. Plain RF stores no pendants at all: every tree holds every one of them, so they cancel.
+Pendant edges never reach a shard. Every tree has all of them, so the pendant of leaf `k` is split `k` outright, and the shards number the internal splits after them. Because a tree's pendants are `0..n` in every tree, no tree stores their IDs: it records how many it has and, for the weighted metrics, their branch lengths in leaf order. Plain RF keeps no pendants at all: every tree holds every one of them, so they cancel.
 
 ```text
 split {A}          → ID 0     (pendants: one ID per leaf, A to G)
@@ -282,18 +282,19 @@ Each tree then becomes an `InternSnap` — two parallel arrays, nothing more:
 
 ```rust
 struct InternSnap {
-    split_ids: Vec<u32>,   // in part order
-    lengths: Vec<f64>,     // lengths[i] belongs to split_ids[i]
+    pendants: u32,         // splits 0..pendants, the same in every tree, not stored
+    split_ids: Vec<u32>,   // the internal splits, in part order
+    lengths: Vec<f64>,     // the pendants' lengths in leaf order, then split_ids'
 }
 ```
 
 The interner matches a candidate on **both** its fingerprint and the cardinality of its smaller side. The cardinality is equal for both sides of a bipartition, so it costs one integer compare and rules out a slice of the collision space for free.
 
-For our two trees the whole run has **13 distinct splits** (7 pendants + 6 internal), so, sorted (a tree keeps its pendants first, then its internal splits in part order):
+For our two trees the whole run has **13 distinct splits** (7 pendants + 6 internal), so, sorted, with the pendants (IDs 0 to 6) that every tree holds and none stores:
 
 ```text
-tree 1: split_ids = [0, 1, 2, 3, 4, 5, 6, 7,       10, 11, 12]
-tree 2: split_ids = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,         12]
+tree 1: splits    = [0, 1, 2, 3, 4, 5, 6, 7,       10, 11, 12]
+tree 2: splits    = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,         12]
                                              ↑  ↑  ↑   ↑
                        held by one tree only — 4 splits → RF = 4
 ```

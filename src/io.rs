@@ -1168,7 +1168,7 @@ mod load_tests {
         assert_eq!((rf.clades.len(), weighted.clades.len()), (0, 0));
         for (r, w) in rf.snapshots.iter().zip(&weighted.snapshots) {
             assert!(r.lengths.is_empty(), "RF path must not store lengths");
-            assert_eq!(w.lengths.len(), w.split_ids.len());
+            assert_eq!(w.lengths.len(), w.n_splits());
         }
     }
 

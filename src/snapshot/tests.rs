@@ -153,10 +153,10 @@ fn test_interning_is_reproducible() {
 fn test_two_taxa_pendants_stay_distinct() {
     let snaps = Snapshots::from_newicks(&["(A:1,B:2);", "(A:3,B:4);"], false).unwrap();
     assert_eq!(snaps.clades.len(), 2);
-    let ids = &snaps.snapshots[0].split_ids;
+    let ids: Vec<u32> = snaps.snapshots[0].ids().collect();
     assert_eq!(ids.len(), 2);
     assert_ne!(ids[0], ids[1]);
-    assert_eq!(&snaps.snapshots[1].split_ids, ids);
+    assert_eq!(snaps.snapshots[1].ids().collect::<Vec<_>>(), ids);
 }
 
 /// A caterpillar tree nests as deep as it has leaves. The DFS is iterative so
@@ -173,7 +173,7 @@ fn test_deep_caterpillar_tree() {
     let snaps = Snapshots::from_newicks(&[&newick, &newick], false).unwrap();
     assert_eq!(snaps.leaf_names.len(), LEAVES);
     // LEAVES pendant edges + LEAVES-3 internal bipartitions.
-    assert_eq!(snaps.snapshots[0].split_ids.len(), 2 * LEAVES - 3);
+    assert_eq!(snaps.snapshots[0].n_splits(), 2 * LEAVES - 3);
     assert_eq!(snaps.pairwise_rf(None)[1], 0, "a tree against itself");
 }
 
@@ -333,14 +333,14 @@ fn test_taxon_names_vs_node_ids() {
         vec!["Chimp", "Gorilla", "Human"],
         "bit indices come from alphabetical names, not parse order"
     );
-    let sorted = |ids: &[u32]| {
-        let mut ids = ids.to_vec();
+    let sorted = |snap: &InternSnap| {
+        let mut ids: Vec<u32> = snap.ids().collect();
         ids.sort_unstable();
         ids
     };
     assert_eq!(
-        sorted(&snaps.snapshots[0].split_ids),
-        sorted(&snaps.snapshots[1].split_ids),
+        sorted(&snaps.snapshots[0]),
+        sorted(&snaps.snapshots[1]),
         "same taxa and topology must intern to the same IDs whatever the node IDs"
     );
     assert_eq!(snaps.pairwise_rf(None)[1], 0);
@@ -700,7 +700,7 @@ fn test_rf_path_without_lengths_matches() {
         assert!(snap.lengths.is_empty(), "RF path must not store lengths");
     }
     for snap in &with_len.snapshots {
-        assert_eq!(snap.lengths.len(), snap.split_ids.len());
+        assert_eq!(snap.lengths.len(), snap.n_splits());
     }
 
     assert_eq!(with_len.pairwise_rf(None), no_len.pairwise_rf(None));
@@ -718,20 +718,20 @@ fn test_intern_split_ids_deduped() {
     let snaps = snaps_opts(&trees, false, true);
 
     for snap in &snaps.snapshots {
-        let mut ids = snap.split_ids.clone();
+        let mut ids: Vec<u32> = snap.ids().collect();
         ids.sort_unstable();
         assert!(
             ids.windows(2).all(|w| w[0] < w[1]),
-            "split IDs must be unique within a tree: {:?}",
-            snap.split_ids
+            "split IDs must be unique within a tree: {ids:?}",
         );
-        for &id in &snap.split_ids {
+        for &id in &ids {
             assert!((id as usize) < snaps.clades.len());
         }
     }
 
     assert_eq!(
-        snaps.snapshots[0].split_ids, snaps.snapshots[1].split_ids,
+        snaps.snapshots[0].ids().collect::<Vec<_>>(),
+        snaps.snapshots[1].ids().collect::<Vec<_>>(),
         "identical topologies must intern to identical split IDs"
     );
 }
@@ -1371,11 +1371,12 @@ fn every_split_id_names_its_parts_clade() {
             let (pendants, internal): (Vec<&Part>, Vec<&Part>) =
                 snap.parts.iter().partition(|part| part.size == 1);
             assert_eq!(pendants.len(), n);
-            assert_eq!(interned.split_ids.len(), n + internal.len());
+            assert_eq!(interned.pendants as usize, n);
+            assert_eq!(interned.split_ids.len(), internal.len());
             let ids = pendants
                 .iter()
                 .map(|part| snap.leaf_order[part.first as usize])
-                .chain(interned.split_ids[n..].iter().copied());
+                .chain(interned.split_ids.iter().copied());
             for (part, id) in pendants.iter().chain(&internal).zip(ids) {
                 let mut clade = CladeTable::new();
                 snap.push_canonical(part, rooted, &mut clade);
@@ -1403,7 +1404,12 @@ fn pendants_are_the_first_split_ids_in_leaf_order() {
     .unwrap();
     assert_eq!(snaps.leaf_names, ["A", "B", "C", "D"]);
     for (snap, scale) in snaps.snapshots.iter().zip([1.0, 10.0]) {
-        assert_eq!(snap.split_ids[..4], [0, 1, 2, 3]);
+        assert_eq!(snap.ids().take(4).collect::<Vec<_>>(), [0, 1, 2, 3]);
+        assert_eq!(snap.pendants, 4);
+        assert!(
+            snap.split_ids.iter().all(|&id| id >= 4),
+            "pendant IDs are not stored"
+        );
         assert_eq!(
             snap.lengths[..4],
             [scale, 2.0 * scale, 3.0 * scale, 4.0 * scale]
@@ -1428,7 +1434,8 @@ fn rf_only_collections_store_no_pendants() {
     let everything = Snapshots::from_newicks(&refs, false).unwrap();
     let n = everything.leaf_names.len();
     for (lean, full) in rf_only.snapshots.iter().zip(&everything.snapshots) {
-        assert_eq!(lean.split_ids.len() + n, full.split_ids.len());
+        assert_eq!((lean.pendants, full.pendants as usize), (0, n));
+        assert_eq!(lean.split_ids.len(), full.split_ids.len());
     }
     assert_eq!(
         rf_only.n_distinct_splits() + n,
