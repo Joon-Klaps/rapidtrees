@@ -723,9 +723,7 @@ const LANES: usize = 8;
 /// is what keeps identical trees at exactly 0.0.
 #[inline]
 fn sweep(a: &[f64], b: &[f64], overlap: &impl Fn(f64, f64) -> f64) -> f64 {
-    let mut lanes = [0.0f64; LANES];
-    accumulate(&mut lanes, a, b, overlap);
-    lanes.iter().sum()
+    accumulate([0.0; LANES], a, b, overlap).iter().sum()
 }
 
 /// Rows per weighted sweep task, rows of the other side held against them,
@@ -739,12 +737,21 @@ const PANEL: usize = 512;
 // add in `sweep`'s order.
 const _: () = assert!(PANEL.is_multiple_of(LANES));
 
-/// Add `overlap(a[k], b[k])` into `lanes` in [`sweep`]'s order: whole blocks
-/// of eight first, then the tail into the first lanes. Called panel by panel,
-/// with every panel but the last a multiple of eight wide, the lanes end up
-/// holding exactly what one call over the whole rows would.
+/// `lanes` with `overlap(a[k], b[k])` added in [`sweep`]'s order: whole
+/// blocks of eight first, then the tail into the first lanes. Called panel by
+/// panel, with every panel but the last a multiple of eight wide, the lanes end
+/// up holding exactly what one call over the whole rows would.
+///
+/// The lanes go in and come out by value. Behind a `&mut` the compiler cannot
+/// always prove that they do not alias the rows, and then stores every lane
+/// back on every block and gives up on vectorising: twice the instructions.
 #[inline(always)]
-fn accumulate(lanes: &mut [f64; LANES], a: &[f64], b: &[f64], overlap: &impl Fn(f64, f64) -> f64) {
+fn accumulate(
+    mut lanes: [f64; LANES],
+    a: &[f64],
+    b: &[f64],
+    overlap: &impl Fn(f64, f64) -> f64,
+) -> [f64; LANES] {
     let (a_blocks, a_tail) = a.as_chunks::<LANES>();
     let (b_blocks, b_tail) = b.as_chunks::<LANES>();
     for (xs, ys) in a_blocks.iter().zip(b_blocks) {
@@ -755,6 +762,7 @@ fn accumulate(lanes: &mut [f64; LANES], a: &[f64], b: &[f64], overlap: &impl Fn(
     for ((lane, &x), &y) in lanes.iter_mut().zip(a_tail).zip(b_tail) {
         *lane += overlap(x, y);
     }
+    lanes
 }
 
 /// The weighted kernels' trees laid out with the dense/posting boundary at
@@ -856,7 +864,7 @@ fn weighted_distances_split(
                 for (i, lanes_i) in (i0..i1).zip(&mut lanes) {
                     let a = &dense.row(i)[panel.clone()];
                     for (j, lane) in (j0..j1).zip(lanes_i).skip(at_or_before(i)) {
-                        accumulate(lane, a, &dense.row(j)[panel.clone()], &overlap);
+                        *lane = accumulate(*lane, a, &dense.row(j)[panel.clone()], &overlap);
                     }
                 }
             }
