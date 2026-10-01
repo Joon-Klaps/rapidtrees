@@ -47,7 +47,12 @@ use std::collections::HashMap;
 
 /// Bytes of tree text and raw parts parsed per chunk; see
 /// [`Snapshots::from_newick_iter_opts`].
-const CHUNK_TARGET_BYTES: usize = 256 * 1024 * 1024;
+///
+/// The chunk is held whole until it is interned, so below about 50 000 taxa
+/// it, not the split table, sets peak construction memory. 16 MiB is where
+/// shrinking it stops paying: a smaller chunk saves little more, and from
+/// about 10^5 taxa a chunk is already at its floor of one tree per thread.
+const CHUNK_TARGET_BYTES: usize = 16 * 1024 * 1024;
 
 /// A bulk collection of tree snapshots in an interned split-ID representation.
 ///
