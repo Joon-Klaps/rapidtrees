@@ -15,6 +15,7 @@ This project uses release names based on random words from [codenamegenerator.co
 - ([#56](https://github.com/Joon-Klaps/rapidtrees/pull/56)) - __PERFORMANCE__: Trees are parsed in smaller chunks, which lowers peak memory when building collections of up to tens of thousands of taxa.
 - ([#46](https://github.com/Joon-Klaps/rapidtrees/pull/46)) - __PERFORMANCE__: Splits are interned by 256 fingerprint shards in parallel instead of in one table on one thread, and the split table's key columns carry no padding.
 - ([#48](https://github.com/Joon-Klaps/rapidtrees/pull/48)) - __PERFORMANCE__: Pendant edges take their leaf's index as split ID instead of going through the split table, and plain RF no longer stores them.
+- ([#49](https://github.com/Joon-Klaps/rapidtrees/pull/49)) - __PERFORMANCE__: The kernels lay trees out a block at a time with posting lists sized from the split counts, and `Snapshots::into_pairwise_rf`, `into_pairwise_wrf` and `into_pairwise_kf`, used by the CLI and the matrix-only Python calls, drop each block of trees as it is laid out.
 
 ## [0.10.0] - Surface Copperhead (2026-09-24)
 

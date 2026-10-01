@@ -367,6 +367,8 @@ So the columns are split by how many trees hold them:
 
 A posting list is HashRF's bucket. Row `i` walks tree `i`'s posted splits, and for each one adds `overlap(length_i, length_j)` into cell `j` for every later tree `j` on the list, straight into the output row. The dense columns are then swept and added on top. A bucket of `k` trees costs `k²` — ruinous for a split every tree holds, and exactly why only the rare splits go there.
 
+Every kernel lays the trees out a block at a time. A block's rows and posted splits are worked out in parallel, and then its trees are added to the posting lists in tree order, which keeps every list ascending without a sort. A posting list holds exactly the trees that hold its split, so the split counts size every list before any tree is read, and no tree's splits are ever gathered twice. When the caller is done with the collection — the CLI, and the Python calls that return only a matrix — the kernel is handed the trees (`Snapshots::into_pairwise_*`) and drops each block once it is laid out, so the trees and the rows built from them are never held whole together.
+
 Two details keep the answer exact. The dense sweep runs eight independent running sums in a fixed order, so the compiler can vectorise it without changing the result. And each tree sums its posted splits in column order, the same order its shared terms are added in, so two identical trees cancel to exactly `0.0` however their Newick listed the children.
 
 ---
