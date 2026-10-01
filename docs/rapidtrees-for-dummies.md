@@ -256,7 +256,9 @@ Two things happen as each part is emitted:
 1. **Drop the trivial splits.** `size == 1` is a pendant (kept). `size >= n − 1` is a pendant's complement (dropped). Both decided by integer comparison on `size`.
 2. **Merge duplicates.** In a rooted binary tree both children of the root canonicalize to the *same* split; without merging, RF would come out inflated by 2 versus phangorn's `RF.dist(rooted=FALSE)`. When two parts merge, their branch lengths are summed. Those two children are the only way two parts of an ordinary tree can share a key, so the reader merges them directly. A unary node (one child) repeats its child's split too; that is rare, and the reader falls back to sorting the tree's parts by key and merging equal ones.
 
-`Snapshot` is deliberately **short-lived**: built per tree, handed straight to the interner, dropped. Trees are processed in chunks sized to a memory budget, so peak memory stays near the *deduplicated* footprint instead of holding every tree's raw data at once.
+`Snapshot` is deliberately **short-lived**: built per tree, handed straight to the interner, dropped. Trees are processed in chunks sized to a memory budget, and never to fewer trees than there are threads, so peak memory stays near the *deduplicated* footprint instead of holding every tree's raw data at once.
+
+The file is streamed the same way. A background thread reads it a tree at a time, each tree staying in the line it was read into, and a chunk's text is dropped as soon as the chunk is parsed. The input never has to fit in memory, which matters most for BEAST output, where the `[&...]` annotations are most of the bytes.
 
 ---
 
@@ -499,5 +501,5 @@ Not every path needs everything, and both extras cost real work:
 | `snapshot/mod.rs` | `Snapshots`, the construction pipeline, `Retain` |
 | `distances.rs` | RF over dense bit-rows plus posting lists; WRF / KF over dense columns plus posting lists |
 | `snapshot/clades.rs` | the export-only leaf-set table, and its packed ordering |
-| `io.rs` | NEXUS/Newick file reading: tree lines, TRANSLATE, burn-in |
+| `io.rs` | NEXUS/Newick file reading, streamed a tree at a time: tree lines, TRANSLATE, burn-in |
 | `api.rs` | PyO3 bindings — glue only, no computation |

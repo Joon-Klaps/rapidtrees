@@ -45,6 +45,10 @@ use crate::par::*;
 use clades::CladeTable;
 use std::collections::HashMap;
 
+/// Bytes of tree text and raw parts parsed per chunk; see
+/// [`Snapshots::from_newick_iter_opts`].
+const CHUNK_TARGET_BYTES: usize = 256 * 1024 * 1024;
+
 /// A bulk collection of tree snapshots in an interned split-ID representation.
 ///
 /// All trees in the set share a single bipartition table: each unique split is
@@ -123,25 +127,49 @@ impl Snapshots {
     }
 
     /// Like [`Snapshots::from_newick_iter`], but lets a caller skip work it will
-    /// not read. See [`Retain`].
+    /// not read, and takes the Newick text as anything that derefs to `str`.
     ///
-    /// [`Snapshots::from_newick_iter`] retains everything, so callers that do
-    /// not opt in are unaffected.
-    pub fn from_newick_iter_opts<'a>(
-        entries: impl IntoIterator<Item = (&'a str, &'a HashMap<String, String>)>,
+    /// Entries are pulled lazily, one chunk of trees at a time, and a chunk's
+    /// text is dropped as soon as it is parsed. A caller that hands over owned
+    /// strings from a lazy source (a file being read, a Python iterator)
+    /// therefore never holds more than one chunk of text. See [`Retain`] for
+    /// what can be skipped; [`Snapshots::from_newick_iter`] retains everything,
+    /// so callers that do not opt in are unaffected.
+    pub fn from_newick_iter_opts<'a, T>(
+        entries: impl IntoIterator<Item = (T, &'a HashMap<String, String>)>,
         rooted: bool,
         retain: Retain,
-    ) -> Result<Self, String> {
-        let entries: Vec<_> = entries.into_iter().collect();
-        if entries.is_empty() {
+    ) -> Result<Self, String>
+    where
+        T: AsRef<str> + Send + Sync,
+    {
+        Self::from_chunks(entries.into_iter(), rooted, retain, CHUNK_TARGET_BYTES)
+    }
+
+    /// [`Self::from_newick_iter_opts`] with the chunk budget given.
+    ///
+    /// A chunk is `budget` bytes of text and raw parts, estimated from tree 0
+    /// (every tree shares its leaf set, so it is representative), rounded to a
+    /// whole number of rounds of the thread pool: never fewer trees than
+    /// threads, or wide trees would parse on a few cores while the rest idle.
+    fn from_chunks<'a, T>(
+        mut entries: impl Iterator<Item = (T, &'a HashMap<String, String>)>,
+        rooted: bool,
+        retain: Retain,
+        budget: usize,
+    ) -> Result<Self, String>
+    where
+        T: AsRef<str> + Send + Sync,
+    {
+        let Some((first, first_translate)) = entries.next() else {
             return Ok(Self::empty());
-        }
+        };
+        let first_newick = first.as_ref();
 
         // Tree 0 defines the run's taxa, so its names are read first and on
         // their own: every tree's leaf check, tree 0's included, needs the very
         // table they are about to build. An unnamed leaf fails inside
         // `leaf_names`; a repeated one is caught here.
-        let (first_newick, first_translate) = entries[0];
         let mut sorted_leaf_names = newick::leaf_names(first_newick, first_translate)?;
         let n_leaves = sorted_leaf_names.len();
         sorted_leaf_names.sort_unstable();
@@ -166,21 +194,16 @@ impl Snapshots {
         };
 
         let first_snap = newick::snapshot(first_newick, first_translate, 0, &run)?;
-
-        // Bound how many raw snapshots are alive at once. Holding every tree's
-        // un-interned parts simultaneously is the dominant memory cost at
-        // construction — it can dwarf the deduplicated result and OOM the process.
-        // Estimate one snapshot's raw bytes from the first tree (all trees share
-        // the leaf set, so this is representative), parse the rest in chunks sized
-        // to ~`CHUNK_TARGET_BYTES`, and fold each chunk into the interner — freeing
-        // its parts — before parsing the next.
-        const CHUNK_TARGET_BYTES: usize = 256 * 1024 * 1024;
-        let per_snap_bytes = first_snap.parts.len() * size_of::<Part>()
-            + first_snap.leaf_order.len() * size_of::<u32>();
-        let chunk = (CHUNK_TARGET_BYTES / per_snap_bytes.max(1)).clamp(1, 4096);
+        let per_tree = first_snap.parts.len() * size_of::<Part>()
+            + first_snap.leaf_order.len() * size_of::<u32>()
+            + first_newick.len();
+        let threads = current_num_threads().max(1);
+        let rounds = (budget / (per_tree.max(1) * threads)).clamp(1, (4096 / threads).max(1));
+        let chunk = rounds * threads;
+        drop(first);
 
         let mut interner = Interner::new(
-            entries.len(),
+            entries.size_hint().0 + 1,
             first_snap.words,
             sorted_leaf_names.len(),
             rooted,
@@ -189,22 +212,28 @@ impl Snapshots {
         interner.push(first_snap);
 
         let mut base = 1usize; // tree 0 is already interned
-        for chunk_entries in entries[1..].chunks(chunk) {
-            // Parse this chunk in parallel, validating leaf sets.
-            let raw: Vec<Snapshot> = chunk_entries
+        loop {
+            let batch: Vec<_> = entries.by_ref().take(chunk).collect();
+            if batch.is_empty() {
+                break;
+            }
+            // Parse this chunk in parallel, validating leaf sets. Its text is
+            // not needed past the parse.
+            let raw: Vec<Snapshot> = batch
                 .par_iter()
                 .enumerate()
-                .map(|(k, &(newick, translate))| {
-                    newick::snapshot(newick, translate, base + k, &run)
+                .map(|(k, (newick, translate))| {
+                    newick::snapshot(newick.as_ref(), translate, base + k, &run)
                 })
                 .collect::<Result<_, _>>()?;
+            base += batch.len();
+            drop(batch);
 
             // Sequential fold: each raw snapshot is dropped right after it is
             // interned, so peak stays near the deduplicated footprint.
             for snap in raw {
                 interner.push(snap);
             }
-            base += chunk_entries.len();
         }
 
         Ok(interner.finish(sorted_leaf_names))
@@ -265,7 +294,8 @@ impl Snapshots {
         crate::distances::distance_kf(self, progress)
     }
 
-    fn empty() -> Self {
+    /// A collection of no trees.
+    pub(crate) fn empty() -> Self {
         Self {
             snapshots: Vec::new(),
             clades: CladeTable::new(),
