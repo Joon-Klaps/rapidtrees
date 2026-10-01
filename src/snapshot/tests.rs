@@ -7,14 +7,14 @@
 use super::*;
 use std::collections::HashSet;
 
-/// Decode a native-endian `f64` matrix emitted by `build_branch_length_matrix`.
-fn decode_f64(bytes: &[u8]) -> Vec<f64> {
+/// Decode a native-endian buffer emitted by an export builder, e.g. `decode(&bytes, f64::from_ne_bytes)`.
+fn decode<T, const N: usize>(bytes: &[u8], from_ne_bytes: fn([u8; N]) -> T) -> Vec<T> {
     bytes
-        .as_chunks::<8>()
+        .as_chunks::<N>()
         .0
         .iter()
         .copied()
-        .map(f64::from_ne_bytes)
+        .map(from_ne_bytes)
         .collect()
 }
 
@@ -534,7 +534,7 @@ fn test_build_branch_length_matrix_values() {
     assert_eq!(n_bip, snaps.clades.len());
 
     // Decode bytes to f64 matrix: shape (2, n_bip)
-    let floats = decode_f64(&bytes);
+    let floats = decode(&bytes, f64::from_ne_bytes);
     assert_eq!(floats.len(), 2 * n_bip);
 
     let row0 = &floats[..n_bip];
@@ -591,7 +591,7 @@ fn test_branch_length_matrix_consistent_with_presence_matrix() {
     assert_eq!(bl_col_to_bip, pres_col_to_bip);
 
     let n_bip = bl_col_to_bip.len();
-    let bl = decode_f64(&bl_bytes);
+    let bl = decode(&bl_bytes, f64::from_ne_bytes);
 
     // For every (tree, bipartition) cell: bl > 0 ↔ presence == 1.
     for tree in 0..2 {
@@ -618,7 +618,7 @@ fn test_build_branch_length_matrix_two_leaves() {
     assert_eq!(col_to_bip_id.len(), 2);
     assert_eq!(bytes.len(), 2 * 2 * 8); // 2 trees × 2 bips × 8 bytes
 
-    let floats = decode_f64(&bytes);
+    let floats = decode(&bytes, f64::from_ne_bytes);
     // Both pendant columns must be non-zero in both trees.
     assert!(floats.iter().all(|&v| v > 0.0));
 }
@@ -638,7 +638,7 @@ fn test_build_branch_length_matrix_absent_split_is_zero() {
     let (bytes, col_to_bip_id) = snaps.build_branch_length_matrix();
     let n_bip = col_to_bip_id.len();
 
-    let floats = decode_f64(&bytes);
+    let floats = decode(&bytes, f64::from_ne_bytes);
 
     // Find the column for the {C,D} bipartition (bits 2 and 3 set = 0b1100).
     let cd_col = col_to_bip_id
@@ -759,6 +759,64 @@ fn test_presence_export_independent_of_lengths() {
     assert_eq!(bip_a, bip_b, "bipartition clade bytes must be identical");
 }
 
+/// Each CSR row lists, in ascending order, exactly the columns its dense presence row sets, in both rooting modes and with a polytomy in the set.
+#[test]
+fn sparse_presence_matrix_expands_to_dense() {
+    let trees = [
+        "((A:1,B:2):5,(C:3,D:4):6);",
+        "((A:7,C:8):9,(B:10,D:11):12);",
+        "(A:1,B:1,C:1,D:1);",
+    ];
+    for rooted in [false, true] {
+        let snaps = snaps_opts(&trees, rooted, false);
+        let (presence, dense_cols) = snaps.build_presence_matrix();
+        let (offsets, columns, sparse_cols) = snaps.build_sparse_presence_matrix();
+        let offsets = decode(&offsets, u64::from_ne_bytes);
+        let columns = decode(&columns, u32::from_ne_bytes);
+        assert_eq!(sparse_cols, dense_cols);
+        assert_eq!(offsets.len(), trees.len() + 1);
+        assert_eq!(offsets.last(), Some(&(columns.len() as u64)));
+
+        let n_bip = dense_cols.len();
+        let mut expanded = vec![0u8; presence.len()];
+        for (tree, bounds) in offsets.windows(2).enumerate() {
+            let row = &columns[bounds[0] as usize..bounds[1] as usize];
+            assert!(row.windows(2).all(|w| w[0] < w[1]), "tree {tree}: {row:?}");
+            for &col in row {
+                expanded[tree * n_bip + col as usize] = 1;
+            }
+        }
+        assert_eq!(expanded, presence, "rooted={rooted}");
+    }
+}
+
+/// A polytomy holds fewer splits than a binary tree, so its CSR row is shorter. Rooted, the star tree has its four pendant clades and the binary tree adds `{A,B}` and `{C,D}`; columns ascend by packed leaf set, so `{A,B}` sorts between `{B}` and `{C}`.
+#[test]
+fn sparse_presence_rows_vary_in_width() {
+    let trees = ["(A:1,B:1,C:1,D:1);", "((A:1,B:1):1,(C:1,D:1):1);"];
+    let (offsets, columns, _) = snaps_opts(&trees, true, false).build_sparse_presence_matrix();
+    assert_eq!(decode(&offsets, u64::from_ne_bytes), [0, 4, 10]);
+    assert_eq!(
+        decode(&columns, u32::from_ne_bytes),
+        [0, 1, 3, 4, 0, 1, 2, 3, 4, 5]
+    );
+}
+
+/// Without a clade table there are no columns to list, so every CSR row is empty, as every dense row is.
+#[test]
+fn sparse_presence_without_bipartitions_has_empty_rows() {
+    let empty = HashMap::new();
+    let trees = [
+        "((A:1,B:2):5,(C:3,D:4):6);",
+        "((A:7,C:8):9,(B:10,D:11):12);",
+    ];
+    let entries = trees.iter().map(|&n| (n, &empty));
+    let snaps = Snapshots::from_newick_iter_opts(entries, false, Retain::for_distances(false));
+    let (offsets, columns, cols) = snaps.unwrap().build_sparse_presence_matrix();
+    assert_eq!(decode(&offsets, u64::from_ne_bytes), [0, 0, 0]);
+    assert!(columns.is_empty() && cols.is_empty());
+}
+
 /// Leaf-set validation runs against the shared name → bit table rather than a
 /// per-tree `HashSet<String>`. These are the three ways a tree can disagree with
 /// tree 0, and all of them must still be caught.
@@ -832,6 +890,11 @@ fn empty_collection_is_queryable() {
     let (lengths, cols_bl) = snaps.build_branch_length_matrix();
     assert!(lengths.is_empty());
     assert_eq!(cols_bl, cols);
+
+    let (offsets, columns, cols_sparse) = snaps.build_sparse_presence_matrix();
+    assert_eq!(decode(&offsets, u64::from_ne_bytes), [0]);
+    assert!(columns.is_empty());
+    assert_eq!(cols_sparse, cols);
 
     assert!(snaps.build_bipartition_bytes(&cols).is_empty());
 }

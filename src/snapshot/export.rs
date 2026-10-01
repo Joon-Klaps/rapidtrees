@@ -2,11 +2,11 @@
 //! each edge is worth, and which taxa each split names.
 //!
 //! Every builder here shares one column order — ascending packed leaf set,
-//! stable across calls on the same tree set — so the three buffers can be
+//! stable across calls on the same tree set — so their buffers can be
 //! indexed against each other and against `leaf_names`.
 
-use super::Snapshots;
 use super::clades::cmp_packed;
+use super::{InternSnap, Snapshots};
 use crate::par::*;
 impl Snapshots {
     /// The one column order every builder here shares, in both directions.
@@ -60,6 +60,49 @@ impl Snapshots {
             });
 
         (presence, col_to_bip_id)
+    }
+
+    /// Build the presence matrix in compressed sparse-row (CSR) form.
+    ///
+    /// Returns `(row_offsets, column_indices, col_to_bip_id)`:
+    /// - `row_offsets`: native-endian `u64` bytes, `n_trees + 1` values; tree `i` owns entries `row_offsets[i]..row_offsets[i + 1]`
+    /// - `column_indices`: native-endian `u32` bytes, one column per entry, ascending within each tree
+    /// - `col_to_bip_id`: as returned by [`Snapshots::build_presence_matrix`]
+    ///
+    /// Columns follow [`Snapshots::build_presence_matrix`], so setting each tree's listed columns to `1` reproduces the dense matrix. Rows differ in length when trees hold different numbers of splits, as polytomies do.
+    pub fn build_sparse_presence_matrix(&self) -> (Vec<u8>, Vec<u8>, Vec<usize>) {
+        let (id_to_col, col_to_bip_id) = self.column_order();
+        // Without a clade table (`Retain::bipartitions` off) there are no columns, as in the dense builders.
+        if col_to_bip_id.is_empty() {
+            let row_offsets = vec![0u8; (self.snapshots.len() + 1) * size_of::<u64>()];
+            return (row_offsets, Vec::new(), col_to_bip_id);
+        }
+        let n_entries: usize = self.snapshots.iter().map(InternSnap::n_splits).sum();
+        let mut row_offsets = Vec::with_capacity((self.snapshots.len() + 1) * size_of::<u64>());
+        let mut column_indices = vec![0u8; n_entries * size_of::<u32>()];
+
+        // Prefix sum over row lengths, carving `column_indices` into one slice per tree on the way so the rows can be filled in parallel.
+        let mut rows = Vec::with_capacity(self.snapshots.len());
+        let mut rest = column_indices.as_mut_slice();
+        let mut end = 0u64;
+        row_offsets.extend_from_slice(&end.to_ne_bytes());
+        for snap in &self.snapshots {
+            let (row, tail) =
+                std::mem::take(&mut rest).split_at_mut(snap.n_splits() * size_of::<u32>());
+            rows.push(row);
+            rest = tail;
+            end += snap.n_splits() as u64;
+            row_offsets.extend_from_slice(&end.to_ne_bytes());
+        }
+
+        self.snapshots.par_iter().zip(rows).for_each(|(snap, row)| {
+            let entries = sorted_row(snap, &id_to_col);
+            for (dst, (col, _)) in row.chunks_exact_mut(size_of::<u32>()).zip(entries) {
+                dst.copy_from_slice(&col.to_ne_bytes());
+            }
+        });
+
+        (row_offsets, column_indices, col_to_bip_id)
     }
 
     /// Build a flat row-major branch-length matrix `(n_trees × n_bip)` as native-endian
@@ -138,4 +181,17 @@ impl Snapshots {
         }
         out
     }
+}
+
+/// One tree's splits as `(column, position)` pairs in ascending column order, where `position` indexes [`InternSnap::ids`].
+///
+/// `lengths` follows the same order as `ids`, so the position lets a caller carry a branch length, or any value laid out like it, into the order of the columns.
+fn sorted_row(snap: &InternSnap, id_to_col: &[usize]) -> Vec<(u32, u32)> {
+    let mut row: Vec<(u32, u32)> = snap
+        .ids()
+        .zip(0..)
+        .map(|(id, pos)| (id_to_col[id as usize] as u32, pos))
+        .collect();
+    row.sort_unstable();
+    row
 }
