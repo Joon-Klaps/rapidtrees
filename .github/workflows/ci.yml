@@ -100,8 +100,8 @@ jobs:
             - name: Run Python API tests
               run: pixi run -e ${{ matrix.environment }} test-python
 
-    wasm-compat:
-        name: Wasm Compatibility
+    wasm-test:
+        name: Wasm smoke test
         runs-on: ubuntu-latest
 
         steps:
@@ -141,9 +141,7 @@ jobs:
                   cargo fmt -- --check
                   cargo clippy --target wasm32-unknown-unknown -- -D warnings
 
-            # Compiling is not running: a rayon pool, std::fs or std::time::Instant on the
-            # wasm path builds fine and only traps once called. This loads the wasm32 build
-            # in Node, reads every BEAST file in tests/data, and checks the RF, weighted RF
-            # and KF matrices against the native CLI.
+            # Checking if wasm32 build for all files in data/
+            # match those of CLI
             - name: Run the wasm32 build on BEAST files
               run: node tests/wasm/run.ts
