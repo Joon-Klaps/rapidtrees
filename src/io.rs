@@ -76,7 +76,7 @@ pub fn detect_format(content: &str) -> TreeFormat {
 const READ_BUFFER_BYTES: usize = 16 << 20;
 
 /// Bytes of tree text the background reader may hold ahead of the parser.
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 const READ_AHEAD_BYTES: usize = 256 << 20;
 
 /// One tree as read from a tree file.
@@ -204,6 +204,11 @@ impl<R: BufRead> TreeReader<R> {
             done: false,
         };
         reader.read_line()?;
+        // A byte-order mark is not text: left in, it hides `#NEXUS` from the
+        // sniff below and a Newick tree's opening `(`.
+        if reader.line.starts_with('\u{feff}') {
+            reader.line.drain(..'\u{feff}'.len_utf8());
+        }
         while !reader.line.is_empty() && reader.line.trim().is_empty() {
             reader.read_line()?;
         }
@@ -257,8 +262,11 @@ impl<R: BufRead> TreeReader<R> {
         while !self.line.is_empty() && !starts_with_ci(self.line.trim(), "tree ") {
             if use_real_taxa && starts_with_ci(self.line.trim(), "translate") {
                 self.read_line()?;
-                while !self.line.is_empty() && !self.line.trim().starts_with(';') {
+                while !self.line.is_empty() {
                     translate.extend(translate_entry(&self.line));
+                    if closes_translate(&self.line) {
+                        break;
+                    }
                     self.read_line()?;
                 }
             }
@@ -406,7 +414,7 @@ impl<R: BufRead> Iterator for TreeReader<R> {
 
 /// A reader's trees, read on a background thread about [`READ_AHEAD_BYTES`]
 /// ahead of the consumer, so that reading the file overlaps parsing it.
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 fn read_ahead<R>(mut reader: TreeReader<R>) -> Box<dyn Iterator<Item = io::Result<TreeRecord>>>
 where
     R: BufRead + Send + 'static,
@@ -420,12 +428,22 @@ where
     let (tx, rx) = std::sync::mpsc::sync_channel(depth);
     // The thread stops at the end of the file, or as soon as the consumer
     // hangs up and a send fails.
-    std::thread::spawn(move || reader.try_for_each(|tree| tx.send(tree)));
-    Box::new(std::iter::once(first).chain(rx))
+    let mut thread = Some(std::thread::spawn(move || {
+        reader.try_for_each(|tree| tx.send(tree))
+    }));
+    // A panic drops the sender just as the end of the file does, so once the
+    // queue is drained the thread is joined, and a panic becomes an error
+    // instead of a quietly shortened file.
+    let panicked = std::iter::from_fn(move || {
+        thread.take()?.join().err()?;
+        Some(Err(io::Error::other("the tree reader thread panicked")))
+    });
+    Box::new(std::iter::once(first).chain(rx).chain(panicked))
 }
 
-/// Without the `parallel` feature, and so on wasm32, trees are read inline.
-#[cfg(not(feature = "parallel"))]
+/// Without the `parallel` feature trees are read inline, and so on wasm32,
+/// which has no `std::thread::spawn` even where `parallel` is on.
+#[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
 fn read_ahead<R>(reader: TreeReader<R>) -> Box<dyn Iterator<Item = io::Result<TreeRecord>>>
 where
     R: BufRead + Send + 'static,
@@ -481,16 +499,20 @@ pub fn load_beast_trees<P: AsRef<Path>>(
 
     let mut names = Vec::new();
     let mut failed = None;
-    let entries = read_ahead(reader).map_while(|tree| match tree {
-        Ok(mut tree) => {
-            names.push(std::mem::take(&mut tree.name));
-            Some((tree, &translate))
-        }
-        Err(e) => {
-            failed = Some(e);
-            None
-        }
-    });
+    // Fused: the builder asks again after a short chunk, and `map_while`
+    // would read on past the error that ended it.
+    let entries = read_ahead(reader)
+        .map_while(|tree| match tree {
+            Ok(mut tree) => {
+                names.push(std::mem::take(&mut tree.name));
+                Some((tree, &translate))
+            }
+            Err(e) => {
+                failed = Some(e);
+                None
+            }
+        })
+        .fuse();
     let built = Snapshots::from_newick_iter_opts(entries, rooted, retain);
     match (failed, built) {
         (None, Ok(snaps)) => return (names, snaps),
@@ -670,18 +692,35 @@ fn collect_newick_trees(content: &str, base_name: &str) -> Vec<TreeRecord> {
 
 /// Read a NEXUS `TRANSLATE` block into a numeric-ID → taxon-name map.
 pub fn parse_taxon_block(content: &str) -> HashMap<String, String> {
-    content
+    let mut translate = HashMap::new();
+    let block = content
         .lines()
         .skip_while(|line| !starts_with_ci(line.trim(), "translate"))
-        .skip(1)
-        .take_while(|line| !line.trim().starts_with(';'))
-        .filter_map(translate_entry)
-        .collect::<HashMap<_, _>>()
+        .skip(1);
+    for line in block {
+        translate.extend(translate_entry(line));
+        if closes_translate(line) {
+            break;
+        }
+    }
+    translate
 }
 
-/// One `TRANSLATE` line, `<id> <label>,`, as `(id, label)`, quotes dropped.
+/// Whether a `TRANSLATE` line ends the block: a line opening with `;`, or the
+/// last entry carrying the `;` itself, as MrBayes writes it.
+fn closes_translate(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with(';') || line.ends_with(';')
+}
+
+/// One `TRANSLATE` line, `<id> <label>,` or a last `<id> <label>;`, as
+/// `(id, label)`, quotes dropped. A line opening with `;` holds none.
 fn translate_entry(line: &str) -> Option<(String, String)> {
-    let line = line.trim().trim_end_matches(',');
+    let line = line.trim();
+    if line.starts_with(';') {
+        return None;
+    }
+    let line = line.trim_end_matches(';').trim_end().trim_end_matches(',');
     let mut parts = line.split_whitespace();
     let id = parts.next()?.to_string();
     let label = parts.next()?.trim_matches('\'').to_string();
@@ -759,6 +798,16 @@ mod load_tests {
         assert_eq!(map.get("1").map(String::as_str), Some("Alpha"));
         assert_eq!(map.get("2").map(String::as_str), Some("Beta"));
         assert_eq!(map.get("3").map(String::as_str), Some("Gamma"));
+    }
+
+    /// MrBayes ends the block on the last entry: its `;` is not part of the
+    /// label, and the tree lines after it are not entries.
+    #[test]
+    fn test_parse_taxon_block_semicolon_on_last_entry() {
+        let content = "begin trees;\n   translate\n       1 A,\n       2 'B';\n   tree gen.0 = [&U] (1:1,2:1);\nend;\n";
+        let map = parse_taxon_block(content);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("2").map(String::as_str), Some("B"));
     }
 
     #[test]
@@ -942,6 +991,33 @@ mod load_tests {
         assert!(trees.next().is_none());
     }
 
+    /// Input that serves `data` and then panics, as a bug in the reader would.
+    #[cfg(feature = "parallel")]
+    struct PanicsAfter(&'static [u8]);
+
+    #[cfg(feature = "parallel")]
+    impl io::Read for PanicsAfter {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            assert!(!self.0.is_empty(), "reader bug");
+            let n = buf.len().min(self.0.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+
+    /// A panic on the read-ahead thread ends the trees with an error, not with
+    /// what looks like the end of the file.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_read_ahead_reports_a_reader_panic() {
+        let input = BufReader::new(PanicsAfter(b"(A:1,B:1,C:1);\n(A:2,B:2,C:2);\n"));
+        let (_, trees) = TreeReader::new(input, "f", "input", None, 0, 0, false).unwrap();
+        let mut trees: Vec<_> = read_ahead(trees).collect();
+        assert!(trees.pop().is_some_and(|last| last.is_err()));
+        assert!(trees.iter().all(Result::is_ok));
+    }
+
     /// Writes `content` to a temporary `*<suffix>` file and loads it for RF,
     /// resolving TRANSLATE.
     fn load_bytes(content: &[u8], suffix: &str) -> (Vec<String>, Snapshots) {
@@ -972,6 +1048,32 @@ mod load_tests {
         let (names, snaps) = load_bytes(content, ".trees");
         assert_eq!(names.len(), 2);
         assert_eq!(snaps.len(), 2);
+    }
+
+    /// A MrBayes `.t` file: the TRANSLATE block ends on its last entry, so the
+    /// tree lines after it are still trees.
+    #[test]
+    fn test_load_beast_trees_mrbayes_translate() {
+        let content = b"#NEXUS\n[ID: 123]\nbegin trees;\n   translate\n       1 A,\n       2 B,\n       3 C,\n       4 D;\n   tree gen.0 = [&U] ((1:1,2:1):1,(3:1,4:1):1);\n   tree gen.100 = [&U] ((1:1,3:1):1,(2:1,4:1):1);\nend;\n";
+        let (names, snaps) = load_bytes(content, ".t");
+        assert_eq!(names.len(), 2);
+        assert_eq!(snaps.leaf_names, ["A", "B", "C", "D"]);
+        assert_eq!(snaps.pairwise_rf(None), vec![0, 2, 2, 0]);
+    }
+
+    /// A byte-order mark neither hides a `#NEXUS` header nor a Newick file's
+    /// first tree.
+    #[test]
+    fn test_load_beast_trees_byte_order_mark() {
+        let nexus = "\u{feff}#NEXUS\nBegin trees;\n\tTranslate\n\t\t1 A,\n\t\t2 B,\n\t\t3 C,\n\t\t4 D\n\t\t;\ntree STATE_0 = ((1:1,2:1):1,(3:1,4:1):1);\ntree STATE_10 = ((1:1,3:1):1,(2:1,4:1):1);\nEnd;\n";
+        let (names, snaps) = load_bytes(nexus.as_bytes(), ".trees");
+        assert_eq!(names.len(), 2);
+        assert_eq!(snaps.leaf_names, ["A", "B", "C", "D"]);
+
+        let newick = "\u{feff}((A:1,B:1):1,(C:1,D:1):1);\n((A:1,C:1):1,(B:1,D:1):1);\n";
+        let (names, snaps) = load_bytes(newick.as_bytes(), ".newick");
+        assert_eq!(names.len(), 2);
+        assert_eq!(snaps.pairwise_rf(None), vec![0, 2, 2, 0]);
     }
 
     /// More trees than the read-ahead queue holds still arrive complete and in
