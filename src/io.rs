@@ -1,14 +1,13 @@
 use crate::snapshot::{Retain, Snapshots};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
-
+use std::io::{self, BufRead, BufReader};
+use std::ops::Range;
 use std::path::Path;
 
 #[cfg(feature = "cli")]
 use flate2::{Compression, write::GzEncoder};
-#[cfg(feature = "cli")]
-use std::io;
 #[cfg(feature = "cli")]
 use std::io::Write;
 
@@ -72,83 +71,385 @@ pub fn detect_format(content: &str) -> TreeFormat {
     }
 }
 
-/// One tree as read from a file, before burn-in filtering.
-struct RawTree {
+/// Buffer between the file and the reader. Every file allocates one, and a
+/// larger one reads no faster, not even lines of over a megabyte.
+const READ_BUFFER_BYTES: usize = 64 << 10;
+
+/// Bytes of tree text the background reader may hold ahead of the parser:
+/// enough to keep it fed, and never fewer than two trees.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+const READ_AHEAD_BYTES: usize = 32 << 20;
+
+/// One tree as read from a tree file.
+///
+/// It keeps the line it was read in, and its Newick text is a range of that
+/// buffer, so reading a tree never copies it.
+pub(crate) struct TreeRecord {
     /// Display name, already prefixed with the file stem.
-    name: String,
+    pub(crate) name: String,
     /// MCMC state it was sampled at; `0` when the format records none.
-    state: usize,
-    /// Newick string, annotations already stripped.
-    newick: String,
+    pub(crate) state: usize,
+    text: String,
+    span: Range<usize>,
 }
 
-/// Load raw tree data from a NEXUS or plain-Newick tree file without parsing.
+impl TreeRecord {
+    /// The tree's Newick string.
+    pub(crate) fn newick(&self) -> &str {
+        &self.text[self.span.clone()]
+    }
+}
+
+impl AsRef<str> for TreeRecord {
+    fn as_ref(&self) -> &str {
+        self.newick()
+    }
+}
+
+/// Byte offset of `part` in `whole`, which `part` must borrow from.
+fn offset_in(whole: &str, part: &str) -> usize {
+    part.as_ptr() as usize - whole.as_ptr() as usize
+}
+
+/// Reads the trees of a NEXUS or plain-Newick file one at a time.
 ///
-/// The format is sniffed with [`detect_format`]. Returns
-/// `(translate_map, [(tree_name, stripped_newick)])`; burnin filtering and
-/// annotation stripping are applied but no Newick parsing is done.
+/// Opening reads the header. The first non-empty line decides the format:
+/// `#NEXUS`, or a `begin` or `tree` line, is NEXUS, and anything else is
+/// Newick. For NEXUS the `TRANSLATE` block comes back complete before the
+/// first tree is read. Trees then arrive one by one with burn-in applied, each
+/// in the line it was read from, so only the trees in flight are ever in
+/// memory, however large the file and however much of it is annotation.
 ///
-/// Plain Newick files name nothing, so their trees are called
-/// `<file stem>_line<n>` after the 1-based line each tree starts on. They carry
-/// no `STATE_` labels either, so `burnin_states` does not apply, and they have
-/// no `TRANSLATE` block, so `use_real_taxa` leaves the returned map empty.
-pub(crate) fn load_beast_raw<P: AsRef<Path>>(
-    path: P,
+/// NEXUS trees are the `name = newick` lines from the first `tree` line to
+/// `end;`, named after their header. Newick trees end at `;`, may share a line
+/// or wrap across lines, have `[&...]` annotations stripped per line, and are
+/// named `<file stem>_line<n>` after the line they start on.
+pub(crate) struct TreeReader<R> {
+    lines: R,
+    /// The line waiting to be processed; empty once the input is exhausted.
+    line: String,
+    /// Lines read so far, which is the 1-based number of `line`.
+    lines_read: usize,
+    format: TreeFormat,
+    base_name: String,
+    /// How the input is named in messages.
+    label: String,
     burnin_trees: usize,
     burnin_states: usize,
-    use_real_taxa: bool,
-) -> (HashMap<String, String>, Vec<(String, String)>) {
-    let path = path.as_ref();
-    let content = match fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Failed to read {path:?}: {e}");
-            return (HashMap::new(), Vec::new());
-        }
-    };
+    /// Trees read so far, burn-in included.
+    seen: usize,
+    /// Newick only: the text of a tree still waiting for its `;`, and the
+    /// line it started on.
+    pending: String,
+    pending_line: usize,
+    /// Trees read but not yet handed out.
+    ready: VecDeque<TreeRecord>,
+    /// Whether the input held anything besides blank lines.
+    has_content: bool,
+    done: bool,
+}
 
-    let base_name = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown");
-    let format = detect_format(&content);
+impl TreeReader<BufReader<fs::File>> {
+    /// Open `path` and read its header. Returns the `TRANSLATE` map, empty
+    /// unless `use_real_taxa`, and a reader positioned at the first tree.
+    pub(crate) fn open(
+        path: &Path,
+        burnin_trees: usize,
+        burnin_states: usize,
+        use_real_taxa: bool,
+    ) -> io::Result<(HashMap<String, String>, Self)> {
+        let base_name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+        let lines = BufReader::with_capacity(READ_BUFFER_BYTES, fs::File::open(path)?);
+        let label = format!("{path:?}");
+        Self::new(
+            lines,
+            base_name,
+            &label,
+            None,
+            burnin_trees,
+            burnin_states,
+            use_real_taxa,
+        )
+    }
+}
 
-    // Newick trees carry no `STATE_` labels, so a state threshold cannot apply.
-    let burnin_states = if format == TreeFormat::Newick && burnin_states > 0 {
-        eprintln!("Ignoring burn-in by state for {path:?}: Newick trees carry no `STATE_` labels");
-        0
-    } else {
-        burnin_states
-    };
-
-    let (translate_map, trees) = match format {
-        TreeFormat::Nexus => {
-            let translate = if use_real_taxa {
-                parse_taxon_block(&content)
-            } else {
-                HashMap::new()
-            };
-            (translate, collect_nexus_trees(&content, base_name))
-        }
-        TreeFormat::Newick => (HashMap::new(), collect_newick_trees(&content, base_name)),
-    };
-
-    if trees.is_empty() && !content.trim().is_empty() {
-        let missing = match format {
-            TreeFormat::Nexus => "no NEXUS `tree ... = ...` lines",
-            TreeFormat::Newick => "no `;`-terminated Newick trees",
+impl<R: BufRead> TreeReader<R> {
+    /// Read the header of `lines`; `format` forces a format instead of
+    /// sniffing one.
+    fn new(
+        lines: R,
+        base_name: &str,
+        label: &str,
+        format: Option<TreeFormat>,
+        burnin_trees: usize,
+        burnin_states: usize,
+        use_real_taxa: bool,
+    ) -> io::Result<(HashMap<String, String>, Self)> {
+        let mut reader = Self {
+            lines,
+            line: String::new(),
+            lines_read: 0,
+            format: TreeFormat::Newick,
+            base_name: base_name.to_string(),
+            label: label.to_string(),
+            burnin_trees,
+            burnin_states,
+            seen: 0,
+            pending: String::new(),
+            pending_line: 0,
+            ready: VecDeque::new(),
+            has_content: false,
+            done: false,
         };
-        eprintln!("No trees found in {path:?}: {missing}");
+        reader.read_line()?;
+        // A byte-order mark is not text: left in, it hides `#NEXUS` from the
+        // sniff below and a Newick tree's opening `(`.
+        if reader.line.starts_with('\u{feff}') {
+            reader.line.drain(..'\u{feff}'.len_utf8());
+        }
+        while !reader.line.is_empty() && reader.line.trim().is_empty() {
+            reader.read_line()?;
+        }
+        let head = reader.line.trim();
+        reader.has_content = !head.is_empty();
+        let nexus = starts_with_ci(head, "#nexus")
+            || starts_with_ci(head, "begin")
+            || starts_with_ci(head, "tree ");
+        reader.format = format.unwrap_or(if nexus {
+            TreeFormat::Nexus
+        } else {
+            TreeFormat::Newick
+        });
+
+        let mut translate = HashMap::new();
+        if reader.format == TreeFormat::Nexus {
+            reader.read_nexus_header(use_real_taxa, &mut translate)?;
+        } else if burnin_states > 0 {
+            // Newick trees carry no `STATE_` labels, so a state threshold cannot apply.
+            eprintln!(
+                "Ignoring burn-in by state for {label}: Newick trees carry no `STATE_` labels"
+            );
+            reader.burnin_states = 0;
+        }
+        Ok((translate, reader))
     }
 
-    let tree_pairs = trees
-        .into_iter()
-        .enumerate()
-        .filter(|(idx, tree)| keep_tree(*idx, tree.state, burnin_trees, burnin_states))
-        .map(|(_, tree)| (tree.name, tree.newick))
-        .collect();
+    /// Replace `line` with the next line of input, or empty it at the end.
+    fn read_line(&mut self) -> io::Result<()> {
+        self.line.clear();
+        if self.lines.read_line(&mut self.line)? > 0 {
+            self.lines_read += 1;
+        }
+        Ok(())
+    }
 
-    (translate_map, tree_pairs)
+    /// Hand `line` over whole, leaving a buffer sized for the next one: the
+    /// trees of a run are about the same length, so it rarely has to grow.
+    fn take_line(&mut self) -> String {
+        let capacity = self.line.len() + self.line.len() / 8;
+        std::mem::replace(&mut self.line, String::with_capacity(capacity))
+    }
+
+    /// Skip the NEXUS header up to the first `tree` line, reading the
+    /// `TRANSLATE` block into `translate` on the way when `use_real_taxa`.
+    fn read_nexus_header(
+        &mut self,
+        use_real_taxa: bool,
+        translate: &mut HashMap<String, String>,
+    ) -> io::Result<()> {
+        while !self.line.is_empty() && !starts_with_ci(self.line.trim(), "tree ") {
+            if use_real_taxa && starts_with_ci(self.line.trim(), "translate") {
+                self.read_line()?;
+                while !self.line.is_empty() {
+                    translate.extend(translate_entry(&self.line));
+                    if closes_translate(&self.line) {
+                        break;
+                    }
+                    self.read_line()?;
+                }
+            }
+            self.read_line()?;
+        }
+        Ok(())
+    }
+
+    /// Read the current line, queueing any tree it completes, and move on to
+    /// the next one.
+    fn advance(&mut self) -> io::Result<()> {
+        let more = !self.line.is_empty()
+            && match self.format {
+                TreeFormat::Nexus => self.nexus_line(),
+                TreeFormat::Newick => {
+                    self.newick_line();
+                    true
+                }
+            };
+        if more {
+            self.read_line()
+        } else {
+            self.finish();
+            Ok(())
+        }
+    }
+
+    /// Queue the tree on the current NEXUS line, if it holds one. `false` at
+    /// the trees block's `end;`.
+    fn nexus_line(&mut self) -> bool {
+        let trimmed = self.line.trim();
+        if starts_with_ci(trimmed, "end;") {
+            return false;
+        }
+        if let Some((header, body)) = trimmed.split_once(" = ") {
+            let (name, state) = extract_name_state(header.trim());
+            let body = body.trim();
+            let start = offset_in(&self.line, body);
+            let span = start..start + body.len();
+            let name = format!("{}_{name}", self.base_name);
+            let text = self.take_line();
+            self.offer(TreeRecord {
+                name,
+                state,
+                text,
+                span,
+            });
+        }
+        true
+    }
+
+    /// Add the current Newick line to the tree being read, queueing every
+    /// tree it completes.
+    fn newick_line(&mut self) {
+        // A whole tree alone on its line, with nothing stripped from it, is
+        // handed over in the line it was read into. Anything else is gathered
+        // in `pending` and split at each `;`.
+        let alone = {
+            let stripped = strip_annotations(self.line.trim());
+            let piece = stripped.trim();
+            if piece.is_empty() {
+                return;
+            }
+            if self.pending.is_empty() {
+                self.pending_line = self.lines_read;
+            }
+            if self.pending.is_empty()
+                && matches!(stripped, Cow::Borrowed(_))
+                && piece.find(';') == Some(piece.len() - 1)
+            {
+                let start = offset_in(&self.line, piece);
+                Some(start..start + piece.len())
+            } else {
+                self.pending.push_str(piece);
+                None
+            }
+        };
+        if let Some(span) = alone {
+            let text = self.take_line();
+            self.offer_newick(text, span);
+        }
+        while let Some(end) = self.pending.find(';') {
+            let rest = self.pending.split_off(end + 1);
+            let tree = std::mem::replace(&mut self.pending, rest.trim_start().to_string());
+            let span = 0..tree.len();
+            self.offer_newick(tree, span);
+        }
+    }
+
+    /// Queue `text[span]` as a Newick tree read from `pending_line`, if it is
+    /// one: a chunk that does not open with `(` is dropped, which keeps a
+    /// file of neither format from coming back as one nonsense tree.
+    fn offer_newick(&mut self, text: String, span: Range<usize>) {
+        if text[span.clone()].starts_with('(') {
+            let name = format!("{}_line{}", self.base_name, self.pending_line);
+            self.offer(TreeRecord {
+                name,
+                state: 0,
+                text,
+                span,
+            });
+        }
+    }
+
+    /// Queue `tree` unless burn-in drops it.
+    fn offer(&mut self, tree: TreeRecord) {
+        if keep_tree(self.seen, tree.state, self.burnin_trees, self.burnin_states) {
+            self.ready.push_back(tree);
+        }
+        self.seen += 1;
+    }
+
+    /// End of input: queue a trailing Newick tree that never met its `;`,
+    /// leaving the parser to complain, and warn when there were no trees.
+    fn finish(&mut self) {
+        self.done = true;
+        if self.format == TreeFormat::Newick {
+            let tree = std::mem::take(&mut self.pending);
+            let span = 0..tree.len();
+            self.offer_newick(tree, span);
+        }
+        if self.seen == 0 && self.has_content {
+            let missing = match self.format {
+                TreeFormat::Nexus => "no NEXUS `tree ... = ...` lines",
+                TreeFormat::Newick => "no `;`-terminated Newick trees",
+            };
+            eprintln!("No trees found in {}: {missing}", self.label);
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for TreeReader<R> {
+    type Item = io::Result<TreeRecord>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.ready.is_empty() && !self.done {
+            if let Err(e) = self.advance() {
+                self.done = true;
+                return Some(Err(e));
+            }
+        }
+        self.ready.pop_front().map(Ok)
+    }
+}
+
+/// A reader's trees, read on a background thread about [`READ_AHEAD_BYTES`]
+/// ahead of the consumer, so that reading the file overlaps parsing it.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+fn read_ahead<R>(mut reader: TreeReader<R>) -> Box<dyn Iterator<Item = io::Result<TreeRecord>>>
+where
+    R: BufRead + Send + 'static,
+{
+    let Some(first) = reader.next() else {
+        return Box::new(std::iter::empty());
+    };
+    // The trees of a run are about the same length, so the first sizes the queue.
+    let bytes = first.as_ref().map_or(0, |tree| tree.text.capacity());
+    let depth = (READ_AHEAD_BYTES / bytes.max(1)).clamp(2, 1024);
+    let (tx, rx) = std::sync::mpsc::sync_channel(depth);
+    // The thread stops at the end of the file, or as soon as the consumer
+    // hangs up and a send fails.
+    let mut thread = Some(std::thread::spawn(move || {
+        reader.try_for_each(|tree| tx.send(tree))
+    }));
+    // A panic drops the sender just as the end of the file does, so once the
+    // queue is drained the thread is joined, and a panic becomes an error
+    // instead of a quietly shortened file.
+    let panicked = std::iter::from_fn(move || {
+        thread.take()?.join().err()?;
+        Some(Err(io::Error::other("the tree reader thread panicked")))
+    });
+    Box::new(std::iter::once(first).chain(rx).chain(panicked))
+}
+
+/// Without the `parallel` feature trees are read inline, and so on wasm32,
+/// which has no `std::thread::spawn` even where `parallel` is on.
+#[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
+fn read_ahead<R>(reader: TreeReader<R>) -> Box<dyn Iterator<Item = io::Result<TreeRecord>>>
+where
+    R: BufRead + Send + 'static,
+{
+    Box::new(reader)
 }
 
 /// Burn-in predicate shared by both formats: keep tree `idx` (0-based), sampled
@@ -162,10 +463,12 @@ fn keep_tree(idx: usize, state: usize, burnin_trees: usize, burnin_states: usize
 
 /// Load and parse all trees from a NEXUS or plain-Newick tree file.
 ///
-/// The format is detected per file with [`detect_format`]: NEXUS trees keep
-/// their `tree` header name, plain Newick trees are named `<file stem>_line<n>`
-/// after the line they start on. Returns `(tree_names, Snapshots)`. On any
-/// error, prints to stderr and returns an empty `Snapshots`.
+/// The format is detected per file: NEXUS trees keep their `tree` header
+/// name, plain Newick trees are named `<file stem>_line<n>` after the line
+/// they start on. The file is streamed: a chunk of trees is read, parsed and
+/// dropped before the next is read, so memory does not grow with the size of
+/// the file. Returns `(tree_names, Snapshots)`. On any error, prints to stderr
+/// and returns an empty `Snapshots`.
 ///
 /// `retain` says what to build besides the split IDs; pass `None` to keep
 /// everything.
@@ -185,17 +488,39 @@ pub fn load_beast_trees<P: AsRef<Path>>(
     retain: impl Into<Option<Retain>>,
 ) -> (Vec<String>, Snapshots) {
     let retain = retain.into().unwrap_or_else(Retain::everything);
-    let (translate_map, tree_pairs) =
-        load_beast_raw(&path, burnin_trees, burnin_states, use_real_taxa);
-    let (names, newicks): (Vec<String>, Vec<String>) = tree_pairs.into_iter().unzip();
-    let entries = newicks.iter().map(|n| (n.as_str(), &translate_map));
-    match Snapshots::from_newick_iter_opts(entries, rooted, retain) {
-        Ok(snaps) => (names, snaps),
-        Err(e) => {
-            eprintln!("Failed to parse trees in {:?}: {e}", path.as_ref());
-            (Vec::new(), Snapshots::from_newicks(&[], rooted).unwrap())
-        }
+    let path = path.as_ref();
+    let (translate, reader) =
+        match TreeReader::open(path, burnin_trees, burnin_states, use_real_taxa) {
+            Ok(opened) => opened,
+            Err(e) => {
+                eprintln!("Failed to read {path:?}: {e}");
+                return (Vec::new(), Snapshots::empty());
+            }
+        };
+
+    let mut names = Vec::new();
+    let mut failed = None;
+    // Fused: the builder asks again after a short chunk, and `map_while`
+    // would read on past the error that ended it.
+    let entries = read_ahead(reader)
+        .map_while(|tree| match tree {
+            Ok(mut tree) => {
+                names.push(std::mem::take(&mut tree.name));
+                Some((tree, &translate))
+            }
+            Err(e) => {
+                failed = Some(e);
+                None
+            }
+        })
+        .fuse();
+    let built = Snapshots::from_newick_iter_opts(entries, rooted, retain);
+    match (failed, built) {
+        (None, Ok(snaps)) => return (names, snaps),
+        (Some(e), _) => eprintln!("Failed to read {path:?}: {e}"),
+        (None, Err(e)) => eprintln!("Failed to parse trees in {path:?}: {e}"),
     }
+    (Vec::new(), Snapshots::empty())
 }
 
 /// Write a labeled square matrix as TSV to a file or stdout.
@@ -336,79 +661,71 @@ fn nexus_tree_lines(content: &str) -> impl Iterator<Item = (&str, &str)> {
         })
 }
 
-/// Collect a NEXUS trees block, naming each tree after its `tree` header.
-fn collect_nexus_trees(content: &str, base_name: &str) -> Vec<RawTree> {
-    nexus_tree_lines(content)
-        .map(|(header, body)| {
-            let (name, state) = extract_name_state(header);
-            RawTree {
-                name: format!("{base_name}_{name}"),
-                state,
-                newick: body.to_string(),
-            }
-        })
-        .collect()
+/// Every kept tree of a file as `(name, newick)`, with its `TRANSLATE` map:
+/// the reader, collected. A file that cannot be opened gives nothing.
+#[cfg(test)]
+pub(crate) fn load_beast_raw<P: AsRef<Path>>(
+    path: P,
+    burnin_trees: usize,
+    burnin_states: usize,
+    use_real_taxa: bool,
+) -> (HashMap<String, String>, Vec<(String, String)>) {
+    let Ok((translate, reader)) =
+        TreeReader::open(path.as_ref(), burnin_trees, burnin_states, use_real_taxa)
+    else {
+        return (HashMap::new(), Vec::new());
+    };
+    let trees = reader
+        .map_while(Result::ok)
+        .map(|tree| (tree.name.clone(), tree.newick().to_string()))
+        .collect();
+    (translate, trees)
 }
 
-/// Collect a plain Newick file, naming each tree after the line it starts on.
-///
-/// Trees are delimited by `;`, so a line may hold several and one tree may wrap
-/// across lines. [`strip_beast_annotations`] runs per line, which keeps the line
-/// count intact and takes `[&...]` comments out of the way before the `;` split.
-fn collect_newick_trees(content: &str, base_name: &str) -> Vec<RawTree> {
-    let mut trees = Vec::new();
-    let mut buf = String::new();
-    let mut start_line = 1;
-
-    for (idx, line) in content.lines().enumerate() {
-        let stripped = strip_annotations(line.trim());
-        let line = stripped.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if buf.is_empty() {
-            start_line = idx + 1;
-        }
-        buf.push_str(line);
-
-        // Several trees may share a line; each keeps that line as its origin.
-        while let Some(end) = buf.find(';') {
-            let rest = buf.split_off(end + 1);
-            let newick = std::mem::replace(&mut buf, rest.trim_start().to_string());
-            trees.extend(newick_tree(base_name, start_line, newick));
-        }
-    }
-
-    // A trailing tree with no `;` is kept, leaving the parser to complain.
-    trees.extend(newick_tree(base_name, start_line, buf));
-    trees
-}
-
-/// A collected chunk is a tree only if it opens with `(`, which is what keeps a
-/// file of neither format from coming back as one nonsense tree.
-fn newick_tree(base_name: &str, line: usize, newick: String) -> Option<RawTree> {
-    newick.starts_with('(').then(|| RawTree {
-        name: format!("{base_name}_line{line}"),
-        state: 0,
-        newick,
-    })
+/// The trees of a plain Newick text, whatever its first line looks like.
+#[cfg(test)]
+fn collect_newick_trees(content: &str, base_name: &str) -> Vec<TreeRecord> {
+    let format = Some(TreeFormat::Newick);
+    TreeReader::new(content.as_bytes(), base_name, "input", format, 0, 0, false)
+        .map(|(_, reader)| reader.map_while(Result::ok).collect())
+        .unwrap_or_default()
 }
 
 /// Read a NEXUS `TRANSLATE` block into a numeric-ID → taxon-name map.
 pub fn parse_taxon_block(content: &str) -> HashMap<String, String> {
-    content
+    let mut translate = HashMap::new();
+    let block = content
         .lines()
         .skip_while(|line| !starts_with_ci(line.trim(), "translate"))
-        .skip(1)
-        .take_while(|line| !line.trim().starts_with(';'))
-        .filter_map(|line| {
-            let line = line.trim().trim_end_matches(',');
-            let mut parts = line.split_whitespace();
-            let id = parts.next()?.to_string();
-            let label = parts.next()?.trim_matches('\'').to_string();
-            Some((id, label))
-        })
-        .collect::<HashMap<_, _>>()
+        .skip(1);
+    for line in block {
+        translate.extend(translate_entry(line));
+        if closes_translate(line) {
+            break;
+        }
+    }
+    translate
+}
+
+/// Whether a `TRANSLATE` line ends the block: a line opening with `;`, or the
+/// last entry carrying the `;` itself, as MrBayes writes it.
+fn closes_translate(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with(';') || line.ends_with(';')
+}
+
+/// One `TRANSLATE` line, `<id> <label>,` or a last `<id> <label>;`, as
+/// `(id, label)`, quotes dropped. A line opening with `;` holds none.
+fn translate_entry(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    if line.starts_with(';') {
+        return None;
+    }
+    let line = line.trim_end_matches(';').trim_end().trim_end_matches(',');
+    let mut parts = line.split_whitespace();
+    let id = parts.next()?.to_string();
+    let label = parts.next()?.trim_matches('\'').to_string();
+    Some((id, label))
 }
 
 #[cfg(test)]
@@ -482,6 +799,16 @@ mod load_tests {
         assert_eq!(map.get("1").map(String::as_str), Some("Alpha"));
         assert_eq!(map.get("2").map(String::as_str), Some("Beta"));
         assert_eq!(map.get("3").map(String::as_str), Some("Gamma"));
+    }
+
+    /// MrBayes ends the block on the last entry: its `;` is not part of the
+    /// label, and the tree lines after it are not entries.
+    #[test]
+    fn test_parse_taxon_block_semicolon_on_last_entry() {
+        let content = "begin trees;\n   translate\n       1 A,\n       2 'B';\n   tree gen.0 = [&U] (1:1,2:1);\nend;\n";
+        let map = parse_taxon_block(content);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("2").map(String::as_str), Some("B"));
     }
 
     #[test]
@@ -625,6 +952,180 @@ mod load_tests {
         assert!(load_raw_from_str("").is_empty());
     }
 
+    // ── TreeReader ────────────────────────────────────────────────────────────
+
+    /// Read the header and trees of `content` as a file named `f` would be.
+    fn reader(content: &str, use_real_taxa: bool) -> (HashMap<String, String>, TreeReader<&[u8]>) {
+        TreeReader::new(content.as_bytes(), "f", "input", None, 0, 0, use_real_taxa).unwrap()
+    }
+
+    #[test]
+    fn test_reader_hands_nexus_trees_over_in_their_line() {
+        let (_, mut trees) = reader(
+            "#NEXUS\nBegin trees;\ntree STATE_5 = [&R] (A:1,B:1,C:1);\nEnd;\n",
+            false,
+        );
+        let tree = trees.next().unwrap().unwrap();
+        assert_eq!(tree.name, "f_STATE_5");
+        assert_eq!(tree.state, 5);
+        assert_eq!(tree.newick(), "[&R] (A:1,B:1,C:1);");
+        // The record keeps the line it was read in: nothing was copied out.
+        assert_eq!(tree.text, "tree STATE_5 = [&R] (A:1,B:1,C:1);\n");
+        assert!(trees.next().is_none());
+    }
+
+    #[test]
+    fn test_reader_hands_a_lone_newick_tree_over_in_its_line() {
+        let (_, mut trees) = reader("  (A:1,B:1,C:1);  \n", false);
+        let tree = trees.next().unwrap().unwrap();
+        assert_eq!(tree.name, "f_line1");
+        assert_eq!(tree.newick(), "(A:1,B:1,C:1);");
+        assert_eq!(tree.text, "  (A:1,B:1,C:1);  \n");
+    }
+
+    #[test]
+    fn test_reader_translate_block_cut_short_by_end_of_file() {
+        let (translate, mut trees) =
+            reader("#NEXUS\nBegin trees;\n\tTranslate\n\t\t1 A,\n\t\t2 B", true);
+        assert_eq!(translate.len(), 2);
+        assert_eq!(translate.get("2").map(String::as_str), Some("B"));
+        assert!(trees.next().is_none());
+    }
+
+    /// Input that serves `data` and then panics, as a bug in the reader would.
+    #[cfg(feature = "parallel")]
+    struct PanicsAfter(&'static [u8]);
+
+    #[cfg(feature = "parallel")]
+    impl io::Read for PanicsAfter {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            assert!(!self.0.is_empty(), "reader bug");
+            let n = buf.len().min(self.0.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+
+    /// A panic on the read-ahead thread ends the trees with an error, not with
+    /// what looks like the end of the file.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_read_ahead_reports_a_reader_panic() {
+        let input = BufReader::new(PanicsAfter(b"(A:1,B:1,C:1);\n(A:2,B:2,C:2);\n"));
+        let (_, trees) = TreeReader::new(input, "f", "input", None, 0, 0, false).unwrap();
+        let mut trees: Vec<_> = read_ahead(trees).collect();
+        assert!(trees.pop().is_some_and(|last| last.is_err()));
+        assert!(trees.iter().all(Result::is_ok));
+    }
+
+    /// Writes `content` to a temporary `*<suffix>` file and loads it for RF,
+    /// resolving TRANSLATE.
+    fn load_bytes(content: &[u8], suffix: &str) -> (Vec<String>, Snapshots) {
+        use std::io::Write;
+        let mut tmp = tempfile::Builder::new().suffix(suffix).tempfile().unwrap();
+        tmp.write_all(content).unwrap();
+        load_beast_trees(tmp.path(), 0, 0, true, false, Retain::for_distances(false))
+    }
+
+    #[test]
+    fn test_load_beast_trees_crlf_line_endings() {
+        let nexus = b"#NEXUS\r\nBegin trees;\r\n\tTranslate\r\n\t\t1 A,\r\n\t\t2 B,\r\n\t\t3 C,\r\n\t\t4 D\r\n\t\t;\r\ntree STATE_0 = ((1:1,2:1):1,(3:1,4:1):1);\r\ntree STATE_10 = ((1:1,3:1):1,(2:1,4:1):1);\r\nEnd;\r\n";
+        let (names, snaps) = load_bytes(nexus, ".trees");
+        assert_eq!(names.len(), 2);
+        assert_eq!(snaps.leaf_names, ["A", "B", "C", "D"]);
+        assert_eq!(snaps.pairwise_rf(None), vec![0, 2, 2, 0]);
+
+        let newick = b"((A:1,B:1):1,(C:1,D:1):1);\r\n((A:1,C:1):1,(B:1,D:1):1);\r\n";
+        let (names, snaps) = load_bytes(newick, ".newick");
+        assert_eq!(names.len(), 2);
+        assert_eq!(snaps.pairwise_rf(None), vec![0, 2, 2, 0]);
+    }
+
+    #[test]
+    fn test_load_beast_trees_headerless_nexus() {
+        let content =
+            b"Begin trees;\n\ttree t1 = (A:1,B:1,C:1);\n\ttree t2 = (A:2,B:2,C:2);\nEnd;\n";
+        let (names, snaps) = load_bytes(content, ".trees");
+        assert_eq!(names.len(), 2);
+        assert_eq!(snaps.len(), 2);
+    }
+
+    /// A MrBayes `.t` file: the TRANSLATE block ends on its last entry, so the
+    /// tree lines after it are still trees.
+    #[test]
+    fn test_load_beast_trees_mrbayes_translate() {
+        let content = b"#NEXUS\n[ID: 123]\nbegin trees;\n   translate\n       1 A,\n       2 B,\n       3 C,\n       4 D;\n   tree gen.0 = [&U] ((1:1,2:1):1,(3:1,4:1):1);\n   tree gen.100 = [&U] ((1:1,3:1):1,(2:1,4:1):1);\nend;\n";
+        let (names, snaps) = load_bytes(content, ".t");
+        assert_eq!(names.len(), 2);
+        assert_eq!(snaps.leaf_names, ["A", "B", "C", "D"]);
+        assert_eq!(snaps.pairwise_rf(None), vec![0, 2, 2, 0]);
+    }
+
+    /// A byte-order mark neither hides a `#NEXUS` header nor a Newick file's
+    /// first tree.
+    #[test]
+    fn test_load_beast_trees_byte_order_mark() {
+        let nexus = "\u{feff}#NEXUS\nBegin trees;\n\tTranslate\n\t\t1 A,\n\t\t2 B,\n\t\t3 C,\n\t\t4 D\n\t\t;\ntree STATE_0 = ((1:1,2:1):1,(3:1,4:1):1);\ntree STATE_10 = ((1:1,3:1):1,(2:1,4:1):1);\nEnd;\n";
+        let (names, snaps) = load_bytes(nexus.as_bytes(), ".trees");
+        assert_eq!(names.len(), 2);
+        assert_eq!(snaps.leaf_names, ["A", "B", "C", "D"]);
+
+        let newick = "\u{feff}((A:1,B:1):1,(C:1,D:1):1);\n((A:1,C:1):1,(B:1,D:1):1);\n";
+        let (names, snaps) = load_bytes(newick.as_bytes(), ".newick");
+        assert_eq!(names.len(), 2);
+        assert_eq!(snaps.pairwise_rf(None), vec![0, 2, 2, 0]);
+    }
+
+    /// More trees than the read-ahead queue holds still arrive complete and in
+    /// order, and give the matrix the same trees give in memory.
+    #[test]
+    fn test_load_beast_trees_streams_many_trees_in_order() {
+        let shapes = [
+            "((A:1,B:1):1,(C:1,D:1):1,E:1);",
+            "((A:1,C:1):1,(B:1,D:1):1,E:1);",
+            "((A:1,D:1):1,(B:1,E:1):1,C:1);",
+        ];
+        let trees: Vec<&str> = (0..3000).map(|k| shapes[k % 3]).collect();
+        let (names, snaps) = load_bytes(trees.join("\n").as_bytes(), ".newick");
+        assert_eq!(names.len(), trees.len());
+        for (k, name) in names.iter().enumerate() {
+            assert!(
+                name.ends_with(&format!("_line{}", k + 1)),
+                "tree {k} is {name}"
+            );
+        }
+        let reference = Snapshots::from_newicks(&trees, false).unwrap();
+        assert_eq!(snaps.pairwise_rf(None), reference.pairwise_rf(None));
+    }
+
+    /// A read error part-way through fails the whole load rather than
+    /// returning the trees before it.
+    #[test]
+    fn test_load_beast_trees_unreadable_line_fails_cleanly() {
+        let mut content = b"((A:1,B:1):1,(C:1,D:1):1);\n".to_vec();
+        content.extend_from_slice(b"((A:1,\xff\xfe:1):1,(C:1,D:1):1);\n");
+        content.extend_from_slice(b"((A:1,C:1):1,(B:1,D:1):1);\n");
+        let (names, snaps) = load_bytes(&content, ".newick");
+        assert!(names.is_empty());
+        assert!(snaps.is_empty());
+    }
+
+    #[test]
+    fn test_load_beast_trees_bad_tree_fails_cleanly() {
+        let content = b"((A:1,B:1):1,(C:1,D:1):1);\n((A:1,B:1):1,(C:1,E:1):1);\n";
+        let (names, snaps) = load_bytes(content, ".newick");
+        assert!(names.is_empty());
+        assert!(snaps.is_empty());
+    }
+
+    #[test]
+    fn test_load_beast_trees_newick_without_trees_is_empty() {
+        let (names, snaps) = load_bytes(b"[a comment and nothing else]\n", ".newick");
+        assert!(names.is_empty());
+        assert!(snaps.is_empty());
+    }
+
     // ── load_beast_trees ──────────────────────────────────────────────────────
 
     #[test]
@@ -739,7 +1240,7 @@ mod load_tests {
     fn newick_blocks(content: &str) -> Vec<(String, String)> {
         collect_newick_trees(content, "f")
             .into_iter()
-            .map(|tree| (tree.name, tree.newick))
+            .map(|tree| (tree.name.clone(), tree.newick().to_string()))
             .collect()
     }
 

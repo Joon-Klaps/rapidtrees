@@ -22,6 +22,17 @@
 #[cfg(feature = "parallel")]
 pub use rayon::prelude::*;
 
+pub fn current_num_threads() -> usize {
+    #[cfg(feature = "parallel")]
+    {
+        rayon::current_num_threads()
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        1
+    }
+}
+
 #[cfg(not(feature = "parallel"))]
 pub use sequential::*;
 
