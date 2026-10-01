@@ -53,7 +53,7 @@ impl Snapshots {
             .par_chunks_mut(n_bip)
             .zip(&self.snapshots) // Pair each chunk with its corresponding snapshot
             .for_each(|(row, snap)| {
-                for &split_id in &snap.split_ids {
+                for split_id in snap.ids() {
                     // Write directly into the final memory location
                     row[id_to_col[split_id as usize]] = 1;
                 }
@@ -101,7 +101,7 @@ impl Snapshots {
             .par_chunks_mut(n_bip * 8)
             .zip(&self.snapshots)
             .for_each(|(row, snap)| {
-                for (&split_id, &length) in snap.split_ids.iter().zip(&snap.lengths) {
+                for (split_id, &length) in snap.ids().zip(&snap.lengths) {
                     let col = id_to_col[split_id as usize];
                     row[col * 8..(col + 1) * 8].copy_from_slice(&length.to_ne_bytes());
                 }

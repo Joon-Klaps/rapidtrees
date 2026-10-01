@@ -515,7 +515,7 @@ fn rf_layout(
         self_count.extend(
             block
                 .iter()
-                .map(|snap| (snap.split_ids.len() - n_universal) as u32),
+                .map(|snap| (snap.n_splits() - n_universal) as u32),
         );
         first += block.len();
     });
@@ -712,7 +712,7 @@ fn weighted_layout(
                 let row = &mut row[..stride];
                 let mut own = Vec::new();
                 let mut unique_self = 0.0;
-                for (&id, &length) in snap.split_ids.iter().zip(&snap.lengths) {
+                for (id, &length) in snap.ids().zip(&snap.lengths) {
                     match column(&layout.column_of, id) {
                         Some(col) if col < stride => row[col] = length,
                         Some(col) => own.push(((col - stride) as u32, length)),
@@ -1404,7 +1404,7 @@ mod tests {
         let snaps = three_snapshots();
         let mut recount = vec![0u32; snaps.n_distinct_splits()];
         for snap in &snaps.snapshots {
-            for &id in &snap.split_ids {
+            for id in snap.ids() {
                 recount[id as usize] += 1;
             }
         }
@@ -1423,7 +1423,7 @@ mod tests {
     fn lengths_aligned_with_split_ids() {
         let snaps = three_snapshots();
         for snap in &snaps.snapshots {
-            assert_eq!(snap.split_ids.len(), snap.lengths.len());
+            assert_eq!(snap.n_splits(), snap.lengths.len());
         }
     }
 
@@ -1434,11 +1434,7 @@ mod tests {
     /// so it cannot reproduce a backend bug by construction.
     fn reference_distances(a: &InternSnap, b: &InternSnap) -> (usize, f64, f64) {
         let lengths_by_split = |s: &InternSnap| -> BTreeMap<u32, f64> {
-            s.split_ids
-                .iter()
-                .copied()
-                .zip(s.lengths.iter().copied())
-                .collect()
+            s.ids().zip(s.lengths.iter().copied()).collect()
         };
         let (ma, mb) = (lengths_by_split(a), lengths_by_split(b));
 

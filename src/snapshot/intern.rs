@@ -13,10 +13,10 @@
 //! shard. The IDs therefore depend on the input alone.
 //!
 //! Pendant edges never reach a table. Every tree has all `n` of them, so the
-//! pendant of leaf `k` is split `k` outright, and a tree's IDs open with its
-//! `n` pendants in leaf order, followed by its internal splits in part order.
-//! A path that keeps neither branch lengths nor bipartitions (plain RF) does
-//! not store them at all: they are held by every tree and cancel out of RF.
+//! pendant of leaf `k` is split `k` outright and no tree stores their IDs, only
+//! how many there are and, when kept, their lengths in leaf order. A path that
+//! keeps neither branch lengths nor bipartitions (plain RF) does not keep them
+//! at all: they are held by every tree and cancel out of RF.
 
 use super::Retain;
 use super::Snapshots;
@@ -28,14 +28,29 @@ use hashbrown::HashTable;
 
 /// One tree's bipartitions in interned form (private implementation detail of [`Snapshots`]).
 ///
-/// `split_ids` holds the tree's pendant edges first, in leaf order (when they
-/// are kept), then its internal splits in part order: the kernels and the
-/// export index by ID, so nothing downstream needs it sorted. `lengths[i]` is
-/// the branch length of `split_ids[i]` (parallel arrays).
+/// The tree holds its `pendants` pendant edges, which are splits `0..pendants`
+/// in every tree and so are not stored, and then the internal splits in
+/// `split_ids`, in part order: the kernels and the export index by ID, so
+/// nothing downstream needs them sorted. [`InternSnap::ids`] gives all of them.
+/// `lengths[i]` is the branch length of the `i`-th of [`InternSnap::ids`]: the
+/// pendants' in leaf order, then the internal splits'.
 #[derive(Debug, Clone)]
 pub(crate) struct InternSnap {
+    pub(crate) pendants: u32,
     pub(crate) split_ids: Vec<u32>,
     pub(crate) lengths: Vec<f64>,
+}
+
+impl InternSnap {
+    /// Every split the tree holds: its pendants, then its internal splits.
+    pub(crate) fn ids(&self) -> impl Iterator<Item = u32> + '_ {
+        (0..self.pendants).chain(self.split_ids.iter().copied())
+    }
+
+    /// How many splits the tree holds.
+    pub(crate) fn n_splits(&self) -> usize {
+        self.pendants as usize + self.split_ids.len()
+    }
 }
 
 const SHARD_BITS: u32 = 8;
@@ -271,18 +286,17 @@ impl Interner {
             .enumerate()
             .map(|(t, (snap, route))| {
                 // The pendant of leaf `k` is split `k`, so a tree's pendant IDs
-                // are `0..n` whatever its shape.
-                let mut split_ids: Vec<u32> = (0..base as u32).collect();
-                split_ids.resize(base + route.internal.len(), 0);
+                // are `0..n` whatever its shape and are not stored.
+                let mut split_ids = vec![0u32; route.internal.len()];
                 for (s, (ids, starts)) in locals.iter().enumerate() {
                     let run = &ids[starts[t]..starts[t + 1]];
                     for (&slot, &local) in route.shard(s).iter().zip(run) {
-                        split_ids[base + slot as usize] = (local << SHARD_BITS) | s as u32;
+                        split_ids[slot as usize] = (local << SHARD_BITS) | s as u32;
                     }
                 }
                 let mut lengths = Vec::new();
                 if retain.lengths {
-                    lengths.resize(split_ids.len(), 0.0);
+                    lengths.resize(base + split_ids.len(), 0.0);
                     for part in snap.parts.iter().filter(|part| part.size == 1) {
                         lengths[snap.leaf_order[part.first as usize] as usize] = part.length;
                     }
@@ -291,7 +305,11 @@ impl Interner {
                     }
                 }
                 debug_assert!(keep_pendants || !retain.lengths);
-                InternSnap { split_ids, lengths }
+                InternSnap {
+                    pendants: base as u32,
+                    split_ids,
+                    lengths,
+                }
             })
             .collect();
         self.snapshots.extend(interned);
@@ -311,7 +329,7 @@ impl Interner {
 
         let mut snapshots = self.snapshots;
         snapshots.par_iter_mut().for_each(|snap| {
-            for id in &mut snap.split_ids[base..] {
+            for id in &mut snap.split_ids {
                 *id = offsets[*id as usize & (SHARDS - 1)] + (*id >> SHARD_BITS);
             }
         });
