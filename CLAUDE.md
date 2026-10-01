@@ -26,11 +26,28 @@ depends on this crate as a pinned git dependency.
 ```
 Cargo.toml              — the rapidtrees package + [patch.crates-io]
 src/                    — the distance kernel. No wasm-bindgen here.
-  api.rs        — PyO3 bindings (keep minimal — logic lives in snapshot.rs / distances.rs)
-  bitset.rs     — compact bitset for leaf sets; inner-most hot path
-  snapshot.rs   — Snapshot / Snapshots types, canonicalisation, interning
-  distances.rs  — RF, WRF, KF algorithms
-  io.rs         — BEAST/NEXUS parsing, annotation stripping
+  api/          — PyO3 bindings (keep minimal — logic lives in snapshot/ / distances/)
+    input.rs      — argument validation, Python iterator → Snapshots
+    rf.rs         — RF entry points
+    weighted.rs   — WRF / KF entry points
+    progress.rs   — ProgressCounter
+    py_tests.rs   — embedded-Python integration tests
+  snapshot/     — Snapshot / Snapshots types, Newick reader, interning, export
+  distances/    — RF, WRF, KF kernels
+    boundary.rs   — dense/posting cutoffs and their env overrides
+    layout.rs     — column map, the trees a kernel reads
+    postings.rs   — posting lists for rarely held splits
+    matrix.rs     — symmetric matrix fill
+    rf.rs         — Robinson–Foulds
+    weighted.rs   — weighted RF and Kuhner–Felsenstein
+    tests.rs, treedist.rs — kernel tests, PHYLIP treedist known values
+  io/           — BEAST/NEXUS/Newick reading, TSV writing
+    annotations.rs — `[&...]` stripping
+    nexus.rs      — NEXUS primitives (tree headers, TRANSLATE)
+    format.rs     — NEXUS vs Newick detection
+    reader.rs     — streaming TreeReader, burn-in
+    load.rs       — load_beast_trees
+    write.rs      — write_matrix_tsv (cli feature)
   par.rs        — rayon-or-sequential shim; `pub` so dependents share one policy
   main.rs       — CLI binary
   lib.rs        — public re-exports
@@ -65,7 +82,7 @@ docs/
    `extract_name_state`, `strip_beast_annotations`) stay here and are `pub` for
    it to build on. `rename_leaf_nodes` was removed with the Newick reader: it
    took a phylotree `Tree`, and rapidtrees no longer parses into one.
-4. **Anything `pub` in `io.rs` is treetracer-web's API.** Changing one of those
+4. **Anything `pub` in `io/` is treetracer-web's API.** Changing one of those
    three signatures breaks that repo's build with no compiler to warn you, since
    it is a git dependency rather than a workspace member. Treat them as
    published surface.
@@ -108,10 +125,10 @@ Invoke with `/skill-name` in chat.
 - `Vec::with_capacity` / `HashMap::with_capacity` whenever size is known
 - Small hot functions (`Bitset` ops, merge steps) get `#[inline]`
 
-### api.rs
+### api/
 
-- Keep `api.rs` thin: validation, serialisation, and return-value assembly only
-- All computation belongs in `snapshot.rs` or `distances.rs`
+- Keep `api/` thin: validation, serialisation, and return-value assembly only
+- All computation belongs in `snapshot/` or `distances/`
 - Every `#[pyfunction]` needs a Rust doc comment that is visible from Python `help()`
 - Raise `PyValueError` — never panic from binding code
 

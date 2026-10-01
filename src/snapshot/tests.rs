@@ -1443,3 +1443,51 @@ fn rf_only_collections_store_no_pendants() {
     );
     assert_eq!(rf_only.pairwise_rf(None), everything.pairwise_rf(None));
 }
+
+// ─── constructors ───────────────────────────────────────────────────────────
+
+#[test]
+fn test_snapshots_from_newicks_basic() {
+    let snaps = Snapshots::from_newicks(
+        &["((A:1,B:1):1,(C:1,D:1):1);", "((A:1,C:1):1,(B:1,D:1):1);"],
+        false,
+    )
+    .unwrap();
+    assert_eq!(snaps.len(), 2);
+    assert_eq!(snaps.leaf_names, vec!["A", "B", "C", "D"]);
+}
+
+#[test]
+fn test_snapshots_from_newicks_mismatched_leaves_errors() {
+    let result = Snapshots::from_newicks(
+        &["((A:1,B:1):1,(C:1,D:1):1);", "((A:1,B:1):1,(C:1,E:1):1);"],
+        false,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_snapshots_from_newicks_leaf_names_sorted() {
+    let snaps = Snapshots::from_newicks(&["((D:1,C:1):1,(B:1,A:1):1);"], false).unwrap();
+    assert_eq!(
+        snaps.leaf_names,
+        vec!["A", "B", "C", "D"],
+        "leaf names must be sorted"
+    );
+}
+
+#[test]
+fn test_snapshots_from_newick_iter_uses_translate() {
+    let translate: HashMap<String, String> = [
+        ("1".to_string(), "A".to_string()),
+        ("2".to_string(), "B".to_string()),
+        ("3".to_string(), "C".to_string()),
+        ("4".to_string(), "D".to_string()),
+    ]
+    .into();
+    let newick = "((1:1,2:1):1,(3:1,4:1):1);";
+    let entries = [(newick, &translate), (newick, &translate)];
+    let snaps = Snapshots::from_newick_iter(entries, false).unwrap();
+    assert_eq!(snaps.len(), 2);
+    assert_eq!(snaps.leaf_names, vec!["A", "B", "C", "D"]);
+}

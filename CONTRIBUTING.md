@@ -75,12 +75,12 @@ pip install -e .
 rapidtrees/
 ├── src/
 │   ├── lib.rs                # Public API re-exports
-│   ├── snapshot.rs           # Tree snapshot types & interning
-│   ├── distances.rs          # RF, WRF, KF distance algorithms
-│   ├── bitset.rs             # Efficient bitset for tree splits
-│   ├── io.rs                 # BEAST/NEXUS file parsing
+│   ├── snapshot/             # Tree snapshot types, Newick reader & interning
+│   ├── distances/            # RF (rf.rs), WRF and KF (weighted.rs) kernels
+│   ├── io/                   # BEAST/NEXUS/Newick reading, TSV writing
+│   ├── par.rs                # Rayon-or-sequential shim
 │   ├── main.rs               # CLI binary
-│   └── api.rs                # PyO3 Python bindings
+│   └── api/                  # PyO3 Python bindings
 ├── tests/
 │   └── test_python_api.py    # Python API tests (with R comparisons)
 ├── benches/
@@ -103,7 +103,7 @@ rapidtrees/
 
 ### Example: Adding a new distance metric
 
-1. **Add algorithm in `src/distances.rs`**:
+1. **Add the kernel as a new file in `src/distances/`**, re-exported from `src/distances/mod.rs`:
    ```rust
    pub fn your_metric(a: &Snapshot, b: &Snapshot) -> f64 {
        // Implementation
@@ -116,7 +116,7 @@ rapidtrees/
    }
    ```
 
-2. **Add PyO3 binding in `src/api.rs`**:
+2. **Add the PyO3 binding in `src/api/`** and register it in `src/api/mod.rs`:
    ```rust
    #[pyfunction]
    fn pairwise_your_metric_from_newick_iter(...) { /* ... */ }

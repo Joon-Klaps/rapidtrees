@@ -5,7 +5,7 @@
 //! - `io`: reading and parsing BEAST/NEXUS tree files.
 //! - `snapshot`: tree snapshot and interned snapshot types (crate-internal).
 //! - `par`: rayon-or-sequential shim; public so dependents share one policy.
-//! - `api`: Python bindings via `pyo3` (gated behind "python" feature).
+//! - `api`: Python bindings via `pyo3`, with their progress counter (gated behind "python" feature).
 
 pub mod distances;
 pub mod io;
@@ -15,8 +15,6 @@ pub(crate) mod snapshot;
 
 #[cfg(feature = "python")]
 pub mod api;
-#[cfg(feature = "python")]
-pub(crate) mod progress;
 
 #[cfg(feature = "cli")]
 pub use io::write_matrix_tsv;

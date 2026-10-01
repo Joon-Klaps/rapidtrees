@@ -509,7 +509,11 @@ Not every path needs everything, and both extras cost real work:
 | `snapshot/intern.rs` | `Interner`, `InternSnap` — dedupe to `u32` IDs, in parallel shards |
 | `snapshot/export.rs` | the flat byte buffers Python reads |
 | `snapshot/mod.rs` | `Snapshots`, the construction pipeline, `Retain` |
-| `distances.rs` | RF over dense bit-rows plus posting lists; WRF / KF over dense columns plus posting lists |
+| `distances/rf.rs` | RF over dense bit-rows plus posting lists |
+| `distances/weighted.rs` | WRF / KF over dense columns plus posting lists |
+| `distances/layout.rs`, `postings.rs`, `boundary.rs`, `matrix.rs` | what both share: the column map, posting lists, the dense/posting cutoff, the symmetric fill |
 | `snapshot/clades.rs` | the export-only leaf-set table, and its packed ordering |
-| `io.rs` | NEXUS/Newick file reading, streamed a tree at a time: tree lines, TRANSLATE, burn-in |
-| `api.rs` | PyO3 bindings — glue only, no computation |
+| `io/reader.rs` | NEXUS/Newick file reading, streamed a tree at a time: tree lines, TRANSLATE, burn-in |
+| `io/nexus.rs`, `annotations.rs`, `format.rs` | NEXUS primitives, `[&...]` stripping, format detection |
+| `io/load.rs`, `write.rs` | `load_beast_trees`, `write_matrix_tsv` |
+| `api/` | PyO3 bindings — glue only, no computation |

@@ -55,7 +55,7 @@ jobs:
               run: cargo clippy --all-targets --all-features -- -D warnings
 
             - name: Run tests
-              # --features python compiles src/api.rs + src/progress.rs and
+              # --features python compiles src/api/ (progress counter included) and
               # their unit + embedded-Python integration tests.
               env:
                   PYO3_PYTHON: ${{ github.workspace }}/.pixi/envs/default/bin/python
