@@ -13,6 +13,8 @@ on:
 
 env:
     CARGO_TERM_COLOR: always
+    # Pin rayon's pool to the 4 vCPUs of a public-repo `ubuntu-latest` runner, so a change of runner cannot shift results between base and head. The `_1thread` benches build their own one-thread pool.
+    RAYON_NUM_THREADS: 4
 
 jobs:
     benchmarks:
