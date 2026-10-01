@@ -116,14 +116,35 @@ where
     T: Copy + Default + Send,
     F: Fn(usize, &mut [T]) + Sync,
 {
+    fill_symmetric_banded(n, 1, progress, fill_row)
+}
+
+/// [`fill_symmetric`] with one rayon task per band of `band` rows:
+/// `fill_band(i0, rows)` writes `rows[r * n + j]` for every row `i0 + r` of the
+/// band and every `j > i0 + r`.
+fn fill_symmetric_banded<T, F>(
+    n: usize,
+    band: usize,
+    progress: Option<&AtomicUsize>,
+    fill_band: F,
+) -> Vec<T>
+where
+    T: Copy + Default + Send,
+    F: Fn(usize, &mut [T]) + Sync,
+{
     let mut matrix = vec![T::default(); n * n];
 
-    matrix.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
-        fill_row(i, row);
-        if let Some(counter) = progress {
-            counter.fetch_add(n.saturating_sub(i + 1), Ordering::Relaxed);
-        }
-    });
+    matrix
+        .par_chunks_mut((n * band).max(1))
+        .enumerate()
+        .for_each(|(b, rows)| {
+            let i0 = b * band;
+            fill_band(i0, rows);
+            if let Some(counter) = progress {
+                let pairs = (i0..i0 + rows.len() / n).map(|i| n - i - 1).sum();
+                counter.fetch_add(pairs, Ordering::Relaxed);
+            }
+        });
 
     // Mirror into the lower triangle in tiles: a plain row-read/column-write
     // sweep puts every write on its own cache line at large `n`.
@@ -613,6 +634,32 @@ fn sweep(a: &[f64], b: &[f64], overlap: &impl Fn(f64, f64) -> f64) -> f64 {
     lanes.iter().sum()
 }
 
+/// Rows per weighted sweep task, rows of the other side held against them,
+/// and columns per pass: a tile of `TILE_I × TILE_J` pairs reads each row's
+/// panel once instead of once per pair, which turns the sweep from bound by
+/// memory bandwidth into bound by arithmetic.
+const TILE_I: usize = 8;
+const TILE_J: usize = 4;
+const PANEL: usize = 512;
+
+/// Add `overlap(a[k], b[k])` into `lanes` exactly as [`sweep`] does over the
+/// same columns: whole blocks of eight first, then the tail into the first
+/// lanes. Called panel by panel, with every panel but the last a multiple of
+/// eight wide, the lanes end up holding exactly what [`sweep`] adds up.
+#[inline(always)]
+fn accumulate(lanes: &mut [f64; 8], a: &[f64], b: &[f64], overlap: &impl Fn(f64, f64) -> f64) {
+    let (a_blocks, a_tail) = a.as_chunks::<8>();
+    let (b_blocks, b_tail) = b.as_chunks::<8>();
+    for (xs, ys) in a_blocks.iter().zip(b_blocks) {
+        for ((lane, &x), &y) in lanes.iter_mut().zip(xs).zip(ys) {
+            *lane += overlap(x, y);
+        }
+    }
+    for ((lane, &x), &y) in lanes.iter_mut().zip(a_tail).zip(b_tail) {
+        *lane += overlap(x, y);
+    }
+}
+
 /// Every tree's lengths over the dense columns, 0.0 where it lacks the split.
 /// Stored a block of trees per buffer, so that they can be allocated as the
 /// trees are consumed.
@@ -727,20 +774,47 @@ fn weighted_distances_split(
     let (dense, postings, self_total) = weighted_layout(trees, counts, &layout, &overlap);
     drop(layout);
 
-    fill_symmetric(n, progress, |i, row: &mut [f64]| {
+    fill_symmetric_banded(n, TILE_I, progress, |i0, rows: &mut [f64]| {
+        let band = rows.len() / n;
         // Shared terms from the posting lists first, accumulated in place.
-        let (cols, lengths) = postings.of_tree(i);
-        for (&col, &length) in cols.iter().zip(lengths) {
-            let (trees, others) = postings.after(col, i);
-            for (&j, &other) in trees.iter().zip(others) {
-                row[j as usize] += overlap(length, other);
+        for (r, row) in rows.chunks_mut(n).enumerate() {
+            let i = i0 + r;
+            let (cols, lengths) = postings.of_tree(i);
+            for (&col, &length) in cols.iter().zip(lengths) {
+                let (trees, others) = postings.after(col, i);
+                for (&j, &other) in trees.iter().zip(others) {
+                    row[j as usize] += overlap(length, other);
+                }
             }
         }
 
-        let own = dense.row(i);
-        for (j, slot) in row.iter_mut().enumerate().skip(i + 1) {
-            let shared = sweep(own, dense.row(j), &overlap) + *slot;
-            *slot = finish((self_total[i] + self_total[j] - 2.0 * shared).max(0.0));
+        // Then the dense columns, a tile of pairs at a time, a panel of
+        // columns per pass, each pair keeping its own eight lanes throughout.
+        for j0 in (i0 + 1..n).step_by(TILE_J) {
+            let width = (n - j0).min(TILE_J);
+            let mut lanes = [[[0.0f64; 8]; TILE_J]; TILE_I];
+            for p0 in (0..dense.stride).step_by(PANEL) {
+                let panel = p0..(p0 + PANEL).min(dense.stride);
+                for (r, lanes_r) in lanes.iter_mut().enumerate().take(band) {
+                    let a = &dense.row(i0 + r)[panel.clone()];
+                    for (c, lane) in lanes_r.iter_mut().enumerate().take(width) {
+                        if j0 + c > i0 + r {
+                            accumulate(lane, a, &dense.row(j0 + c)[panel.clone()], &overlap);
+                        }
+                    }
+                }
+            }
+            for (r, lanes_r) in lanes.iter().enumerate().take(band) {
+                let i = i0 + r;
+                for (c, lane) in lanes_r.iter().enumerate().take(width) {
+                    let j = j0 + c;
+                    if j > i {
+                        let slot = &mut rows[r * n + j];
+                        let shared = lane.iter().sum::<f64>() + *slot;
+                        *slot = finish((self_total[i] + self_total[j] - 2.0 * shared).max(0.0));
+                    }
+                }
+            }
         }
     })
 }
@@ -1233,8 +1307,8 @@ fn kuhner_felsenstein_treedist() {
 #[cfg(test)]
 mod tests {
     use super::{
-        NO_COLUMN, TREEDIST_TREES, Trees, assign_columns, distance_rf_split, parse_share,
-        weighted_distances_split,
+        Layout, NO_COLUMN, PANEL, TREEDIST_TREES, Trees, assign_columns, distance_rf_split,
+        fill_symmetric, min_dense, parse_share, sweep, weighted_distances_split, weighted_layout,
     };
     use crate::{
         distances::{RF_DENSE_SHARE, WEIGHTED_DENSE_SHARE, rf_dense_share, weighted_dense_share},
@@ -1632,6 +1706,46 @@ mod tests {
         ] {
             let expected = parse_share(std::env::var(var).ok().as_deref(), default);
             assert_eq!(share, expected, "{var}");
+        }
+    }
+
+    /// The tiled sweep adds each pair's terms in the order [`sweep`] does, so it
+    /// gives the untiled formula to the bit. Seventeen trees leave partial
+    /// bands and tiles, and with 603 taxa the dense columns cross a panel
+    /// boundary and end in a tail.
+    #[test]
+    fn tiled_sweep_matches_the_untiled_formula_to_the_bit() {
+        let (_, snaps) = random_snapshots(603, 13, 4, 51);
+        let (counts, n) = (&snaps.split_counts, snaps.snapshots.len());
+        let min_dense = min_dense(n, weighted_dense_share());
+        type Overlap = fn(f64, f64) -> f64;
+        type Finish = fn(f64) -> f64;
+        let metrics: [(Overlap, Finish); 2] = [(f64::min, |d| d), (|a, b| a * b, f64::sqrt)];
+        for (overlap, finish) in metrics {
+            let trees = || Trees::Borrowed(&snaps.snapshots);
+            let tiled = weighted_distances_split(trees(), counts, None, min_dense, overlap, finish);
+
+            let layout = Layout::new(counts, n, min_dense, |count| count >= 2);
+            let (dense, postings, self_total) = weighted_layout(trees(), counts, &layout, &overlap);
+            assert!(
+                dense.stride > PANEL && dense.stride % 8 != 0,
+                "{}",
+                dense.stride
+            );
+            let untiled = fill_symmetric(n, None, |i, row: &mut [f64]| {
+                let (cols, lengths) = postings.of_tree(i);
+                for (&col, &length) in cols.iter().zip(lengths) {
+                    let (trees, others) = postings.after(col, i);
+                    for (&j, &other) in trees.iter().zip(others) {
+                        row[j as usize] += overlap(length, other);
+                    }
+                }
+                for (j, slot) in row.iter_mut().enumerate().skip(i + 1) {
+                    let shared = sweep(dense.row(i), dense.row(j), &overlap) + *slot;
+                    *slot = finish((self_total[i] + self_total[j] - 2.0 * shared).max(0.0));
+                }
+            });
+            assert_eq!(tiled, untiled);
         }
     }
 

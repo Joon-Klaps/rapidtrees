@@ -371,6 +371,8 @@ Every kernel lays the trees out a block at a time. A block's rows and posted spl
 
 Two details keep the answer exact. The dense sweep runs eight independent running sums in a fixed order, so the compiler can vectorise it without changing the result. And each tree sums its posted splits in column order, the same order its shared terms are added in, so two identical trees cancel to exactly `0.0` however their Newick listed the children.
 
+The dense sweep is tiled. A pair reads two rows of `n_dense` lengths, and a row of a wide tree is too long to stay in cache, so sweeping the pairs one at a time reads every row from memory once per pair and leaves the cores waiting on memory bandwidth. A task instead fills eight rows of the matrix, holding four of the other rows against them at a time and streaming 512 columns per pass, so each row's stretch of columns is read once per tile. Each pair still keeps its own eight running sums and adds its terms in the order above, so the tiles change the speed and not one bit of the answer.
+
 ---
 
 ## Step 10 — Naming the split: the clade table
