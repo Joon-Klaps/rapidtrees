@@ -97,7 +97,12 @@ impl Snapshots {
 
         self.snapshots.par_iter().zip(rows).for_each(|(snap, row)| {
             let entries = sorted_row(snap, &id_to_col);
-            for (dst, (col, _)) in row.chunks_exact_mut(size_of::<u32>()).zip(entries) {
+            for (dst, (col, _)) in row
+                .as_chunks_mut::<{ size_of::<u32>() }>()
+                .0
+                .iter_mut()
+                .zip(entries)
+            {
                 dst.copy_from_slice(&col.to_ne_bytes());
             }
         });
