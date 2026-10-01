@@ -47,7 +47,12 @@ use std::collections::HashMap;
 
 /// Bytes of tree text and raw parts parsed per chunk; see
 /// [`Snapshots::from_newick_iter_opts`].
-const CHUNK_TARGET_BYTES: usize = 256 * 1024 * 1024;
+///
+/// The chunk is held whole until it is interned, so below about 50 000 taxa
+/// it, not the split table, sets peak construction memory. 16 MiB is where
+/// shrinking it stops paying: a smaller chunk saves little more, and from
+/// about 10^5 taxa a chunk is already at its floor of one tree per thread.
+const CHUNK_TARGET_BYTES: usize = 16 * 1024 * 1024;
 
 /// A bulk collection of tree snapshots in an interned split-ID representation.
 ///
@@ -275,21 +280,21 @@ impl Snapshots {
     /// counter is bumped by `n - i - 1`, reaching `n*(n-1)/2` when done. Pass
     /// `None` to skip the (negligible) counter work entirely.
     pub fn pairwise_rf(&self, progress: Option<&std::sync::atomic::AtomicUsize>) -> Vec<u32> {
-        crate::distances::distance_rf(self, progress)
+        crate::distances::distance_rf(self.into(), progress)
     }
 
     /// Compute all pairwise Weighted Robinson–Foulds distances as a symmetric n×n matrix.
     ///
     /// See [`Self::pairwise_rf`] for the `progress` argument.
     pub fn pairwise_wrf(&self, progress: Option<&std::sync::atomic::AtomicUsize>) -> Vec<f64> {
-        crate::distances::distance_wrf(self, progress)
+        crate::distances::distance_wrf(self.into(), progress)
     }
 
     /// Compute all pairwise Kuhner–Felsenstein distances as a symmetric n×n matrix.
     ///
     /// See [`Self::pairwise_rf`] for the `progress` argument.
     pub fn pairwise_kf(&self, progress: Option<&std::sync::atomic::AtomicUsize>) -> Vec<f64> {
-        crate::distances::distance_kf(self, progress)
+        crate::distances::distance_kf(self.into(), progress)
     }
 
     /// [`Self::pairwise_rf`] for a caller that is done with the collection.
@@ -297,7 +302,7 @@ impl Snapshots {
     /// The per-tree split IDs are dropped a block of trees at a time as the
     /// kernel lays them out, so they are gone before the pairwise sweep.
     pub fn into_pairwise_rf(self, progress: Option<&std::sync::atomic::AtomicUsize>) -> Vec<u32> {
-        crate::distances::distance_rf_owned(self, progress)
+        crate::distances::distance_rf(self.into(), progress)
     }
 
     /// [`Self::pairwise_wrf`] for a caller that is done with the collection.
@@ -306,13 +311,13 @@ impl Snapshots {
     /// a time as the kernel lays them out, so the trees and the kernel's dense
     /// rows and posting lists are never both whole.
     pub fn into_pairwise_wrf(self, progress: Option<&std::sync::atomic::AtomicUsize>) -> Vec<f64> {
-        crate::distances::distance_wrf_owned(self, progress)
+        crate::distances::distance_wrf(self.into(), progress)
     }
 
     /// [`Self::pairwise_kf`] for a caller that is done with the collection; see
     /// [`Self::into_pairwise_wrf`].
     pub fn into_pairwise_kf(self, progress: Option<&std::sync::atomic::AtomicUsize>) -> Vec<f64> {
-        crate::distances::distance_kf_owned(self, progress)
+        crate::distances::distance_kf(self.into(), progress)
     }
 
     /// A collection of no trees.

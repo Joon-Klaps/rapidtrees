@@ -1,0 +1,16 @@
+# Runtime smoke test for the wasm32 build, never published: `run.ts` builds this, loads it in Node and checks its distance matrices against the native CLI.
+[package]
+name = "rapidtrees-wasm-smoke"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# No default features (no rayon, clap or flate2): the same build the browser gets.
+rapidtrees = { path = "../..", default-features = false }
+
+# Standalone, so it never joins the parent package's build.
+[workspace]

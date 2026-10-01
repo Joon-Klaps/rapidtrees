@@ -52,6 +52,7 @@
 
 use crate::par::*;
 use crate::snapshot::{InternSnap, Snapshots};
+use std::borrow::Cow;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -104,25 +105,16 @@ fn weighted_dense_share() -> f64 {
     })
 }
 
-/// Fill a symmetric `n × n` matrix one row at a time, one rayon task per row.
+/// Fill a symmetric `n × n` matrix a band of `band` rows at a time, one rayon
+/// task per band.
 ///
-/// `fill_row(i, row)` writes `row[j]` for every `j > i`. `row` arrives holding
-/// `T::default()` throughout, so a caller may accumulate into it first. The
-/// diagonal stays at `T::default()` and the lower triangle is mirrored from
-/// the upper. `progress` is bumped by each row's pair count as that row
-/// finishes.
-fn fill_symmetric<T, F>(n: usize, progress: Option<&AtomicUsize>, fill_row: F) -> Vec<T>
-where
-    T: Copy + Default + Send,
-    F: Fn(usize, &mut [T]) + Sync,
-{
-    fill_symmetric_banded(n, 1, progress, fill_row)
-}
-
-/// [`fill_symmetric`] with one rayon task per band of `band` rows:
 /// `fill_band(i0, rows)` writes `rows[r * n + j]` for every row `i0 + r` of the
-/// band and every `j > i0 + r`.
-fn fill_symmetric_banded<T, F>(
+/// band and every `j > i0 + r`; with `band == 1` that is `rows[j]` of row `i0`.
+/// `rows` arrives holding `T::default()` throughout, so a caller may accumulate
+/// into it first. The last band may be shorter. The diagonal stays at
+/// `T::default()` and the lower triangle is mirrored from the upper.
+/// `progress` is bumped by each band's pair count as that band finishes.
+fn fill_symmetric<T, F>(
     n: usize,
     band: usize,
     progress: Option<&AtomicUsize>,
@@ -132,6 +124,7 @@ where
     T: Copy + Default + Send,
     F: Fn(usize, &mut [T]) + Sync,
 {
+    debug_assert!(band > 0, "a band holds at least one row");
     let mut matrix = vec![T::default(); n * n];
 
     matrix
@@ -178,13 +171,6 @@ where
         (*slot, total) = (total, total + *slot);
     }
     total
-}
-
-/// The column of split `id`, or `None` if `column_of` gave it none.
-#[inline]
-fn column(column_of: &[u32], id: u32) -> Option<usize> {
-    let col = column_of[id as usize];
-    (col != NO_COLUMN).then_some(col as usize)
 }
 
 /// Give every split `keep` accepts a packed column index.
@@ -236,6 +222,14 @@ struct Layout {
     n_columns: usize,
 }
 
+/// Where a [`Layout`] puts a split.
+enum Column {
+    /// A dense column: a bit in RF's rows, an `f64` in the weighted metrics'.
+    Dense(usize),
+    /// A posting list, numbered from 0 after the dense columns.
+    Posted(u32),
+}
+
 impl Layout {
     /// Columns for the splits `shareable` accepts, given how many of the
     /// `n_trees` trees hold each; those held by at least `min_dense` are dense.
@@ -256,47 +250,119 @@ impl Layout {
             n_columns,
         }
     }
+
+    /// Where split `id` goes, or `None` if it has no column.
+    #[inline]
+    fn place(&self, id: u32) -> Option<Column> {
+        match self.column_of[id as usize] {
+            NO_COLUMN => None,
+            col if (col as usize) < self.n_dense => Some(Column::Dense(col as usize)),
+            col => Some(Column::Posted(col - self.n_dense as u32)),
+        }
+    }
 }
+
 // ─── the trees a kernel reads ───────────────────────────────────────────────
 
-/// Trees laid out per block: a few rounds of the pool, so a block is laid out
-/// in parallel and its scratch stays small.
-fn block_size() -> usize {
-    4 * current_num_threads().max(1)
+/// What a kernel reads: the trees, and how many of them hold each split.
+///
+/// Borrowed from a collection the caller keeps, or owned when the caller is
+/// done with it. Owned trees are dropped a block at a time as the kernel lays
+/// them out, so the trees and the kernel's layout of them are never both whole.
+pub(crate) struct Input<'a> {
+    trees: Cow<'a, [InternSnap]>,
+    counts: Cow<'a, [u32]>,
 }
 
-/// The trees a kernel reads: borrowed from a collection the caller keeps, or
-/// owned, in which case each block of trees is dropped as soon as the kernel
-/// has laid it out, so the trees and the kernel's layout of them are never both
-/// whole.
-enum Trees<'a> {
-    Borrowed(&'a [InternSnap]),
-    Owned(Vec<InternSnap>),
+impl<'a> From<&'a Snapshots> for Input<'a> {
+    fn from(snaps: &'a Snapshots) -> Self {
+        Self {
+            trees: Cow::Borrowed(&snaps.snapshots),
+            counts: Cow::Borrowed(&snaps.split_counts),
+        }
+    }
 }
 
-impl Trees<'_> {
-    fn len(&self) -> usize {
-        match self {
-            Trees::Borrowed(trees) => trees.len(),
-            Trees::Owned(trees) => trees.len(),
+impl From<Snapshots> for Input<'static> {
+    fn from(snaps: Snapshots) -> Self {
+        Self {
+            trees: Cow::Owned(snaps.snapshots),
+            counts: Cow::Owned(snaps.split_counts),
+        }
+    }
+}
+
+/// Trees per layout block, as a power of two: two to four rounds of the pool,
+/// so a block is laid out in parallel and its scratch stays small, and finding
+/// a tree's block is a shift rather than a division.
+fn block_shift() -> u32 {
+    (4 * current_num_threads().max(1)).ilog2()
+}
+
+/// Hand `trees` to `lay_out` in order, `size` at a time. Owned trees are
+/// dropped a block at a time, as soon as `lay_out` has read them.
+fn by_blocks(trees: Cow<'_, [InternSnap]>, size: usize, mut lay_out: impl FnMut(&[InternSnap])) {
+    match trees {
+        Cow::Borrowed(trees) => trees.chunks(size).for_each(lay_out),
+        Cow::Owned(trees) => {
+            let mut trees = trees.into_iter().peekable();
+            while trees.peek().is_some() {
+                let block: Vec<InternSnap> = trees.by_ref().take(size).collect();
+                lay_out(&block);
+            }
+        }
+    }
+}
+
+/// Per-tree data stored a block of trees per item. Each block is sized as it
+/// is laid out, so nothing is reserved for all the trees while they are still
+/// held. Every block but the last holds `1 << shift` trees.
+struct Blocks<T> {
+    shift: u32,
+    blocks: Vec<T>,
+}
+
+impl<T> Blocks<T> {
+    /// No blocks yet, with room for those of `n` trees.
+    fn with_capacity(shift: u32, n: usize) -> Self {
+        Self {
+            shift,
+            blocks: Vec::with_capacity(n.div_ceil(1 << shift)),
         }
     }
 
-    /// Hand the trees to `lay_out` in order, a block of `size` at a time.
-    fn by_blocks(self, size: usize, mut lay_out: impl FnMut(&[InternSnap])) {
-        match self {
-            Trees::Borrowed(trees) => trees.chunks(size).for_each(lay_out),
-            Trees::Owned(trees) => {
-                let mut trees = trees.into_iter();
-                loop {
-                    let block: Vec<InternSnap> = trees.by_ref().take(size).collect();
-                    if block.is_empty() {
-                        break;
-                    }
-                    lay_out(&block);
-                }
-            }
-        }
+    /// Add the next block.
+    fn push(&mut self, block: T) {
+        self.blocks.push(block);
+    }
+
+    /// The block holding tree `i`, and where in it `i` is.
+    #[inline]
+    fn locate(&self, i: usize) -> (&T, usize) {
+        (&self.blocks[i >> self.shift], i & ((1 << self.shift) - 1))
+    }
+}
+
+/// One row of `stride` values per tree over a layout's dense columns.
+struct Rows<T> {
+    stride: usize,
+    blocks: Blocks<Vec<T>>,
+}
+
+impl<T> Rows<T> {
+    /// Tree `i`'s row.
+    #[inline]
+    fn row(&self, i: usize) -> &[T] {
+        let (block, k) = self.blocks.locate(i);
+        row_slice(block, k, self.stride)
+    }
+
+    /// Every row in one flat, row-major buffer.
+    fn into_flat(self) -> Vec<T>
+    where
+        T: Clone,
+    {
+        self.blocks.blocks.concat()
     }
 }
 
@@ -312,18 +378,12 @@ impl Trees<'_> {
 /// collection has.
 ///
 /// Each tree's own posted splits are recorded once, in column order, so a row
-/// walks only those rather than scanning all of its tree's splits. They are
-/// stored a block of trees at a time, sized as each block is laid out, so they
-/// are never reserved while the trees they come from are still held.
+/// walks only those rather than scanning all of its tree's splits.
 struct Postings {
     offsets: Vec<usize>,
     trees: Vec<u32>,
     lengths: Vec<f64>,
-    /// Trees per block of `own`: tree `i` is tree `i % block` of `own[i / block]`.
-    block: usize,
-    own: Vec<OwnPosted>,
-    /// While the lists are filled: the next free entry of each.
-    fill: Vec<usize>,
+    own: Blocks<OwnPosted>,
 }
 
 /// One block of trees' own posted splits: tree `k` of the block owns entries
@@ -334,71 +394,56 @@ struct OwnPosted {
     lengths: Vec<f64>,
 }
 
+/// [`Postings`] while the trees are added to them, a block at a time.
+struct PostingsBuilder {
+    postings: Postings,
+    with_lengths: bool,
+    /// The next free entry of each list.
+    fill: Vec<usize>,
+    /// How many trees have been added so far.
+    added: usize,
+}
+
 impl Postings {
     /// Empty lists for `layout`'s posted columns, carrying branch lengths when
-    /// `with_lengths`, for trees that arrive `block` at a time. A posted
-    /// split's list holds exactly the trees that hold it, so `counts` sizes
-    /// every list before any tree is read. When there are none, nothing is
-    /// scanned or allocated beyond an empty index.
-    fn sized(counts: &[u32], layout: &Layout, block: usize, with_lengths: bool) -> Self {
+    /// `with_lengths`, to be filled with `n` trees in blocks of `1 << shift`. A
+    /// posted split's list holds exactly the trees that hold it, so `counts`
+    /// sizes every list before any tree is read.
+    fn builder(
+        counts: &[u32],
+        layout: &Layout,
+        n: usize,
+        shift: u32,
+        with_lengths: bool,
+    ) -> PostingsBuilder {
         let n_posted = layout.n_columns - layout.n_dense;
         let mut offsets = vec![0usize; n_posted + 1];
         if n_posted > 0 {
             for (id, &count) in counts.iter().enumerate() {
-                let posted = column(&layout.column_of, id as u32)
-                    .and_then(|col| col.checked_sub(layout.n_dense));
-                if let Some(col) = posted {
-                    offsets[col] = count as usize;
+                if let Some(Column::Posted(col)) = layout.place(id as u32) {
+                    offsets[col as usize] = count as usize;
                 }
             }
         }
         let total = exclusive_prefix_sum(&mut offsets);
-        Self {
+        PostingsBuilder {
             fill: offsets[..n_posted].to_vec(),
-            offsets,
-            trees: vec![0; total],
-            lengths: vec![0.0; if with_lengths { total } else { 0 }],
-            block,
-            own: Vec::new(),
+            postings: Self {
+                offsets,
+                trees: vec![0; total],
+                lengths: vec![0.0; if with_lengths { total } else { 0 }],
+                own: Blocks::with_capacity(shift, n),
+            },
+            with_lengths,
+            added: 0,
         }
-    }
-
-    /// Add the next block of trees' posted splits, each tree's in column
-    /// order. Blocks come in order, so every list stays ascending.
-    fn push_block(&mut self, posted: &[Vec<(u32, f64)>]) {
-        let first = self.own.len() * self.block;
-        let total = posted.iter().map(Vec::len).sum();
-        let with_lengths = !self.lengths.is_empty();
-        let mut own = OwnPosted {
-            starts: Vec::with_capacity(posted.len() + 1),
-            cols: Vec::with_capacity(total),
-            lengths: Vec::with_capacity(if with_lengths { total } else { 0 }),
-        };
-        own.starts.push(0);
-        for (k, splits) in posted.iter().enumerate() {
-            for &(col, length) in splits {
-                let at = &mut self.fill[col as usize];
-                self.trees[*at] = (first + k) as u32;
-                if let Some(slot) = self.lengths.get_mut(*at) {
-                    *slot = length;
-                }
-                *at += 1;
-            }
-            own.cols.extend(splits.iter().map(|&(col, _)| col));
-            if with_lengths {
-                own.lengths.extend(splits.iter().map(|&(_, length)| length));
-            }
-            own.starts.push(own.cols.len());
-        }
-        self.own.push(own);
     }
 
     /// Tree `i`'s posted columns in column order, with their branch lengths
     /// (empty when built without them).
     #[inline]
     fn of_tree(&self, i: usize) -> (&[u32], &[f64]) {
-        let own = &self.own[i / self.block];
-        let k = i % self.block;
+        let (own, k) = self.own.locate(i);
         let span = own.starts[k]..own.starts[k + 1];
         let lengths = if own.lengths.is_empty() {
             &[][..]
@@ -423,6 +468,113 @@ impl Postings {
         };
         (&trees[from..], lengths)
     }
+
+    /// Add `overlap(lengthᵢ, lengthⱼ)` into `row[j]` for each posted split tree
+    /// `i` holds and each later tree `j` holding it too, in tree `i`'s column
+    /// order. Reads the branch lengths, so the lists must be built with them.
+    #[inline]
+    fn add_shared(&self, i: usize, row: &mut [f64], overlap: &impl Fn(f64, f64) -> f64) {
+        let (cols, lengths) = self.of_tree(i);
+        for (&col, &length) in cols.iter().zip(lengths) {
+            let (trees, others) = self.after(col, i);
+            for (&j, &other) in trees.iter().zip(others) {
+                row[j as usize] += overlap(length, other);
+            }
+        }
+    }
+}
+
+impl PostingsBuilder {
+    /// Add the next block of trees, each tree's posted splits in column order.
+    /// Blocks come in order, so every list stays ascending.
+    fn push_block(&mut self, posted: &[Vec<(u32, f64)>]) {
+        let total = posted.iter().map(Vec::len).sum();
+        let mut own = OwnPosted {
+            starts: Vec::with_capacity(posted.len() + 1),
+            cols: Vec::with_capacity(total),
+            lengths: Vec::with_capacity(if self.with_lengths { total } else { 0 }),
+        };
+        own.starts.push(0);
+        for (tree, splits) in (self.added..).zip(posted) {
+            for &(col, length) in splits {
+                let at = &mut self.fill[col as usize];
+                self.postings.trees[*at] = tree as u32;
+                own.cols.push(col);
+                if self.with_lengths {
+                    self.postings.lengths[*at] = length;
+                    own.lengths.push(length);
+                }
+                *at += 1;
+            }
+            own.starts.push(own.cols.len());
+        }
+        self.added += posted.len();
+        self.postings.own.push(own);
+    }
+
+    /// The filled lists.
+    fn finish(self) -> Postings {
+        self.postings
+    }
+}
+
+// ─── laying the trees out ───────────────────────────────────────────────────
+
+/// The trees as a kernel sweeps them: each tree's dense row, the posting
+/// lists, and each tree's `self` term.
+struct Laid<T, S> {
+    rows: Rows<T>,
+    postings: Postings,
+    selfs: Vec<S>,
+}
+
+/// Lay the trees out over `layout` a block at a time, `width` values to a row.
+///
+/// `tree(layout, snap, row)` writes `snap`'s dense columns into its zeroed
+/// `row` and returns its posted splits in column order, with their branch
+/// lengths when `with_lengths`, and its `self` term. A block's trees are laid
+/// out in parallel and then added to the posting lists in tree order, which
+/// keeps every list ascending without a sort or atomics.
+fn lay_out<T, S>(
+    input: Input<'_>,
+    layout: Layout,
+    width: usize,
+    with_lengths: bool,
+    tree: impl Fn(&Layout, &InternSnap, &mut [T]) -> (Vec<(u32, f64)>, S) + Sync,
+) -> Laid<T, S>
+where
+    T: Copy + Default + Send,
+    S: Send,
+{
+    let Input { trees, counts } = input;
+    let n = trees.len();
+    let shift = block_shift();
+    let mut rows = Rows {
+        stride: width,
+        blocks: Blocks::with_capacity(shift, n),
+    };
+    let mut postings = Postings::builder(&counts, &layout, n, shift, with_lengths);
+    let mut selfs = Vec::with_capacity(n);
+    // `par_chunks_mut` takes no zero width, so a zero-width row is handed one
+    // scratch value, which is dropped once its block is laid out.
+    let scratch = width.max(1);
+    by_blocks(trees, 1 << shift, |block| {
+        let mut buffer = vec![T::default(); block.len() * scratch];
+        let (posted, block_selfs): (Vec<_>, Vec<_>) = buffer
+            .par_chunks_mut(scratch)
+            .zip(block.par_iter())
+            .map(|(row, snap)| tree(&layout, snap, &mut row[..width]))
+            .unzip();
+        postings.push_block(&posted);
+        selfs.extend(block_selfs);
+        rows.blocks
+            .push(if width == 0 { Vec::new() } else { buffer });
+    });
+    Laid {
+        rows,
+        postings: postings.finish(),
+        selfs,
+    }
 }
 
 // ─── Robinson–Foulds ────────────────────────────────────────────────────────
@@ -433,6 +585,10 @@ impl Postings {
 /// `spans[i]` is the half-open range of words where row `i` has bits set,
 /// `(0, 0)` when it has none. Columns run in descending tree count, so a row's
 /// bits cluster and a pair only sweeps the words where both spans overlap.
+///
+/// The rows are kept flat rather than in [`Rows`]' blocks: a pair reads two
+/// short rows and does little else, so a block lookup per row would show in
+/// the sweep, and bit rows are small enough to copy once.
 struct BitRows {
     words: usize,
     packed: Vec<u64>,
@@ -440,8 +596,10 @@ struct BitRows {
 }
 
 impl BitRows {
-    /// The `n` rows packed `words` to a row in `packed`.
-    fn from_packed(packed: Vec<u64>, words: usize, n: usize) -> Self {
+    /// The `n` trees' `rows`, flattened, with the span of each.
+    fn new(rows: Rows<u64>, n: usize) -> Self {
+        let words = rows.stride;
+        let packed = rows.into_flat();
         let spans = (0..n)
             .map(|i| {
                 let row = row_slice(&packed, i, words);
@@ -546,51 +704,59 @@ fn rf_min_dense(n: usize) -> u32 {
 /// either. On a posterior that is most of the distinct splits. The rest are
 /// shared by a popcount over packed bit-rows for the widely held ones and by
 /// posting lists for the rare ones.
-pub(crate) fn distance_rf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> Vec<u32> {
-    let trees = Trees::Borrowed(&snaps.snapshots);
-    let min_dense = rf_min_dense(trees.len());
-    distance_rf_split(trees, &snaps.split_counts, progress, min_dense)
-}
-
-/// [`distance_rf`] for a caller that is done with `snaps`: each block of trees
-/// is dropped once its bit rows and posting entries are written, before the
-/// pairwise sweep.
-pub(crate) fn distance_rf_owned(snaps: Snapshots, progress: Option<&AtomicUsize>) -> Vec<u32> {
-    let Snapshots {
-        snapshots,
-        split_counts,
-        ..
-    } = snaps;
-    let min_dense = rf_min_dense(snapshots.len());
-    distance_rf_split(Trees::Owned(snapshots), &split_counts, progress, min_dense)
+pub(crate) fn distance_rf(input: Input<'_>, progress: Option<&AtomicUsize>) -> Vec<u32> {
+    let n = input.trees.len();
+    let min_dense = if n < RF_MIN_TREES_FOR_POSTINGS {
+        2 // every shareable split gets a bit column
+    } else {
+        min_dense(n, rf_dense_share())
+    };
+    distance_rf_split(input, progress, min_dense)
 }
 
 /// [`distance_rf`] with the bit/posting boundary given: a split held by at
 /// least `min_dense` trees (but not all) gets a bit column, one held by fewer
 /// (but at least two) gets a posting list.
-fn distance_rf_split(
-    trees: Trees,
-    counts: &[u32],
-    progress: Option<&AtomicUsize>,
-    min_dense: u32,
-) -> Vec<u32> {
-    let n = trees.len();
+fn distance_rf_split(input: Input<'_>, progress: Option<&AtomicUsize>, min_dense: u32) -> Vec<u32> {
+    let n = input.trees.len();
     if n == 0 {
         return Vec::new();
     }
 
     // A split held by all `n` trees cancels, so it gets no column of either kind.
     let all = n as u32;
-    let layout = Layout::new(counts, n, min_dense.min(all), |count| {
+    let layout = Layout::new(&input.counts, n, min_dense.min(all), |count| {
         (2..all).contains(&count)
     });
     // Every tree holds each of the `n_universal` splits, so its `self` is its
     // split count minus that fixed number.
-    let n_universal = counts.iter().filter(|&&count| count == all).count();
-    let (bits, postings, self_count) = rf_layout(trees, counts, &layout, n_universal);
-    drop(layout);
+    let n_universal = input.counts.iter().filter(|&&count| count == all).count();
+    let words = layout.n_dense.div_ceil(64);
+    let Laid {
+        rows,
+        postings,
+        selfs: self_count,
+    } = lay_out(
+        input,
+        layout,
+        words,
+        false,
+        |layout, snap, row: &mut [u64]| {
+            let mut posted = Vec::new();
+            for &id in &snap.split_ids {
+                match layout.place(id) {
+                    Some(Column::Dense(col)) => row[col / 64] |= 1u64 << (col % 64),
+                    Some(Column::Posted(col)) => posted.push((col, 0.0)),
+                    None => {}
+                }
+            }
+            posted.sort_unstable_by_key(|&(col, _)| col);
+            (posted, (snap.split_ids.len() - n_universal) as u32)
+        },
+    );
+    let bits = BitRows::new(rows, n);
 
-    fill_symmetric(n, progress, |i, row: &mut [u32]| {
+    fill_symmetric(n, 1, progress, |i, row: &mut [u32]| {
         // Shared splits from the posting lists first, counted in place.
         for &col in postings.of_tree(i).0 {
             for &j in postings.after(col, i).0 {
@@ -607,6 +773,9 @@ fn distance_rf_split(
 
 // ─── weighted metrics (WRF, KF) ─────────────────────────────────────────────
 
+/// Running sums per weighted sweep: see [`sweep`].
+const LANES: usize = 8;
+
 /// `Σ overlap(aₖ, bₖ)` over two rows of equal length, in a fixed order.
 ///
 /// Eight running sums rather than one. A single `f64` sum is a chain the
@@ -617,21 +786,7 @@ fn distance_rf_split(
 /// is what keeps identical trees at exactly 0.0.
 #[inline]
 fn sweep(a: &[f64], b: &[f64], overlap: &impl Fn(f64, f64) -> f64) -> f64 {
-    const LANES: usize = 8;
-    let (a_blocks, a_tail) = a.as_chunks::<LANES>();
-    let (b_blocks, b_tail) = b.as_chunks::<LANES>();
-
-    let mut lanes = [0.0f64; LANES];
-    let mut add = |xs: &[f64], ys: &[f64]| {
-        for ((lane, &x), &y) in lanes.iter_mut().zip(xs).zip(ys) {
-            *lane += overlap(x, y);
-        }
-    };
-    for (xs, ys) in a_blocks.iter().zip(b_blocks) {
-        add(xs, ys);
-    }
-    add(a_tail, b_tail);
-    lanes.iter().sum()
+    accumulate([0.0; LANES], a, b, overlap).iter().sum()
 }
 
 /// Rows per weighted sweep task, rows of the other side held against them,
@@ -641,15 +796,27 @@ fn sweep(a: &[f64], b: &[f64], overlap: &impl Fn(f64, f64) -> f64) -> f64 {
 const TILE_I: usize = 8;
 const TILE_J: usize = 4;
 const PANEL: usize = 512;
+// Every panel but the last must end on a block boundary for `accumulate` to
+// add in `sweep`'s order.
+const _: () = assert!(PANEL.is_multiple_of(LANES));
 
-/// Add `overlap(a[k], b[k])` into `lanes` exactly as [`sweep`] does over the
-/// same columns: whole blocks of eight first, then the tail into the first
-/// lanes. Called panel by panel, with every panel but the last a multiple of
-/// eight wide, the lanes end up holding exactly what [`sweep`] adds up.
+/// `lanes` with `overlap(a[k], b[k])` added in [`sweep`]'s order: whole
+/// blocks of eight first, then the tail into the first lanes. Called panel by
+/// panel, with every panel but the last a multiple of eight wide, the lanes end
+/// up holding exactly what one call over the whole rows would.
+///
+/// The lanes go in and come out by value. Behind a `&mut` the compiler cannot
+/// always prove that they do not alias the rows, and then stores every lane
+/// back on every block and gives up on vectorising: twice the instructions.
 #[inline(always)]
-fn accumulate(lanes: &mut [f64; 8], a: &[f64], b: &[f64], overlap: &impl Fn(f64, f64) -> f64) {
-    let (a_blocks, a_tail) = a.as_chunks::<8>();
-    let (b_blocks, b_tail) = b.as_chunks::<8>();
+fn accumulate(
+    mut lanes: [f64; LANES],
+    a: &[f64],
+    b: &[f64],
+    overlap: &impl Fn(f64, f64) -> f64,
+) -> [f64; LANES] {
+    let (a_blocks, a_tail) = a.as_chunks::<LANES>();
+    let (b_blocks, b_tail) = b.as_chunks::<LANES>();
     for (xs, ys) in a_blocks.iter().zip(b_blocks) {
         for ((lane, &x), &y) in lanes.iter_mut().zip(xs).zip(ys) {
             *lane += overlap(x, y);
@@ -658,46 +825,31 @@ fn accumulate(lanes: &mut [f64; 8], a: &[f64], b: &[f64], overlap: &impl Fn(f64,
     for ((lane, &x), &y) in lanes.iter_mut().zip(a_tail).zip(b_tail) {
         *lane += overlap(x, y);
     }
+    lanes
 }
 
-/// Every tree's lengths over the dense columns, 0.0 where it lacks the split.
-/// Stored a block of trees per buffer, so that they can be allocated as the
-/// trees are consumed.
-struct DenseRows {
-    size: usize,
-    stride: usize,
-    blocks: Vec<Vec<f64>>,
-}
-
-impl DenseRows {
-    /// Tree `i`'s row.
-    #[inline]
-    fn row(&self, i: usize) -> &[f64] {
-        let (block, k) = (i / self.size, i % self.size);
-        &self.blocks[block][k * self.stride..][..self.stride]
-    }
-}
-
-/// The weighted kernels' dense rows and posting lists, laid out a block of
-/// trees at a time, with every tree's `self` term.
+/// The weighted kernels' trees laid out with the dense/posting boundary at
+/// `min_dense`: each tree's lengths over the dense columns, 0.0 where it lacks
+/// the split, its posted splits with their lengths, and its `self` term.
 ///
 /// `self` is summed in the same order as the shared term it has to cancel:
 /// dense columns by [`sweep`], posted splits in column order, and the two parts
 /// added last in both; a split held by one tree alone folds in after them.
 /// Identical trees therefore come out at exactly 0.0.
-fn weighted_layout(
-    trees: Trees,
-    counts: &[u32],
-    layout: &Layout,
+fn weighted_lay_out(
+    input: Input<'_>,
+    min_dense: u32,
     overlap: &(impl Fn(f64, f64) -> f64 + Sync),
-) -> (DenseRows, Postings, Vec<f64>) {
-    let n = trees.len();
-    let (size, stride) = (block_size(), layout.n_dense);
-    // A zero-width row still gets one scratch slot, so that every tree is
-    // handed a row; only its first `stride` (none) are read.
-    let width = stride.max(1);
-    let mut dense = DenseRows {
-        size,
+) -> Laid<f64, f64> {
+    // "Everywhere" splits get a dense column; unlike in RF they do not cancel
+    // out of a weighted score.
+    let layout = Layout::new(&input.counts, input.trees.len(), min_dense, |count| {
+        count >= 2
+    });
+    let stride = layout.n_dense;
+    lay_out(
+        input,
+        layout,
         stride,
         blocks: Vec::with_capacity(n.div_ceil(size)),
     };
@@ -719,20 +871,15 @@ fn weighted_layout(
                         None => unique_self += overlap(length, length),
                     }
                 }
-                own.sort_unstable_by_key(|&(col, _)| col);
-                let dense_self = sweep(row, row, overlap);
-                let posted_self = own
-                    .iter()
-                    .fold(0.0, |sum, &(_, length)| sum + overlap(length, length));
-                (own, (dense_self + posted_self) + unique_self)
-            })
-            .unzip();
-        postings.push_block(&posted);
-        self_total.extend(selfs);
-        dense.blocks.push(rows);
-    });
-    postings.fill = Vec::new();
-    (dense, postings, self_total)
+            }
+            posted.sort_unstable_by_key(|&(col, _)| col);
+            let dense_self = sweep(row, row, overlap);
+            let posted_self = posted
+                .iter()
+                .fold(0.0, |sum, &(_, length)| sum + overlap(length, length));
+            (posted, (dense_self + posted_self) + unique_self)
+        },
+    )
 }
 
 /// `finish(selfᵢ + selfⱼ − 2·Σ overlap)` — the shape WRF and KF share.
@@ -740,14 +887,13 @@ fn weighted_layout(
 /// `overlap` is the per-split shared term, and a split contributes
 /// `overlap(l, l)` to its own tree's `self`. `finish` is applied last.
 fn weighted_distances(
-    trees: Trees,
-    counts: &[u32],
+    input: Input<'_>,
     progress: Option<&AtomicUsize>,
     overlap: impl Fn(f64, f64) -> f64 + Sync,
     finish: impl Fn(f64) -> f64 + Sync,
 ) -> Vec<f64> {
-    let min_dense = min_dense(trees.len(), weighted_dense_share());
-    weighted_distances_split(trees, counts, progress, min_dense, overlap, finish)
+    let min_dense = min_dense(input.trees.len(), weighted_dense_share());
+    weighted_distances_split(input, progress, min_dense, overlap, finish)
 }
 
 /// [`weighted_distances`] with the dense/posting boundary given: a split held
@@ -756,115 +902,68 @@ fn weighted_distances(
 /// since it can never be shared. Its length folds into that tree's `self`.
 /// The clamp stops rounding from handing `finish` a negative.
 fn weighted_distances_split(
-    trees: Trees,
-    counts: &[u32],
+    input: Input<'_>,
     progress: Option<&AtomicUsize>,
     min_dense: u32,
     overlap: impl Fn(f64, f64) -> f64 + Sync,
     finish: impl Fn(f64) -> f64 + Sync,
 ) -> Vec<f64> {
-    let n = trees.len();
+    let n = input.trees.len();
     if n == 0 {
         return Vec::new();
     }
+    let Laid {
+        rows: dense,
+        postings,
+        selfs: self_total,
+    } = weighted_lay_out(input, min_dense, &overlap);
 
-    // "Everywhere" splits get a dense column; unlike in RF they do not cancel
-    // out of a weighted score.
-    let layout = Layout::new(counts, n, min_dense, |count| count >= 2);
-    let (dense, postings, self_total) = weighted_layout(trees, counts, &layout, &overlap);
-    drop(layout);
-
-    fill_symmetric_banded(n, TILE_I, progress, |i0, rows: &mut [f64]| {
-        let band = rows.len() / n;
+    fill_symmetric(n, TILE_I, progress, |i0, rows: &mut [f64]| {
+        let i1 = i0 + rows.len() / n;
         // Shared terms from the posting lists first, accumulated in place.
-        for (r, row) in rows.chunks_mut(n).enumerate() {
-            let i = i0 + r;
-            let (cols, lengths) = postings.of_tree(i);
-            for (&col, &length) in cols.iter().zip(lengths) {
-                let (trees, others) = postings.after(col, i);
-                for (&j, &other) in trees.iter().zip(others) {
-                    row[j as usize] += overlap(length, other);
-                }
-            }
+        for (i, row) in (i0..i1).zip(rows.chunks_mut(n)) {
+            postings.add_shared(i, row, &overlap);
         }
 
         // Then the dense columns, a tile of pairs at a time, a panel of
         // columns per pass, each pair keeping its own eight lanes throughout.
         for j0 in (i0 + 1..n).step_by(TILE_J) {
-            let width = (n - j0).min(TILE_J);
-            let mut lanes = [[[0.0f64; 8]; TILE_J]; TILE_I];
+            let j1 = (j0 + TILE_J).min(n);
+            // Row `i` skips the tile's trees up to and including itself.
+            let at_or_before = |i: usize| (i + 1).saturating_sub(j0);
+            let mut lanes = [[[0.0f64; LANES]; TILE_J]; TILE_I];
             for p0 in (0..dense.stride).step_by(PANEL) {
                 let panel = p0..(p0 + PANEL).min(dense.stride);
-                for (r, lanes_r) in lanes.iter_mut().enumerate().take(band) {
-                    let a = &dense.row(i0 + r)[panel.clone()];
-                    for (c, lane) in lanes_r.iter_mut().enumerate().take(width) {
-                        if j0 + c > i0 + r {
-                            accumulate(lane, a, &dense.row(j0 + c)[panel.clone()], &overlap);
-                        }
+                for (i, lanes_i) in (i0..i1).zip(&mut lanes) {
+                    let a = &dense.row(i)[panel.clone()];
+                    for (j, lane) in (j0..j1).zip(lanes_i).skip(at_or_before(i)) {
+                        *lane = accumulate(*lane, a, &dense.row(j)[panel.clone()], &overlap);
                     }
                 }
             }
-            for (r, lanes_r) in lanes.iter().enumerate().take(band) {
-                let i = i0 + r;
-                for (c, lane) in lanes_r.iter().enumerate().take(width) {
-                    let j = j0 + c;
-                    if j > i {
-                        let slot = &mut rows[r * n + j];
-                        let shared = lane.iter().sum::<f64>() + *slot;
-                        *slot = finish((self_total[i] + self_total[j] - 2.0 * shared).max(0.0));
-                    }
+            for ((i, row), lanes_i) in (i0..i1).zip(rows.chunks_mut(n)).zip(&lanes) {
+                let tile = (j0..j1).zip(lanes_i).zip(&mut row[j0..j1]);
+                for ((j, lane), slot) in tile.skip(at_or_before(i)) {
+                    let shared = lane.iter().sum::<f64>() + *slot;
+                    *slot = finish((self_total[i] + self_total[j] - 2.0 * shared).max(0.0));
                 }
             }
         }
     })
 }
 
-/// The weighted metrics' trees and split counts, taken out of a collection the
-/// caller is done with.
-fn owned_trees(snaps: Snapshots) -> (Trees<'static>, Vec<u32>) {
-    let Snapshots {
-        snapshots,
-        split_counts,
-        ..
-    } = snaps;
-    (Trees::Owned(snapshots), split_counts)
-}
-
 /// `WRF(i, j) = Σ lenᵢ + Σ lenⱼ − 2·Σ min(lenᵢ, lenⱼ)`.
 ///
 /// The `min` form follows from `|a − b| = a + b − 2·min(a, b)`. Assumes
 /// non-negative branch lengths; missing lengths parse as 0.0.
-pub(crate) fn distance_wrf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> Vec<f64> {
-    let trees = Trees::Borrowed(&snaps.snapshots);
-    weighted_distances(trees, &snaps.split_counts, progress, f64::min, |d| d)
-}
-
-/// [`distance_wrf`] for a caller that is done with `snaps`: each tree's split
-/// IDs and branch lengths are dropped, a block at a time, as the kernel lays
-/// them out.
-pub(crate) fn distance_wrf_owned(snaps: Snapshots, progress: Option<&AtomicUsize>) -> Vec<f64> {
-    let (trees, counts) = owned_trees(snaps);
-    weighted_distances(trees, &counts, progress, f64::min, |d| d)
+pub(crate) fn distance_wrf(input: Input<'_>, progress: Option<&AtomicUsize>) -> Vec<f64> {
+    weighted_distances(input, progress, f64::min, |d| d)
 }
 
 /// `KF(i, j) = sqrt(Σ lenᵢ² + Σ lenⱼ² − 2·Σ lenᵢ·lenⱼ)` — Euclidean distance in
 /// branch-length space.
-pub(crate) fn distance_kf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> Vec<f64> {
-    let trees = Trees::Borrowed(&snaps.snapshots);
-    weighted_distances(
-        trees,
-        &snaps.split_counts,
-        progress,
-        |a, b| a * b,
-        f64::sqrt,
-    )
-}
-
-/// [`distance_kf`] for a caller that is done with `snaps`; see
-/// [`distance_wrf_owned`].
-pub(crate) fn distance_kf_owned(snaps: Snapshots, progress: Option<&AtomicUsize>) -> Vec<f64> {
-    let (trees, counts) = owned_trees(snaps);
-    weighted_distances(trees, &counts, progress, |a, b| a * b, f64::sqrt)
+pub(crate) fn distance_kf(input: Input<'_>, progress: Option<&AtomicUsize>) -> Vec<f64> {
+    weighted_distances(input, progress, |a, b| a * b, f64::sqrt)
 }
 
 /// Twelve 10-taxon trees from the PHYLIP treedist reference suite.
@@ -1307,14 +1406,16 @@ fn kuhner_felsenstein_treedist() {
 #[cfg(test)]
 mod tests {
     use super::{
-        Layout, NO_COLUMN, PANEL, TREEDIST_TREES, Trees, assign_columns, distance_rf_split,
-        fill_symmetric, min_dense, parse_share, sweep, weighted_distances_split, weighted_layout,
+        Input, Laid, NO_COLUMN, PANEL, TREEDIST_TREES, assign_columns, distance_rf_split,
+        fill_symmetric, min_dense, parse_share, sweep, weighted_distances_split, weighted_lay_out,
     };
     use crate::{
         distances::{RF_DENSE_SHARE, WEIGHTED_DENSE_SHARE, rf_dense_share, weighted_dense_share},
         snapshot::{InternSnap, Snapshots},
     };
+    use std::borrow::Cow;
     use std::collections::{BTreeMap, BTreeSet};
+    use std::fmt::Debug;
 
     const T0: &str = "(A:0.1,(B:0.1,(H:0.1,(D:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);";
     const T1: &str = "(A:0.1,(B:0.1,(D:0.1,((J:0.1,H:0.1):0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1);";
@@ -1625,31 +1726,34 @@ mod tests {
         }
     }
 
-    /// WRF and KF with the dense/posting boundary at `min_dense`, mirroring
-    /// [`super::distance_wrf`] and [`super::distance_kf`]. The trees are read
-    /// borrowed and owned, and the two have to agree to the bit.
-    fn weighted_at(snaps: &Snapshots, min_dense: u32) -> (Vec<f64>, Vec<f64>) {
-        let counts = &snaps.split_counts;
-        let both = |trees: fn(&Snapshots) -> Trees| {
-            (
-                weighted_distances_split(trees(snaps), counts, None, min_dense, f64::min, |d| d),
-                weighted_distances_split(
-                    trees(snaps),
-                    counts,
-                    None,
-                    min_dense,
-                    |a, b| a * b,
-                    f64::sqrt,
-                ),
-            )
-        };
-        let borrowed = both(|snaps| Trees::Borrowed(&snaps.snapshots));
-        let owned = both(|snaps| Trees::Owned(snaps.snapshots.clone()));
-        assert_eq!(
-            borrowed, owned,
-            "borrowed and owned trees disagree at min_dense={min_dense}"
-        );
+    /// `kernel` on `snaps`' trees borrowed and on an owned copy of them, which
+    /// have to agree to the bit.
+    fn borrowed_and_owned<T: PartialEq + Debug>(
+        snaps: &Snapshots,
+        ctx: &str,
+        kernel: impl Fn(Input<'_>) -> T,
+    ) -> T {
+        let borrowed = kernel(snaps.into());
+        let owned = kernel(Input {
+            trees: Cow::Owned(snaps.snapshots.clone()),
+            counts: Cow::Borrowed(&snaps.split_counts),
+        });
+        assert_eq!(borrowed, owned, "borrowed and owned trees disagree, {ctx}");
         borrowed
+    }
+
+    /// WRF and KF with the dense/posting boundary at `min_dense`, mirroring
+    /// [`super::distance_wrf`] and [`super::distance_kf`], from borrowed and
+    /// from owned trees.
+    fn weighted_at(snaps: &Snapshots, min_dense: u32) -> (Vec<f64>, Vec<f64>) {
+        (
+            borrowed_and_owned(snaps, &format!("WRF min_dense={min_dense}"), |input| {
+                weighted_distances_split(input, None, min_dense, f64::min, |d| d)
+            }),
+            borrowed_and_owned(snaps, &format!("KF min_dense={min_dense}"), |input| {
+                weighted_distances_split(input, None, min_dense, |a, b| a * b, f64::sqrt)
+            }),
+        )
     }
 
     /// The boundary decides which path a split takes and must decide nothing
@@ -1712,30 +1816,26 @@ mod tests {
     #[test]
     fn tiled_sweep_matches_the_untiled_formula_to_the_bit() {
         let (_, snaps) = random_snapshots(603, 13, 4, 51);
-        let (counts, n) = (&snaps.split_counts, snaps.snapshots.len());
+        let n = snaps.snapshots.len();
         let min_dense = min_dense(n, weighted_dense_share());
         type Overlap = fn(f64, f64) -> f64;
         type Finish = fn(f64) -> f64;
         let metrics: [(Overlap, Finish); 2] = [(f64::min, |d| d), (|a, b| a * b, f64::sqrt)];
         for (overlap, finish) in metrics {
-            let trees = || Trees::Borrowed(&snaps.snapshots);
-            let tiled = weighted_distances_split(trees(), counts, None, min_dense, overlap, finish);
+            let tiled = weighted_distances_split((&snaps).into(), None, min_dense, overlap, finish);
 
-            let layout = Layout::new(counts, n, min_dense, |count| count >= 2);
-            let (dense, postings, self_total) = weighted_layout(trees(), counts, &layout, &overlap);
+            let Laid {
+                rows: dense,
+                postings,
+                selfs: self_total,
+            } = weighted_lay_out((&snaps).into(), min_dense, &overlap);
             assert!(
                 dense.stride > PANEL && dense.stride % 8 != 0,
                 "{}",
                 dense.stride
             );
-            let untiled = fill_symmetric(n, None, |i, row: &mut [f64]| {
-                let (cols, lengths) = postings.of_tree(i);
-                for (&col, &length) in cols.iter().zip(lengths) {
-                    let (trees, others) = postings.after(col, i);
-                    for (&j, &other) in trees.iter().zip(others) {
-                        row[j as usize] += overlap(length, other);
-                    }
-                }
+            let untiled = fill_symmetric(n, 1, None, |i, row: &mut [f64]| {
+                postings.add_shared(i, row, &overlap);
                 for (j, slot) in row.iter_mut().enumerate().skip(i + 1) {
                     let shared = sweep(dense.row(i), dense.row(j), &overlap) + *slot;
                     *slot = finish((self_total[i] + self_total[j] - 2.0 * shared).max(0.0));
@@ -1794,24 +1894,11 @@ mod tests {
             let (_, snaps) = random_snapshots(n_taxa, n_trees, duplicates, seed);
             let n = snaps.snapshots.len();
             for min_dense in [2, 3, n as u32 / 2, n as u32, n as u32 + 1] {
-                let counts = &snaps.split_counts;
-                let rf =
-                    distance_rf_split(Trees::Borrowed(&snaps.snapshots), counts, None, min_dense);
-                let owned = distance_rf_split(
-                    Trees::Owned(snaps.snapshots.clone()),
-                    counts,
-                    None,
-                    min_dense,
-                );
-                assert_eq!(
-                    rf, owned,
-                    "borrowed and owned trees disagree at min_dense={min_dense}"
-                );
-                assert_rf_matches_reference(
-                    &snaps,
-                    &rf,
-                    &format!("seed={seed} min_dense={min_dense}"),
-                );
+                let ctx = format!("seed={seed} min_dense={min_dense}");
+                let rf = borrowed_and_owned(&snaps, &ctx, |input| {
+                    distance_rf_split(input, None, min_dense)
+                });
+                assert_rf_matches_reference(&snaps, &rf, &ctx);
             }
         }
     }
