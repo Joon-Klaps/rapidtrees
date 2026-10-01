@@ -313,7 +313,7 @@ impl Interner {
 
         let mut snapshots = self.snapshots;
         snapshots.par_iter_mut().for_each(|snap| {
-            for id in &mut snap.split_ids[base..] {
+            for id in &mut snap.split_ids {
                 *id = offsets[*id as usize & (SHARDS - 1)] + (*id >> SHARD_BITS);
             }
         });
@@ -321,24 +321,11 @@ impl Interner {
         // Every tree holds every pendant once, and pendant `k` names leaf `k`.
         let mut counts = Vec::with_capacity(total as usize);
         counts.resize(base, snapshots.len() as u32);
-        // Sized up front: grown by doubling, the merged table would end up to
-        // twice its size while the shards' tables are still alive.
-        let pendants = if self.retain.bipartitions {
-            self.num_leaves
-        } else {
-            0
-        };
-        let mut clades = CladeTable::with_capacity(
-            total as usize,
-            pendants
-                + self
-                    .shards
-                    .iter()
-                    .map(|shard| shard.clades.n_leaves())
-                    .sum::<usize>(),
-        );
-        for leaf in 0..pendants as u32 {
-            clades.push(std::iter::once(leaf));
+        let mut clades = CladeTable::new();
+        if self.retain.bipartitions {
+            for leaf in 0..self.num_leaves as u32 {
+                clades.push(std::iter::once(leaf));
+            }
         }
         for shard in self.shards {
             counts.extend_from_slice(&shard.counts);
