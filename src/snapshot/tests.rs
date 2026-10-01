@@ -850,10 +850,9 @@ fn populated_collection_is_not_empty() {
 type Fact = (fingerprint::Fingerprint, Vec<u32>, f64);
 
 /// Put facts in one order. The reader emits parts in post-order, so only the
-/// set of them can be compared. Length breaks ties: rooted mode keeps a unary
-/// node and its child as two parts with one key and one leaf set.
+/// set of them can be compared.
 fn sort_facts(facts: &mut [Fact]) {
-    facts.sort_unstable_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)).then(a.2.total_cmp(&b.2)));
+    facts.sort_unstable_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
 }
 
 /// One tree's parts as order-free facts.
@@ -932,6 +931,78 @@ fn reader_ignores_what_does_not_change_the_tree() {
             part_facts(&snapshot_of(plain, false), false),
             "{text}"
         );
+    }
+}
+
+/// A unary node is no branch point, so in either mode a tree must read and
+/// compare as the same tree written without it: its edge joins the edge below,
+/// and a unary root's edge, which cuts off every taxon, is no split or clade.
+#[test]
+fn unary_nodes_read_as_the_tree_without_them() {
+    // A unary node above {A,B}, against a tree with the clade {A,C}.
+    let rooted_rf =
+        Snapshots::from_newicks(&["(((A:1,B:1):1):1,C:1);", "((A:1,C:1):1,B:1);"], true)
+            .unwrap()
+            .pairwise_rf(None);
+    assert_eq!(rooted_rf[1], 2);
+
+    // Every distance and export of a tree against `OTHER`. Export columns
+    // follow the leaf sets rather than the split IDs, so two runs line up.
+    const OTHER: &str = "(((A:2,C:1):1,B:3):2,(D:1,E:4):1);";
+    let observed = |tree: &str, rooted: bool| {
+        let snaps = Snapshots::from_newicks(&[tree, OTHER], rooted).unwrap();
+        let (presence, cols) = snaps.build_presence_matrix();
+        (
+            snaps.pairwise_rf(None),
+            snaps.pairwise_wrf(None),
+            snaps.pairwise_kf(None),
+            presence,
+            snaps.build_branch_length_matrix().0,
+            snaps.build_bipartition_bytes(&cols),
+        )
+    };
+
+    for (text, plain) in [
+        (
+            "((((A:1,B:1):1):2,C:1):1,(D:1,E:1):1);",
+            "(((A:1,B:1):3,C:1):1,(D:1,E:1):1);",
+        ),
+        // A chain of two.
+        (
+            "(((((A:1,B:1):1):2):4,C:1):1,(D:1,E:1):1);",
+            "(((A:1,B:1):7,C:1):1,(D:1,E:1):1);",
+        ),
+        // Directly above a leaf.
+        (
+            "(((A:1):2,B:1):1,C:1,(D:1,E:1):1);",
+            "((A:3,B:1):1,C:1,(D:1,E:1):1);",
+        ),
+        // Unary roots, over a polytomy, a bifurcation, and a chain.
+        (
+            "((A:1,B:1,C:1,(D:1,E:1):1):2);",
+            "(A:1,B:1,C:1,(D:1,E:1):1);",
+        ),
+        (
+            "((((A:1,B:1):1,C:1):1,(D:1,E:1):1));",
+            "(((A:1,B:1):1,C:1):1,(D:1,E:1):1);",
+        ),
+        (
+            "(((((A:1,B:1):1,C:1):1,(D:1,E:1):1):1):3);",
+            "(((A:1,B:1):1,C:1):1,(D:1,E:1):1);",
+        ),
+    ] {
+        for rooted in [false, true] {
+            assert_eq!(
+                part_facts(&snapshot_of(text, rooted), rooted),
+                part_facts(&snapshot_of(plain, rooted), rooted),
+                "{text} (rooted: {rooted})"
+            );
+            assert_eq!(
+                observed(text, rooted),
+                observed(plain, rooted),
+                "{text} (rooted: {rooted})"
+            );
+        }
     }
 }
 
@@ -1066,12 +1137,24 @@ impl Subtree {
     }
 }
 
+/// `subtree`, now and then under a unary node.
+fn sometimes_unary(subtree: Subtree, rng: &mut Lcg) -> Subtree {
+    if rng.below(12) == 0 {
+        Subtree::node(vec![subtree], "", "", rng)
+    } else {
+        subtree
+    }
+}
+
 /// A random tree over `n` taxa, dressed the way real files are: polytomies,
-/// the odd unary node, support values on internal nodes, annotations and blank
-/// space. Returns the text and the edges it was built from.
+/// the odd unary node above a leaf, an internal node or the root, support
+/// values on internal nodes, annotations and blank space. Returns the text and
+/// the edges it was built from.
 fn decorated_tree(n: usize, rng: &mut Lcg) -> (String, Edges) {
     const SPACE: [&str; 5] = ["", "", " ", "\n", "  "];
-    let mut subtrees: Vec<Subtree> = (0..n as u32).map(|i| Subtree::leaf(i, rng)).collect();
+    let mut subtrees: Vec<Subtree> = (0..n as u32)
+        .map(|i| sometimes_unary(Subtree::leaf(i, rng), rng))
+        .collect();
     while subtrees.len() > 4 {
         let arity = 2 + rng.below(3).min(subtrees.len() - 4);
         let children = (0..arity)
@@ -1079,11 +1162,8 @@ fn decorated_tree(n: usize, rng: &mut Lcg) -> (String, Edges) {
             .collect();
         let sep = format!(",{}", rng.pick(&SPACE));
         let label = rng.pick(&["", "", "0.97", "100", "clade_x"]);
-        let mut node = Subtree::node(children, &sep, label, rng);
-        if rng.below(12) == 0 {
-            node = Subtree::node(vec![node], "", "", rng);
-        }
-        subtrees.push(node);
+        let node = Subtree::node(children, &sep, label, rng);
+        subtrees.push(sometimes_unary(node, rng));
     }
     // Two, three or four children at the root.
     let keep = 2 + rng.below(3);
@@ -1091,6 +1171,11 @@ fn decorated_tree(n: usize, rng: &mut Lcg) -> (String, Edges) {
         let a = subtrees.swap_remove(rng.below(subtrees.len()));
         let b = subtrees.swap_remove(rng.below(subtrees.len()));
         subtrees.push(Subtree::node(vec![a, b], ",", "", rng));
+    }
+    // Now and then one node above them all, the root's only child.
+    if rng.below(6) == 0 {
+        let children = std::mem::take(&mut subtrees);
+        subtrees.push(Subtree::node(children, ", ", "", rng));
     }
     let prefix = rng.pick(&["", "[&R] ", "[&U]"]);
     let texts: Vec<&str> = subtrees.iter().map(|s| s.text.as_str()).collect();
@@ -1102,8 +1187,9 @@ fn decorated_tree(n: usize, rng: &mut Lcg) -> (String, Edges) {
 /// The facts a tree must read as, worked out from the edges it was built from
 /// rather than from its text. Taxon `i` is bit `i`.
 ///
-/// Rooted, every edge is its own clade. Unrooted, the other side of a pendant
-/// edge is dropped, a split keeps the side without leaf 0, and edges that cut
+/// Rooted, every edge is a clade except one that cuts off every taxon, which
+/// only a unary root has. Unrooted, the other side of a pendant edge is dropped
+/// too, and a split keeps the side without leaf 0. Either way, edges that cut
 /// the same split merge into one with their lengths summed.
 fn expected_facts(edges: &Edges, n: usize, rooted: bool) -> Vec<Fact> {
     let labels = taxon_labels(n);
@@ -1113,15 +1199,15 @@ fn expected_facts(edges: &Edges, n: usize, rooted: bool) -> Vec<Fact> {
         let fp = leaves
             .iter()
             .fold(0, |acc, &bit| acc ^ labels[bit as usize]);
-        if rooted {
-            facts.push((fp, leaves.clone(), *length));
-            continue;
-        }
         let pendant = leaves.len() == 1;
-        if !pendant && leaves.len() >= n - 1 {
+        let (key, side) = if rooted {
+            if leaves.len() == n {
+                continue;
+            }
+            (fp, leaves.clone())
+        } else if !pendant && leaves.len() >= n - 1 {
             continue;
-        }
-        let (key, side) = if pendant || !leaves.contains(&0) {
+        } else if pendant || !leaves.contains(&0) {
             (
                 if pendant { fp } else { fp.min(fp ^ total) },
                 leaves.clone(),
