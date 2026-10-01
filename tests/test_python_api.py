@@ -947,6 +947,31 @@ class TestPairwiseRFFromNewickIter:
         assert rf1 == rf2
 
 
+def _csr_rows(sparse):
+    """Split a CSR payload into the (start, stop) bounds of each tree's entries."""
+    offsets = np.frombuffer(sparse["row_offsets"], dtype=np.uint64)
+    return list(zip(offsets[:-1], offsets[1:]))
+
+
+def _dense_presence(sparse, n_trees, n_bip):
+    """Expand a sparse presence payload into the n_trees × n_bip uint8 matrix."""
+    columns = np.frombuffer(sparse["column_indices"], dtype=np.uint32)
+    presence = np.zeros((n_trees, n_bip), dtype=np.uint8)
+    for i, (start, stop) in enumerate(_csr_rows(sparse)):
+        presence[i, columns[start:stop]] = 1
+    return presence
+
+
+def _dense_lengths(sparse, n_trees, n_bip):
+    """Expand a sparse branch-length payload into the n_trees × n_bip float64 matrix, absent edges 0.0."""
+    columns = np.frombuffer(sparse["column_indices"], dtype=np.uint32)
+    lengths = np.frombuffer(sparse["lengths"], dtype=np.float64)
+    bl = np.zeros((n_trees, n_bip))
+    for i, (start, stop) in enumerate(_csr_rows(sparse)):
+        bl[i, columns[start:stop]] = lengths[start:stop]
+    return bl
+
+
 class TestPairwiseRFWithSnapshots:
     """Tests for pairwise_rf_with_snapshots_from_newick_iter (6-tuple API)."""
 
@@ -969,7 +994,7 @@ class TestPairwiseRFWithSnapshots:
         assert isinstance(rf_bytes, bytes)
         assert isinstance(leaf_names, list)
         assert isinstance(n_bip, int)
-        assert isinstance(pres_bytes, bytes)
+        assert isinstance(pres_bytes, dict)
         assert isinstance(bip_clade_bytes, bytes)
 
     def test_rf_bytes_known_values(self):
@@ -981,20 +1006,31 @@ class TestPairwiseRFWithSnapshots:
             for j in range(len(FIXTURE_RF)):
                 assert matrix[i, j] == FIXTURE_RF[i][j], f"RF mismatch at [{i}][{j}]"
 
-    def test_presence_bytes_shape_and_range(self):
-        """presence_bytes encodes an n_trees × n_bip uint8 matrix of 0s and 1s."""
-        names, _, _, n_bip, pres_bytes, *_ = self._call()
+    def test_presence_payload_is_csr(self):
+        """The presence payload is a CSR dict whose rows expand to a 0/1 matrix."""
+        names, _, _, n_bip, sparse, *_ = self._call()
         n = len(names)
-        assert len(pres_bytes) == n * n_bip
-        presence = np.frombuffer(pres_bytes, dtype=np.uint8).reshape(n, n_bip)
-        assert set(presence.flatten().tolist()) <= {0, 1}
+        assert set(sparse) == {"format_version", "encoding", "n_entries", "row_offsets", "column_indices"}
+        assert (sparse["format_version"], sparse["encoding"]) == (1, "csr")
+        assert len(sparse["row_offsets"]) == (n + 1) * 8
+        assert len(sparse["column_indices"]) == sparse["n_entries"] * 4
+        presence = _dense_presence(sparse, n, n_bip)
+        assert presence.sum() == sparse["n_entries"]
+
+    def test_csr_rows_strictly_ascending(self):
+        """Each tree's columns ascend, so no clade is listed twice."""
+        *_, sparse, _ = self._call()
+        columns = np.frombuffer(sparse["column_indices"], dtype=np.uint32)
+        for start, stop in _csr_rows(sparse):
+            row = columns[start:stop]
+            assert np.all(row[:-1] < row[1:])
 
     def test_xor_identity(self):
         """sum(presence[i] XOR presence[j]) equals RF(i, j) for every pair."""
         names, rf_bytes, _, n_bip, pres_bytes, *_ = self._call()
         n = len(names)
         rf = np.frombuffer(rf_bytes, dtype=np.uint32).reshape(n, n)
-        presence = np.frombuffer(pres_bytes, dtype=np.uint8).reshape(n, n_bip).astype(np.int32)
+        presence = _dense_presence(pres_bytes, n, n_bip).astype(np.int32)
         for i in range(n):
             for j in range(n):
                 xor_sum = int(np.sum(np.abs(presence[i] - presence[j])))
@@ -1022,7 +1058,7 @@ class TestPairwiseRFWithSnapshots:
         assert r1[1] == r2[1]  # rf_bytes
         assert r1[2] == r2[2]  # leaf_names
         assert r1[3] == r2[3]  # n_bip
-        assert r1[4] == r2[4]  # presence_bytes
+        assert r1[4] == r2[4]  # sparse presence
         assert r1[5] == r2[5]  # bip_clade_bytes
 
     def test_bip_clade_bytes_length(self):
@@ -1251,7 +1287,7 @@ class TestPairwiseRFWithSnapshots:
             )
         )
 
-        presence = np.frombuffer(pres_bytes, dtype=np.uint8).reshape(3, n_bip).copy()
+        presence = _dense_presence(pres_bytes, 3, n_bip)
 
         # Decode bitmasks and map each bipartition frozenset → its column index
         n_leaves = len(leaf_names)
@@ -1302,6 +1338,46 @@ class TestPairwiseRFWithSnapshots:
         assert_col(s(*"GHIJKLMNO"),     [0, 0, 1])  # canonical of {A,B,C,D,E,F} | rest
 
 
+class TestSparseSnapshots:
+    """Tests for the CSR membership payload of pairwise_rf_with_snapshots_from_newick_iter."""
+
+    @staticmethod
+    def _args(trees):
+        return [f"t{i}" for i in range(len(trees))], iter(trees), FIXTURE_TRANSLATE, [0] * len(trees)
+
+    @pytest.mark.parametrize("rooted", [False, True])
+    def test_rows_reproduce_rf(self, rooted):
+        """Setting each row's columns to 1 gives presence rows whose Hamming distances are the RF matrix."""
+        names, rf_bytes, _, n_bip, sparse, _ = rtd.pairwise_rf_with_snapshots_from_newick_iter(
+            *self._args(FIXTURE_TREES), rooted=rooted
+        )
+        n = len(names)
+        presence = _dense_presence(sparse, n, n_bip).astype(np.int32)
+        rf = np.frombuffer(rf_bytes, dtype=np.uint32).reshape(n, n)
+        hamming = np.abs(presence[:, None, :] - presence[None, :, :]).sum(axis=2)
+        assert np.array_equal(hamming, rf)
+        assert sparse["n_entries"] == presence.sum()
+
+    def test_polytomy_rows_known_values(self):
+        """A rooted star tree holds only its four pendant clades, so its row is shorter than the binary tree's. Columns ascend by packed leaf set: A, B, AB, C, D, CD."""
+        trees = ["(A:1,B:1,C:1,D:1);", "((A:1,B:1):1,(C:1,D:1):1);"]
+        *_, sparse, _ = rtd.pairwise_rf_with_snapshots_from_newick_iter(*self._args(trees), rooted=True)
+        assert (sparse["format_version"], sparse["encoding"], sparse["n_entries"]) == (1, "csr", 10)
+        columns = np.frombuffer(sparse["column_indices"], dtype=np.uint32)
+        assert [columns[start:stop].tolist() for start, stop in _csr_rows(sparse)] == [[0, 1, 3, 4], [0, 1, 2, 3, 4, 5]]
+
+    def test_sparse_lengths_known_values(self):
+        """The weighted payload pairs each column with its branch length, in the same row layout."""
+        trees = ["(A:1,B:2,C:3,D:4);", "((A:1,B:2):5,(C:3,D:4):6);"]
+        *_, sparse, _ = rtd.pairwise_wrf_with_snapshots_from_newick_iter(*self._args(trees), rooted=True)
+        assert sparse["n_entries"] == 10
+        lengths = np.frombuffer(sparse["lengths"], dtype=np.float64)
+        assert [lengths[start:stop].tolist() for start, stop in _csr_rows(sparse)] == [
+            [1.0, 2.0, 3.0, 4.0],
+            [1.0, 2.0, 5.0, 3.0, 4.0, 6.0],
+        ]
+
+
 @pytest.mark.skipif(not RUST_MODULE_AVAILABLE, reason="rapidtrees not available")
 class TestPairwiseWrfWithSnapshots:
     """Tests for pairwise_wrf_with_snapshots_from_newick_iter (6-tuple API)."""
@@ -1332,7 +1408,7 @@ class TestPairwiseWrfWithSnapshots:
         assert isinstance(wrf_bytes, bytes)
         assert isinstance(leaf_names, list)
         assert isinstance(n_bip, int)
-        assert isinstance(bl_bytes, bytes)
+        assert isinstance(bl_bytes, dict)
         assert isinstance(bip_clade_bytes, bytes)
 
     def test_wrf_bytes_shape(self):
@@ -1344,18 +1420,22 @@ class TestPairwiseWrfWithSnapshots:
         assert np.allclose(np.diag(wrf), 0.0)
         assert np.allclose(wrf, wrf.T)
 
-    def test_branch_length_bytes_shape(self):
-        """branch_length_bytes is n_trees × n_bip × 8 bytes (float64)."""
-        names, _, _, n_bip, bl_bytes, _ = self._call()
+    def test_branch_length_payload_is_csr(self):
+        """The branch-length payload is a CSR dict with one float64 length per entry."""
+        names, _, _, n_bip, bl, _ = self._call()
         n = len(names)
-        assert len(bl_bytes) == n * n_bip * 8
+        assert set(bl) == {"format_version", "encoding", "n_entries", "row_offsets", "column_indices", "lengths"}
+        assert len(bl["row_offsets"]) == (n + 1) * 8
+        assert len(bl["column_indices"]) == bl["n_entries"] * 4
+        assert len(bl["lengths"]) == bl["n_entries"] * 8
+        assert _dense_lengths(bl, n, n_bip).shape == (n, n_bip)
 
     def test_wrf_identity(self):
         """sum(|bl[i,:] - bl[j,:]|) == wrf[i,j] for all pairs (L1 identity)."""
         names, wrf_bytes, _, n_bip, bl_bytes, _ = self._call()
         n = len(names)
         wrf = np.frombuffer(wrf_bytes, dtype=np.float64).reshape(n, n)
-        bl = np.frombuffer(bl_bytes, dtype=np.float64).reshape(n, n_bip)
+        bl = _dense_lengths(bl_bytes, n, n_bip)
         for i in range(n):
             for j in range(n):
                 computed = float(np.sum(np.abs(bl[i] - bl[j])))
@@ -1368,7 +1448,7 @@ class TestPairwiseWrfWithSnapshots:
         """sqrt(sum((bl[i,:]-bl[j,:])**2)) matches pairwise_kf_from_newick_iter."""
         names, _, _, n_bip, bl_bytes, _ = self._call()
         n = len(names)
-        bl = np.frombuffer(bl_bytes, dtype=np.float64).reshape(n, n_bip)
+        bl = _dense_lengths(bl_bytes, n, n_bip)
 
         _, kf_flat = rtd.pairwise_kf_from_newick_iter(
             self.SIMPLE_NAMES, iter(self.SIMPLE_TREES), [{}], [0, 0, 0]
@@ -1403,7 +1483,7 @@ class TestPairwiseWrfWithSnapshots:
         bip_arr = np.frombuffer(bip_clade_bytes, dtype=np.uint8).reshape(n_bip, bytes_per_bip)
         bip_bool = np.unpackbits(bip_arr, axis=1, bitorder='little')[:, :n_leaves]
         pendant_cols = np.where(bip_bool.sum(axis=1) == 1)[0]
-        bl = np.frombuffer(bl_bytes, dtype=np.float64).reshape(n, n_bip)
+        bl = _dense_lengths(bl_bytes, n, n_bip)
         assert len(pendant_cols) == n_leaves
         for col in pendant_cols:
             assert np.all(bl[:, col] > 0.0), f"Pendant column {col} has a zero entry"
@@ -1461,7 +1541,7 @@ class TestPairwiseKfWithSnapshots:
         assert isinstance(kf_bytes, bytes)
         assert isinstance(leaf_names, list)
         assert isinstance(n_bip, int)
-        assert isinstance(bl_bytes, bytes)
+        assert isinstance(bl_bytes, dict)
         assert isinstance(bip_clade_bytes, bytes)
 
     def test_kf_bytes_shape(self):
@@ -1473,18 +1553,22 @@ class TestPairwiseKfWithSnapshots:
         assert np.allclose(np.diag(kf), 0.0)
         assert np.allclose(kf, kf.T)
 
-    def test_branch_length_bytes_shape(self):
-        """branch_length_bytes is n_trees × n_bip × 8 bytes (float64)."""
-        names, _, _, n_bip, bl_bytes, _ = self._call()
+    def test_branch_length_payload_is_csr(self):
+        """The branch-length payload is a CSR dict with one float64 length per entry."""
+        names, _, _, n_bip, bl, _ = self._call()
         n = len(names)
-        assert len(bl_bytes) == n * n_bip * 8
+        assert set(bl) == {"format_version", "encoding", "n_entries", "row_offsets", "column_indices", "lengths"}
+        assert len(bl["row_offsets"]) == (n + 1) * 8
+        assert len(bl["column_indices"]) == bl["n_entries"] * 4
+        assert len(bl["lengths"]) == bl["n_entries"] * 8
+        assert _dense_lengths(bl, n, n_bip).shape == (n, n_bip)
 
     def test_kf_identity(self):
         """sqrt(sum((bl[i,:]-bl[j,:])**2)) == kf[i,j] for all pairs (L2 identity)."""
         names, kf_bytes, _, n_bip, bl_bytes, _ = self._call()
         n = len(names)
         kf = np.frombuffer(kf_bytes, dtype=np.float64).reshape(n, n)
-        bl = np.frombuffer(bl_bytes, dtype=np.float64).reshape(n, n_bip)
+        bl = _dense_lengths(bl_bytes, n, n_bip)
         for i in range(n):
             for j in range(n):
                 computed = float(np.sqrt(np.sum((bl[i] - bl[j]) ** 2)))
@@ -1505,7 +1589,7 @@ class TestPairwiseKfWithSnapshots:
         assert np.allclose(kf_s, kf_i)
 
     def test_branch_length_matches_wrf_snapshot(self):
-        """branch_length_bytes is identical to the one from pairwise_wrf_with_snapshots."""
+        """the sparse branch lengths are identical to the ones from pairwise_wrf_with_snapshots."""
         _, _, leaf_names_k, n_bip_k, bl_k, bip_k = self._call()
         _, _, leaf_names_w, n_bip_w, bl_w, bip_w = rtd.pairwise_wrf_with_snapshots_from_newick_iter(
             self.SIMPLE_NAMES, iter(self.SIMPLE_TREES), [{}], [0, 0, 0]
@@ -1524,7 +1608,7 @@ class TestPairwiseKfWithSnapshots:
         bip_arr = np.frombuffer(bip_clade_bytes, dtype=np.uint8).reshape(n_bip, bytes_per_bip)
         bip_bool = np.unpackbits(bip_arr, axis=1, bitorder='little')[:, :n_leaves]
         pendant_cols = np.where(bip_bool.sum(axis=1) == 1)[0]
-        bl = np.frombuffer(bl_bytes, dtype=np.float64).reshape(n, n_bip)
+        bl = _dense_lengths(bl_bytes, n, n_bip)
         assert len(pendant_cols) == n_leaves
         for col in pendant_cols:
             assert np.all(bl[:, col] > 0.0), f"Pendant column {col} has a zero entry"

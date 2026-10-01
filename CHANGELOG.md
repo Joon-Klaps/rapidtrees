@@ -19,6 +19,7 @@ This project uses release names based on random words from [codenamegenerator.co
 - ([#50](https://github.com/Joon-Klaps/rapidtrees/pull/50)) - __PERFORMANCE__: The weighted RF and KF sweep fills tiles of tree pairs a panel of columns at a time, so a row is read from memory once per tile instead of once per pair.
 - ([#51](https://github.com/Joon-Klaps/rapidtrees/pull/51)) - __PERFORMANCE__: Trees no longer store the split IDs of their pendant edges, which are the same in every tree, only their branch lengths.
 - ([#57](https://github.com/Joon-Klaps/rapidtrees/pull/57)) - __BUGFIX__: Rooted distances and exports read a tree with unary nodes, a unary root included, as the same tree without them, and rooted weighted RF and KF no longer panic on such a tree.
+- ([#58](https://github.com/Joon-Klaps/rapidtrees/pull/58)) - __FEATURE__ __BREAKING API CHANGE__: `pairwise_rf_with_snapshots_from_newick_iter`, `pairwise_wrf_with_snapshots_from_newick_iter` and `pairwise_kf_with_snapshots_from_newick_iter` return the tree-by-clade presence or branch-length matrix as compressed sparse rows instead of a dense matrix.
 
 ## [0.10.0] - Surface Copperhead (2026-09-24)
 

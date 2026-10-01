@@ -1,13 +1,50 @@
 //! Robinson–Foulds entry points.
 
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyIterator};
+use pyo3::types::{PyBytes, PyDict, PyIterator};
 use std::collections::HashMap;
 
 use super::input::{IterInput, collect_snapshots_from_iter, validate_iter_args};
 use super::progress::{ProgressCounter, with_counter};
 use super::{PyRfSnapshotResult, n_pairs};
-use crate::snapshot::Retain;
+use crate::snapshot::{Retain, Snapshots};
+
+/// Shared body of the RF snapshot-exporting entry points.
+///
+/// They differ only in how they encode which clades each tree holds: `membership` builds that payload and returns it with the column order the clade bitmasks must follow. The tuple comes back in the dense endpoint's order, payload fifth and clade bitmasks sixth.
+fn rf_with_snapshots(
+    py: Python<'_>,
+    names: Vec<String>,
+    input: IterInput<'_, '_>,
+    progress: Option<Py<ProgressCounter>>,
+    membership: impl FnOnce(&Snapshots) -> PyResult<(Py<PyAny>, Vec<usize>)>,
+) -> PyResult<PyRfSnapshotResult> {
+    validate_iter_args(&names, input.map_indices, input.translate_maps)?;
+    let snaps = collect_snapshots_from_iter(
+        input,
+        Retain {
+            lengths: false,
+            bipartitions: true,
+        },
+    )?;
+
+    let rf_matrix = with_counter(py, progress, n_pairs(snaps.len()), |counter| {
+        snaps.pairwise_rf(Some(counter))
+    })?;
+    let rf_bytes: Vec<u8> = rf_matrix.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let (payload, col_to_bip_id) = membership(&snaps)?;
+    let clade_bytes = snaps.build_bipartition_bytes(&col_to_bip_id);
+    let n_clades = snaps.n_distinct_splits();
+
+    Ok((
+        names,
+        PyBytes::new(py, &rf_bytes).into(),
+        snaps.leaf_names,
+        n_clades,
+        payload,
+        PyBytes::new(py, &clade_bytes).into(),
+    ))
+}
 
 /// Compute pairwise Robinson-Foulds distances from a lazy Python iterator of newick strings.
 ///
@@ -74,17 +111,29 @@ pub(super) fn pairwise_rf_from_newick_iter(
     Ok((names, py_rf.into()))
 }
 
-/// Compute pairwise RF distances and export binary tree snapshots in a single pass.
+/// Compute pairwise RF distances and export tree snapshots in a single pass.
 ///
-/// Parses each newick once, building both the RF distance matrix and a binary
-/// presence matrix encoding which bipartitions appear in each tree.
+/// Parses each newick once, building both the RF distance matrix and the tree-by-bipartition
+/// presence matrix, stored as compressed sparse rows (CSR) so a tree costs one entry per
+/// bipartition it holds rather than one byte per bipartition in the collection.
 ///
 /// # Presence matrix format
 ///
-/// Shape `(n_trees, n_bipartitions)`, encoded as a flat row-major `uint8` byte buffer.
-/// Column ordering is deterministic and stable across calls on the same tree set. Reconstruct on the Python side:
+/// The fifth element is a dict with these keys:
+///
+/// - `format_version`: `1`.
+/// - `encoding`: `"csr"`.
+/// - `n_entries`: total number of (tree, bipartition) entries.
+/// - `row_offsets`: native-endian `uint64` bytes, `n_trees + 1` values.
+/// - `column_indices`: native-endian `uint32` bytes, `n_entries` values.
+///
+/// Tree `i` holds the columns `column_indices[row_offsets[i]:row_offsets[i + 1]]`, ascending and in the column order of `bipartition_clade_bytes`, which is stable across calls on the same tree set. Reconstruct the dense matrix on the Python side:
 /// ```python
-/// presence = np.frombuffer(pres_bytes, dtype=np.uint8).reshape(n_trees, n_bip).copy()
+/// offsets = np.frombuffer(sparse["row_offsets"], dtype=np.uint64)
+/// columns = np.frombuffer(sparse["column_indices"], dtype=np.uint32)
+/// presence = np.zeros((n_trees, n_bip), dtype=np.uint8)
+/// for i in range(n_trees):
+///     presence[i, columns[offsets[i]:offsets[i + 1]]] = 1
 /// ```
 ///
 /// # Bipartition clade bytes
@@ -126,7 +175,7 @@ pub(super) fn pairwise_rf_from_newick_iter(
 ///         ``pairwise_rf_from_newick_iter`` for details.
 ///
 /// Returns:
-///     6-tuple (tree_names, rf_matrix_bytes, leaf_names, n_bipartitions, presence_bytes,
+///     6-tuple (tree_names, rf_matrix_bytes, leaf_names, n_bipartitions, sparse_presence,
 ///     bipartition_clade_bytes).
 ///
 /// Raises:
@@ -142,46 +191,20 @@ pub(super) fn pairwise_rf_with_snapshots_from_newick_iter(
     rooted: bool,
     progress: Option<Py<ProgressCounter>>,
 ) -> PyResult<PyRfSnapshotResult> {
-    validate_iter_args(&names, &map_indices, &translate_maps)?;
-
     let input = IterInput {
         newick_iter,
         translate_maps: &translate_maps,
         map_indices: &map_indices,
         rooted,
     };
-
-    let snaps = collect_snapshots_from_iter(
-        input,
-        Retain {
-            lengths: false,
-            bipartitions: true,
-        },
-    )?;
-
-    let n = snaps.snapshots.len();
-    let rf_matrix = with_counter(py, progress, n_pairs(n), |counter| {
-        snaps.pairwise_rf(Some(counter))
-    })?;
-    let rf_bytes: Vec<u8> = rf_matrix
-        .chunks(n)
-        .flat_map(|row| row.iter().flat_map(|&v: &u32| v.to_ne_bytes()))
-        .collect();
-
-    let n_bipartitions = snaps.n_distinct_splits();
-    let (presence_vec, col_to_bip_id) = snaps.build_presence_matrix();
-    let leaf_names = snaps.leaf_names.clone();
-    let bip_clade_bytes = snaps.build_bipartition_bytes(&col_to_bip_id);
-
-    let py_rf = PyBytes::new(py, &rf_bytes);
-    let py_pres = PyBytes::new(py, &presence_vec);
-    let py_bip = PyBytes::new(py, &bip_clade_bytes);
-    Ok((
-        names,
-        py_rf.into(),
-        leaf_names,
-        n_bipartitions,
-        py_pres.into(),
-        py_bip.into(),
-    ))
+    rf_with_snapshots(py, names, input, progress, |snaps| {
+        let (row_offsets, column_indices, col_to_bip_id) = snaps.build_sparse_presence_matrix();
+        let sparse = PyDict::new(py);
+        sparse.set_item("format_version", 1)?;
+        sparse.set_item("encoding", "csr")?;
+        sparse.set_item("n_entries", column_indices.len() / size_of::<u32>())?;
+        sparse.set_item("row_offsets", PyBytes::new(py, &row_offsets))?;
+        sparse.set_item("column_indices", PyBytes::new(py, &column_indices))?;
+        Ok((sparse.into_any().unbind(), col_to_bip_id))
+    })
 }
