@@ -712,6 +712,16 @@ class TestRootedRF:
 
         assert matrix_default == matrix_explicit
 
+    def test_unary_nodes_do_not_change_rooted_rf(self):
+        """A unary node, at the root or below it, compares as the tree without it."""
+        trees = [
+            "(((A:1,B:1):1):1,C:1);",  # ((A,B),C) with a unary node above (A,B)
+            "((A:1,C:1):1,B:1);",
+            "(((A:1,B:1):1,C:1));",  # ((A,B),C) with a unary root
+        ]
+        _, matrix = _pairwise_rf_from_newicks_compat(["t0", "t1", "t2"], trees, [{}], [0, 0, 0], rooted=True)
+        assert matrix == [[0, 2, 0], [2, 0, 2], [0, 2, 0]]
+
 
 class TestPairwiseRFFromNewicks:
     """Tests for pairwise_rf_from_newicks (newick list, no iterator)."""
