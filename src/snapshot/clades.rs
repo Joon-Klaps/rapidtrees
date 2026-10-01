@@ -36,10 +36,24 @@ impl Default for CladeTable {
 
 impl CladeTable {
     pub(crate) fn new() -> Self {
+        Self::with_capacity(0, 0)
+    }
+
+    /// An empty table with room for `clades` clades holding `leaves` leaf
+    /// indices between them, so that filling it to that size never reallocates.
+    pub(crate) fn with_capacity(clades: usize, leaves: usize) -> Self {
+        let mut starts = Vec::with_capacity(clades + 1);
+        starts.push(0);
         Self {
-            leaves: Vec::new(),
-            starts: vec![0],
+            leaves: Vec::with_capacity(leaves),
+            starts,
         }
+    }
+
+    /// Number of leaf indices across all clades.
+    #[inline]
+    pub(crate) fn n_leaves(&self) -> usize {
+        self.leaves.len()
     }
 
     /// Number of distinct splits in the table.
@@ -53,6 +67,14 @@ impl CladeTable {
     pub(crate) fn get(&self, i: usize) -> &[u32] {
         let (lo, hi) = (self.starts[i] as usize, self.starts[i + 1] as usize);
         &self.leaves[lo..hi]
+    }
+
+    /// Append every clade of `other`, in order.
+    pub(crate) fn append(&mut self, other: CladeTable) {
+        let base = self.leaves.len() as u32;
+        self.leaves.extend_from_slice(&other.leaves);
+        self.starts
+            .extend(other.starts[1..].iter().map(|&start| start + base));
     }
 
     /// Append one clade from the leaves it contains, in any order.
@@ -130,6 +152,32 @@ mod tests {
         assert_eq!(t.len(), 2);
         assert_eq!(t.get(0), &[0, 2]);
         assert_eq!(t.get(1), &[1, 3, 5]);
+    }
+
+    #[test]
+    fn append_keeps_both_tables_clades_in_order() {
+        let mut first = table(&[&[2, 0], &[1]]);
+        first.append(table(&[&[4, 3], &[], &[5]]));
+        assert_eq!(first.len(), 5);
+        assert_eq!(first.get(0), &[0, 2]);
+        assert_eq!(first.get(2), &[3, 4]);
+        assert_eq!(first.get(3), &[] as &[u32]);
+        assert_eq!(first.get(4), &[5]);
+    }
+
+    #[test]
+    fn with_capacity_holds_appended_tables_without_growing() {
+        let parts = [table(&[&[2, 0], &[1]]), table(&[&[4, 3], &[], &[5]])];
+        let (clades, leaves) = (5, parts.iter().map(CladeTable::n_leaves).sum());
+        let mut merged = CladeTable::with_capacity(clades, leaves);
+        assert_eq!(merged.len(), 0);
+        for part in parts {
+            merged.append(part);
+        }
+        assert_eq!(merged.n_leaves(), 6);
+        assert_eq!(merged.get(4), &[5]);
+        assert_eq!(merged.leaves.capacity(), leaves);
+        assert_eq!(merged.starts.capacity(), clades + 1);
     }
 
     #[test]
