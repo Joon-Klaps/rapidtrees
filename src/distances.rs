@@ -632,69 +632,6 @@ impl BitRows {
     }
 }
 
-/// RF's bit rows and posting lists, laid out a block of trees at a time, with
-/// every tree's `self` count: its splits less the `n_universal` that every
-/// tree holds.
-fn rf_layout(
-    trees: Trees,
-    counts: &[u32],
-    layout: &Layout,
-    n_universal: usize,
-) -> (BitRows, Postings, Vec<u32>) {
-    let n = trees.len();
-    let words = layout.n_dense.div_ceil(64);
-    // A zero-width row still gets one scratch word, so that every tree is
-    // handed a row; no bit is ever set in it.
-    let width = words.max(1);
-    let mut packed = vec![0u64; n * width];
-    let size = block_size();
-    let mut postings = Postings::sized(counts, layout, size, false);
-    let mut self_count = Vec::with_capacity(n);
-    let mut first = 0;
-    trees.by_blocks(size, |block| {
-        let rows = &mut packed[first * width..(first + block.len()) * width];
-        let posted: Vec<Vec<(u32, f64)>> = rows
-            .par_chunks_mut(width)
-            .zip(block.par_iter())
-            .map(|(row, snap)| {
-                let mut own = Vec::new();
-                for &id in &snap.split_ids {
-                    match column(&layout.column_of, id) {
-                        Some(col) if col < layout.n_dense => row[col / 64] |= 1u64 << (col % 64),
-                        Some(col) => own.push(((col - layout.n_dense) as u32, 0.0)),
-                        None => {}
-                    }
-                }
-                own.sort_unstable_by_key(|&(col, _)| col);
-                own
-            })
-            .collect();
-        postings.push_block(&posted);
-        self_count.extend(
-            block
-                .iter()
-                .map(|snap| (snap.n_splits() - n_universal) as u32),
-        );
-        first += block.len();
-    });
-    postings.fill = Vec::new();
-    if words == 0 {
-        packed = Vec::new();
-    }
-    (BitRows::from_packed(packed, words, n), postings, self_count)
-}
-
-/// The bit/posting boundary RF uses for `n` trees: a split held by fewer than
-/// [`rf_dense_share`] of them gets a posting list, once there are enough trees
-/// for lists to pay.
-fn rf_min_dense(n: usize) -> u32 {
-    if n < RF_MIN_TREES_FOR_POSTINGS {
-        2 // every shareable split gets a bit column
-    } else {
-        min_dense(n, rf_dense_share())
-    }
-}
-
 /// `RF(i, j) = selfᵢ + selfⱼ − 2·shared(i, j)`, where `self` counts a tree's
 /// splits and `shared` the splits both trees hold.
 ///
@@ -743,7 +680,7 @@ fn distance_rf_split(input: Input<'_>, progress: Option<&AtomicUsize>, min_dense
         false,
         |layout, snap, row: &mut [u64]| {
             let mut posted = Vec::new();
-            for &id in &snap.split_ids {
+            for id in snap.ids() {
                 match layout.place(id) {
                     Some(Column::Dense(col)) => row[col / 64] |= 1u64 << (col % 64),
                     Some(Column::Posted(col)) => posted.push((col, 0.0)),
@@ -751,7 +688,7 @@ fn distance_rf_split(input: Input<'_>, progress: Option<&AtomicUsize>, min_dense
                 }
             }
             posted.sort_unstable_by_key(|&(col, _)| col);
-            (posted, (snap.split_ids.len() - n_universal) as u32)
+            (posted, (snap.n_splits() - n_universal) as u32)
         },
     );
     let bits = BitRows::new(rows, n);
@@ -851,25 +788,15 @@ fn weighted_lay_out(
         input,
         layout,
         stride,
-        blocks: Vec::with_capacity(n.div_ceil(size)),
-    };
-    let mut postings = Postings::sized(counts, layout, size, true);
-    let mut self_total = Vec::with_capacity(n);
-    trees.by_blocks(size, |block| {
-        let mut rows = vec![0.0f64; block.len() * width];
-        let (posted, selfs): (Vec<Vec<(u32, f64)>>, Vec<f64>) = rows
-            .par_chunks_mut(width)
-            .zip(block.par_iter())
-            .map(|(row, snap)| {
-                let row = &mut row[..stride];
-                let mut own = Vec::new();
-                let mut unique_self = 0.0;
-                for (id, &length) in snap.ids().zip(&snap.lengths) {
-                    match column(&layout.column_of, id) {
-                        Some(col) if col < stride => row[col] = length,
-                        Some(col) => own.push(((col - stride) as u32, length)),
-                        None => unique_self += overlap(length, length),
-                    }
+        true,
+        |layout, snap, row: &mut [f64]| {
+            let mut posted = Vec::new();
+            let mut unique_self = 0.0;
+            for (id, &length) in snap.ids().zip(&snap.lengths) {
+                match layout.place(id) {
+                    Some(Column::Dense(col)) => row[col] = length,
+                    Some(Column::Posted(col)) => posted.push((col, length)),
+                    None => unique_self += overlap(length, length),
                 }
             }
             posted.sort_unstable_by_key(|&(col, _)| col);
