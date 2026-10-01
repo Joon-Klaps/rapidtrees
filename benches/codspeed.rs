@@ -23,7 +23,7 @@
 //! name cannot drift from what it measures: a malformed one panics with the
 //! expected pattern.
 //!
-//! `load_real_hiv_4x21trees_162taxa` loads the four real BEAST posteriors in
+//! `load_real::hiv_4x21trees_162taxa` loads the four real BEAST posteriors in
 //! `tests/data` (git LFS), annotations and TRANSLATE blocks included.
 //!
 //! The trees come from the manuscript simulator's generator
@@ -50,13 +50,21 @@ fn main() {
 
 // --- the grid -----------------------------------------------------------------
 
-/// One `#[divan::bench]` per name, each measuring the cell its name spells out.
+/// One `#[divan::bench]` per name, each measuring the cell its name spells out,
+/// in a module per group. The group is the bench path's middle segment
+/// (`codspeed::rf::rf_100trees_500taxa_q40`), which is what CI shards on.
 macro_rules! benches {
-    ($($name:ident),* $(,)?) => {
+    ($($group:ident : [$($name:ident),* $(,)?]),* $(,)?) => {
         $(
-            #[divan::bench]
-            fn $name(bencher: divan::Bencher) {
-                Cell::from_name(stringify!($name)).bench(bencher);
+            mod $group {
+                use super::*;
+
+                $(
+                    #[divan::bench]
+                    fn $name(bencher: divan::Bencher) {
+                        Cell::from_name(stringify!($name)).bench(bencher);
+                    }
+                )*
             }
         )*
     };
@@ -65,59 +73,73 @@ macro_rules! benches {
 benches! {
     // Loading a file: a posterior-sized set with and without BEAST annotations,
     // and a wide one, where the file's text dwarfs what is kept of it.
-    load_1000trees_500taxa_q40,
-    load_1000trees_500taxa_q40_annotated,
-    load_20trees_50000taxa_q40,
-    load_20trees_50000taxa_q40_1thread,
+    load: [
+        load_1000trees_500taxa_q40,
+        load_1000trees_500taxa_q40_annotated,
+        load_20trees_50000taxa_q40,
+        load_20trees_50000taxa_q40_1thread,
+    ],
 
     // Construction: a small cell, and wide ones where the per-tree build dominates.
-    build_100trees_500taxa_q40,
-    build_100trees_500taxa_q100,
-    build_50trees_4000taxa_q40,
-    build_50trees_4000taxa_q40_1thread,
-    build_20trees_50000taxa_q40,
+    build: [
+        build_100trees_500taxa_q40,
+        build_100trees_500taxa_q100,
+        build_50trees_4000taxa_q40,
+        build_50trees_4000taxa_q40_1thread,
+        build_20trees_50000taxa_q40,
+    ],
 
     // RF: small guards, the pair sweep on a posterior, independent and
     // near-identical trees, and a wide cell.
-    rf_100trees_500taxa_q40,
-    rf_100trees_500taxa_q100,
-    rf_1500trees_500taxa_q40,
-    rf_1500trees_500taxa_q40_1thread,
-    rf_1500trees_500taxa_q05,
-    rf_300trees_500taxa_q100,
-    rf_300trees_500taxa_q100_1thread,
-    rf_50trees_4000taxa_q40,
-    rf_3000trees_500taxa_q40,
-    rf_20trees_50000taxa_q40,
+    rf: [
+        rf_100trees_500taxa_q40,
+        rf_100trees_500taxa_q100,
+        rf_1500trees_500taxa_q40,
+        rf_1500trees_500taxa_q40_1thread,
+        rf_1500trees_500taxa_q05,
+        rf_300trees_500taxa_q100,
+        rf_300trees_500taxa_q100_1thread,
+        rf_50trees_4000taxa_q40,
+        rf_3000trees_500taxa_q40,
+        rf_20trees_50000taxa_q40,
+    ],
 
     // Weighted RF and KF: small guards and the pair sweep on a posterior and on
     // independent trees.
-    wrf_100trees_500taxa_q40,
-    wrf_100trees_500taxa_q100,
-    wrf_1500trees_500taxa_q40,
-    wrf_300trees_500taxa_q100,
-    kf_100trees_500taxa_q40,
-    kf_100trees_500taxa_q100,
-    kf_1500trees_500taxa_q40,
-    kf_300trees_500taxa_q100,
-    wrf_20trees_50000taxa_q40,
+    weighted: [
+        wrf_100trees_500taxa_q40,
+        wrf_100trees_500taxa_q100,
+        wrf_1500trees_500taxa_q40,
+        wrf_300trees_500taxa_q100,
+        kf_100trees_500taxa_q40,
+        kf_100trees_500taxa_q100,
+        kf_1500trees_500taxa_q40,
+        kf_300trees_500taxa_q100,
+        wrf_20trees_50000taxa_q40,
+    ],
 }
 
 /// The four real BEAST posteriors in `tests/data` (162 taxa, 21 trees each,
 /// `[&rate=...]` annotations and TRANSLATE blocks), loaded as the CLI loads
 /// them for RF.
-#[divan::bench]
-fn load_real_hiv_4x21trees_162taxa(bencher: divan::Bencher) {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
-    let paths: Vec<_> = (1..=4).map(|k| dir.join(format!("hiv{k}.trees"))).collect();
-    for path in &paths {
-        // A checkout without git LFS has pointer files here, which hold no trees.
-        assert!(
-            load(path).len() == 21,
-            "{path:?} holds no trees: fetch it with `git lfs pull`"
-        );
+///
+/// Its module name starts with `load` so that it lands in the `load` CI shard.
+mod load_real {
+    use super::*;
+
+    #[divan::bench]
+    fn hiv_4x21trees_162taxa(bencher: divan::Bencher) {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+        let paths: Vec<_> = (1..=4).map(|k| dir.join(format!("hiv{k}.trees"))).collect();
+        for path in &paths {
+            // A checkout without git LFS has pointer files here, which hold no trees.
+            assert!(
+                load(path).len() == 21,
+                "{path:?} holds no trees: fetch it with `git lfs pull`"
+            );
+        }
+        bencher.bench_local(|| paths.iter().map(|path| load(path)).collect::<Vec<_>>());
     }
-    bencher.bench_local(|| paths.iter().map(|path| load(path)).collect::<Vec<_>>());
 }
 
 // --- cells --------------------------------------------------------------------
