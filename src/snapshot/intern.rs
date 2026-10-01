@@ -116,8 +116,10 @@ impl Shard {
             .ok_or_else(|| "Too many distinct splits for 32-bit split IDs.".to_string())?;
         // Grow by half rather than double: the shards fill evenly, so doubling
         // would leave every one of them oversized by the same large margin.
+        // The floor stays small because it is paid [`SHARDS`] times over: a
+        // floor of 1024 cost 6 MiB per collection however few splits it held.
         if fps.len() == fps.capacity() {
-            let extra = (fps.capacity() / 2).max(1024);
+            let extra = (fps.capacity() / 2).max(16);
             fps.reserve_exact(extra);
             sizes.reserve_exact(extra);
             counts.reserve_exact(extra);

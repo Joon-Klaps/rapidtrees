@@ -1,4 +1,5 @@
 /target
+tests/wasm/target/
 bigdata/
 out/
 Cargo.lock

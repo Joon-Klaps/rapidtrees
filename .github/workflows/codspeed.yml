@@ -13,13 +13,15 @@ on:
 
 env:
     CARGO_TERM_COLOR: always
+    # Pin rayon's pool to the 4 vCPUs of a public-repo `ubuntu-latest` runner, so a change of runner cannot shift results between base and head. The `_1thread` benches build their own one-thread pool.
+    RAYON_NUM_THREADS: 4
 
 jobs:
     benchmarks:
-        # One bench binary (benches/codspeed.rs), measured under two instruments:
+        # One bench binary (benches/codspeed.rs), sharded by bench name and measured under two instruments:
         #   - simulation: deterministic instruction counts (CPU-speed gate)
         #   - memory:     heap allocations per bench (memory gate)
-        name: Benchmarks (${{ matrix.mode }})
+        name: Benchmarks (${{ matrix.mode }}, ${{ matrix.shard }})
         runs-on: ubuntu-latest
         permissions:
             contents: read
@@ -28,9 +30,13 @@ jobs:
             fail-fast: false
             matrix:
                 mode: [simulation, memory]
+                shard: [load, build, rf, weighted]
 
         steps:
             - uses: actions/checkout@v5
+              with:
+                  # The real BEAST posteriors in tests/data are git LFS files.
+                  lfs: true
 
             - name: Setup Rust + cargo-codspeed
               uses: moonrepo/setup-rust@v1
@@ -45,5 +51,5 @@ jobs:
             - name: Run benchmarks
               uses: CodSpeedHQ/action@v4
               with:
-                  run: cargo codspeed run --bench codspeed -m ${{ matrix.mode }}
+                  run: cargo codspeed run --bench codspeed -m ${{ matrix.mode }} '::${{ matrix.shard }}'
                   mode: ${{ matrix.mode }}
