@@ -111,17 +111,29 @@ pub(super) fn pairwise_rf_from_newick_iter(
     Ok((names, py_rf.into()))
 }
 
-/// Compute pairwise RF distances and export binary tree snapshots in a single pass.
+/// Compute pairwise RF distances and export tree snapshots in a single pass.
 ///
-/// Parses each newick once, building both the RF distance matrix and a binary
-/// presence matrix encoding which bipartitions appear in each tree.
+/// Parses each newick once, building both the RF distance matrix and the tree-by-bipartition
+/// presence matrix, stored as compressed sparse rows (CSR) so a tree costs one entry per
+/// bipartition it holds rather than one byte per bipartition in the collection.
 ///
 /// # Presence matrix format
 ///
-/// Shape `(n_trees, n_bipartitions)`, encoded as a flat row-major `uint8` byte buffer.
-/// Column ordering is deterministic and stable across calls on the same tree set. Reconstruct on the Python side:
+/// The fifth element is a dict with these keys:
+///
+/// - `format_version`: `1`.
+/// - `encoding`: `"csr"`.
+/// - `n_entries`: total number of (tree, bipartition) entries.
+/// - `row_offsets`: native-endian `uint64` bytes, `n_trees + 1` values.
+/// - `column_indices`: native-endian `uint32` bytes, `n_entries` values.
+///
+/// Tree `i` holds the columns `column_indices[row_offsets[i]:row_offsets[i + 1]]`, ascending and in the column order of `bipartition_clade_bytes`, which is stable across calls on the same tree set. Reconstruct the dense matrix on the Python side:
 /// ```python
-/// presence = np.frombuffer(pres_bytes, dtype=np.uint8).reshape(n_trees, n_bip).copy()
+/// offsets = np.frombuffer(sparse["row_offsets"], dtype=np.uint64)
+/// columns = np.frombuffer(sparse["column_indices"], dtype=np.uint32)
+/// presence = np.zeros((n_trees, n_bip), dtype=np.uint8)
+/// for i in range(n_trees):
+///     presence[i, columns[offsets[i]:offsets[i + 1]]] = 1
 /// ```
 ///
 /// # Bipartition clade bytes
@@ -163,7 +175,7 @@ pub(super) fn pairwise_rf_from_newick_iter(
 ///         ``pairwise_rf_from_newick_iter`` for details.
 ///
 /// Returns:
-///     6-tuple (tree_names, rf_matrix_bytes, leaf_names, n_bipartitions, presence_bytes,
+///     6-tuple (tree_names, rf_matrix_bytes, leaf_names, n_bipartitions, sparse_presence,
 ///     bipartition_clade_bytes).
 ///
 /// Raises:
@@ -186,65 +198,13 @@ pub(super) fn pairwise_rf_with_snapshots_from_newick_iter(
         rooted,
     };
     rf_with_snapshots(py, names, input, progress, |snaps| {
-        let (presence, col_to_bip_id) = snaps.build_presence_matrix();
-        Ok((PyBytes::new(py, &presence).into(), col_to_bip_id))
+        let (row_offsets, column_indices, col_to_bip_id) = snaps.build_sparse_presence_matrix();
+        let sparse = PyDict::new(py);
+        sparse.set_item("format_version", 1)?;
+        sparse.set_item("encoding", "csr")?;
+        sparse.set_item("n_entries", column_indices.len() / size_of::<u32>())?;
+        sparse.set_item("row_offsets", PyBytes::new(py, &row_offsets))?;
+        sparse.set_item("column_indices", PyBytes::new(py, &column_indices))?;
+        Ok((sparse.into_any().unbind(), col_to_bip_id))
     })
-}
-
-/// Compute pairwise RF distances and export tree snapshots as compressed sparse rows, in a single pass.
-///
-/// Returns what ``pairwise_rf_with_snapshots_from_newick_iter`` returns, with the dense presence matrix replaced by a compressed sparse-row (CSR) dict placed last. The dict holds only the clades each tree has, rather than one byte per tree and clade.
-///
-/// The ``sparse`` dict has these keys:
-///     format_version: ``1``.
-///     encoding: ``"csr"``.
-///     n_entries: total number of (tree, clade) entries.
-///     row_offsets: native-endian uint64 bytes, ``n_trees + 1`` values.
-///     column_indices: native-endian uint32 bytes, ``n_entries`` values.
-///
-/// Tree ``i`` holds the columns ``column_indices[row_offsets[i]:row_offsets[i + 1]]``, ascending and in the column order of ``clade_bytes``; writing ``1`` at those columns reproduces the dense presence row.
-///
-/// Args:
-///     names: Tree identifiers (one per newick).
-///     newick_iter: Python iterator yielding newick strings.
-///     translate_maps: List of translate maps (number → taxon name).
-///     map_indices: Per-tree index into translate_maps.
-///     rooted: If True compare clades; if False compare bipartitions (default: False).
-///     progress: Optional ``rapidtrees.ProgressCounter``; see ``pairwise_rf_from_newick_iter``.
-///
-/// Returns:
-///     6-tuple (tree_names, rf_matrix_bytes, leaf_names, n_clades, clade_bytes, sparse).
-///
-/// Raises:
-///     ValueError: If fewer than 2 trees, leaf sets differ, or argument lengths mismatch.
-#[pyfunction]
-#[pyo3(signature = (names, newick_iter, translate_maps, map_indices, rooted=false, progress=None))]
-pub(super) fn pairwise_rf_with_sparse_snapshots_from_newick_iter(
-    py: Python<'_>,
-    names: Vec<String>,
-    newick_iter: Bound<'_, PyIterator>,
-    translate_maps: Vec<HashMap<String, String>>,
-    map_indices: Vec<usize>,
-    rooted: bool,
-    progress: Option<Py<ProgressCounter>>,
-) -> PyResult<PyRfSnapshotResult> {
-    let input = IterInput {
-        newick_iter,
-        translate_maps: &translate_maps,
-        map_indices: &map_indices,
-        rooted,
-    };
-    let (names, rf, leaf_names, n_clades, sparse, clades) =
-        rf_with_snapshots(py, names, input, progress, |snaps| {
-            let (row_offsets, column_indices, col_to_bip_id) = snaps.build_sparse_presence_matrix();
-            let sparse = PyDict::new(py);
-            sparse.set_item("format_version", 1)?;
-            sparse.set_item("encoding", "csr")?;
-            sparse.set_item("n_entries", column_indices.len() / size_of::<u32>())?;
-            sparse.set_item("row_offsets", PyBytes::new(py, &row_offsets))?;
-            sparse.set_item("column_indices", PyBytes::new(py, &column_indices))?;
-            Ok((sparse.into_any().unbind(), col_to_bip_id))
-        })?;
-    // Unlike the dense endpoint, the membership payload comes after the clade bitmasks.
-    Ok((names, rf, leaf_names, n_clades, clades, sparse))
 }

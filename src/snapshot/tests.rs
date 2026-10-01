@@ -790,6 +790,39 @@ fn sparse_presence_matrix_expands_to_dense() {
     }
 }
 
+/// Scattering each CSR row's lengths into a zeroed row rebuilds the dense branch-length matrix, in both rooting modes and with a polytomy in the set.
+#[test]
+fn sparse_branch_lengths_expand_to_dense() {
+    let trees = [
+        "((A:1,B:2):5,(C:3,D:4):6);",
+        "((A:7,C:8):9,(B:10,D:11):12);",
+        "(A:1,B:1,C:1,D:1);",
+    ];
+    for rooted in [false, true] {
+        let snaps = snaps_opts(&trees, rooted, true);
+        let (dense, dense_cols) = snaps.build_branch_length_matrix();
+        let (offsets, columns, lengths, sparse_cols) = snaps.build_sparse_branch_length_matrix();
+        let offsets = decode(&offsets, u64::from_ne_bytes);
+        let columns = decode(&columns, u32::from_ne_bytes);
+        let lengths = decode(&lengths, f64::from_ne_bytes);
+        assert_eq!(sparse_cols, dense_cols);
+        assert_eq!(columns.len(), lengths.len());
+
+        let n_bip = dense_cols.len();
+        let mut expanded = vec![0.0f64; dense.len() / 8];
+        for (tree, bounds) in offsets.windows(2).enumerate() {
+            for entry in bounds[0] as usize..bounds[1] as usize {
+                expanded[tree * n_bip + columns[entry] as usize] = lengths[entry];
+            }
+        }
+        assert_eq!(
+            expanded,
+            decode(&dense, f64::from_ne_bytes),
+            "rooted={rooted}"
+        );
+    }
+}
+
 /// A polytomy holds fewer splits than a binary tree, so its CSR row is shorter. Rooted, the star tree has its four pendant clades and the binary tree adds `{A,B}` and `{C,D}`; columns ascend by packed leaf set, so `{A,B}` sorts between `{B}` and `{C}`.
 #[test]
 fn sparse_presence_rows_vary_in_width() {

@@ -22,14 +22,13 @@ once.
 | Function | Returns |
 | --- | --- |
 | `pairwise_rf_from_newick_iter` | `(names, bytes)` — RF matrix as flat `uint32` bytes, row-major |
-| `pairwise_rf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, bytes)` — RF matrix + bipartition presence matrix + bipartition clade bitmasks |
-| `pairwise_rf_with_sparse_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, dict)` — RF matrix + bipartition clade bitmasks + presence matrix as sparse rows |
+| `pairwise_rf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, dict, bytes)` — RF matrix + bipartition presence matrix as sparse rows + bipartition clade bitmasks |
 | `pairwise_wrf_from_newick_iter` | `(names, list[float])` — Weighted RF, flat row-major |
-| `pairwise_wrf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, bytes)` — wRF matrix + branch-length matrix + bipartition clade bitmasks |
+| `pairwise_wrf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, dict, bytes)` — wRF matrix + branch-length matrix as sparse rows + bipartition clade bitmasks |
 | `pairwise_kf_from_newick_iter` | `(names, list[float])` — Kuhner-Felsenstein, flat row-major |
-| `pairwise_kf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, bytes)` — KF matrix + branch-length matrix + bipartition clade bitmasks |
+| `pairwise_kf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, dict, bytes)` — KF matrix + branch-length matrix as sparse rows + bipartition clade bitmasks |
 
-All seven share the same call signature:
+All six share the same call signature:
 
 ```python
 func(
@@ -102,7 +101,6 @@ Notes:
 | `pairwise_wrf_from_newick_iter` | `list[float]` — flat, row-major | `np.array(lst, dtype=np.float64).reshape(n, n)` |
 | `pairwise_kf_from_newick_iter` | `list[float]` — flat, row-major | `np.array(lst, dtype=np.float64).reshape(n, n)` |
 | `pairwise_rf_with_snapshots_from_newick_iter` | 6-tuple — see below | see below |
-| `pairwise_rf_with_sparse_snapshots_from_newick_iter` | 6-tuple — see below | see below |
 | `pairwise_wrf_with_snapshots_from_newick_iter` | 6-tuple — see below | see below |
 | `pairwise_kf_with_snapshots_from_newick_iter` | 6-tuple — see below | see below |
 
@@ -240,10 +238,10 @@ tree_names, rf_bytes = rtd.pairwise_rf_from_newick_iter(
 
 `pairwise_rf_with_snapshots_from_newick_iter` builds both the RF distance
 matrix **and** the bipartition presence matrix in a single parse, returning a
-6-tuple:
+6-tuple. The presence matrix comes as compressed sparse rows (CSR), so a tree costs 4 bytes per edge it holds rather than one byte per edge in the whole collection:
 
 ```
-(tree_names, rf_bytes, leaf_names, n_bip, presence_bytes, bipartition_clade_bytes)
+(tree_names, rf_bytes, leaf_names, n_bip, presence, bipartition_clade_bytes)
 ```
 
 | Field | Type | Description |
@@ -252,12 +250,35 @@ matrix **and** the bipartition presence matrix in a single parse, returning a
 | `rf_bytes` | `bytes` | Flat `uint32` RF matrix, row-major, shape `(n, n)` |
 | `leaf_names` | `list[str]` | Sorted taxon names — index `i` corresponds to bit `i` in every bipartition |
 | `n_bip` | `int` | Number of unique edges across all trees (internal bipartitions + pendant edges) |
-| `presence_bytes` | `bytes` | Flat `uint8` presence matrix, row-major, shape `(n, n_bip)` |
+| `presence` | `dict` | Presence matrix as sparse rows — see below |
 | `bipartition_clade_bytes` | `bytes` | Packed bitmasks, shape `(n_bip, ceil(n_leaves/8))` — see below |
 
 The presence matrix entry `presence[i, j]` is `1` if edge `j` appears in tree
 `i`, otherwise `0`. Column order is deterministic and stable across calls on
 the same tree set, so the same trees always give the same column indices.
+
+#### Sparse presence format
+
+| Key | Type | Description |
+| --- | --- | --- |
+| `format_version` | `int` | `1` |
+| `encoding` | `str` | `"csr"` |
+| `n_entries` | `int` | Number of (tree, edge) entries across all trees |
+| `row_offsets` | `bytes` | Native-endian `uint64`, shape `(n_trees + 1,)` |
+| `column_indices` | `bytes` | Native-endian `uint32`, shape `(n_entries,)` |
+
+Tree `i` holds the columns `column_indices[row_offsets[i]:row_offsets[i + 1]]`, in ascending order and in the column order of `bipartition_clade_bytes`. Rows differ in length when trees hold different numbers of edges, as polytomies do. Setting a tree's columns to `1` in a zeroed row gives its row of the dense presence matrix:
+
+```python
+offsets  = np.frombuffer(presence["row_offsets"], dtype=np.uint64)
+columns  = np.frombuffer(presence["column_indices"], dtype=np.uint32)
+split_freq = np.bincount(columns, minlength=n_bip) / len(tree_names)  # frequency of each edge, without a dense matrix
+
+# Dense matrix, when a downstream step needs one (n_trees × n_bip bytes)
+dense = np.zeros((len(tree_names), n_bip), dtype=np.uint8)
+for i in range(len(tree_names)):
+    dense[i, columns[offsets[i]:offsets[i + 1]]] = 1
+```
 
 #### Edge table contents
 
@@ -305,14 +326,20 @@ bip_bool = np.unpackbits(bip_arr, axis=1, bitorder='little')[:, :len(leaf_names)
 ```
 
 ```python
-tree_names, rf_bytes, leaf_names, n_bip, pres_bytes, bip_clade_bytes = (
+tree_names, rf_bytes, leaf_names, n_bip, sparse, bip_clade_bytes = (
     rtd.pairwise_rf_with_snapshots_from_newick_iter(
         list(names), iter(newicks), [tmap], [0] * len(names)
     )
 )
 n = len(tree_names)
-rf       = np.frombuffer(rf_bytes,   dtype=np.uint32).reshape(n, n)
-presence = np.frombuffer(pres_bytes, dtype=np.uint8 ).reshape(n, n_bip).copy()
+rf = np.frombuffer(rf_bytes, dtype=np.uint32).reshape(n, n)
+
+# Expand the sparse rows into the dense presence matrix
+offsets  = np.frombuffer(sparse["row_offsets"], dtype=np.uint64)
+columns  = np.frombuffer(sparse["column_indices"], dtype=np.uint32)
+presence = np.zeros((n, n_bip), dtype=np.uint8)
+for i in range(n):
+    presence[i, columns[offsets[i]:offsets[i + 1]]] = 1
 
 # Verify: sum(|row_i − row_j|) == RF(i, j) for all pairs
 for i in range(n):
@@ -349,49 +376,14 @@ df = pd.DataFrame(presence, index=tree_names, columns=col_labels)
 
 ---
 
-### RF + sparse snapshot in one pass
-
-`pairwise_rf_with_sparse_snapshots_from_newick_iter` returns the same RF matrix, leaf names, `n_bip` and clade bitmasks as `pairwise_rf_with_snapshots_from_newick_iter`, but gives the presence matrix as compressed sparse rows (CSR), in a dict placed last:
-
-```text
-(tree_names, rf_bytes, leaf_names, n_bip, bipartition_clade_bytes, sparse)
-```
-
-Prefer it over the dense endpoint when `n_bip` is more than about four times the number of splits per tree: the dense matrix takes `n_trees × n_bip` bytes, the CSR rows 4 bytes per split in each tree.
-
-| Key | Type | Description |
-| --- | --- | --- |
-| `format_version` | `int` | `1` |
-| `encoding` | `str` | `"csr"` |
-| `n_entries` | `int` | Number of (tree, split) entries across all trees |
-| `row_offsets` | `bytes` | Native-endian `uint64`, shape `(n_trees + 1,)` |
-| `column_indices` | `bytes` | Native-endian `uint32`, shape `(n_entries,)` |
-
-Tree `i` holds the columns `column_indices[row_offsets[i]:row_offsets[i + 1]]`, in ascending order and in the column order of `bipartition_clade_bytes`. Setting those columns to `1` reproduces row `i` of the dense presence matrix exactly.
-
-```python
-tree_names, rf_bytes, leaf_names, n_bip, bip_clade_bytes, sparse = (
-    rtd.pairwise_rf_with_sparse_snapshots_from_newick_iter(
-        list(names), iter(newicks), [tmap], [0] * len(names)
-    )
-)
-offsets = np.frombuffer(sparse["row_offsets"], dtype=np.uint64)
-columns = np.frombuffer(sparse["column_indices"], dtype=np.uint32)
-
-tree_0 = columns[offsets[0]:offsets[1]]  # splits present in tree 0
-split_freq = np.bincount(columns, minlength=n_bip) / len(tree_names)  # presence.mean(axis=0)
-```
-
----
-
 ### wRF + branch-length matrix in one pass
 
 `pairwise_wrf_with_snapshots_from_newick_iter` builds both the pairwise wRF
 distance matrix **and** a per-edge branch-length matrix in a single parse,
-returning a 6-tuple:
+returning a 6-tuple. The branch-length matrix comes as compressed sparse rows (CSR), one entry per edge a tree holds:
 
 ```text
-(tree_names, wrf_bytes, leaf_names, n_bip, branch_length_bytes, bipartition_clade_bytes)
+(tree_names, wrf_bytes, leaf_names, n_bip, branch_lengths, bipartition_clade_bytes)
 ```
 
 | Field | Type | Description |
@@ -400,15 +392,25 @@ returning a 6-tuple:
 | `wrf_bytes` | `bytes` | Flat `float64` wRF matrix, row-major, shape `(n, n)` |
 | `leaf_names` | `list[str]` | Sorted taxon names — index `i` corresponds to bit `i` in every bipartition |
 | `n_bip` | `int` | Number of unique edges across all trees (pendant + internal) |
-| `branch_length_bytes` | `bytes` | Flat `float64`, shape `(n_trees, n_bip)`, row-major |
+| `branch_lengths` | `dict` | Branch-length matrix as sparse rows — see below |
 | `bipartition_clade_bytes` | `bytes` | Packed bitmasks, shape `(n_bip, ceil(n_leaves/8))` — identical to RF snapshot |
 
-`branch_length_bytes[i, j]` is the branch length of edge `j` in tree `i`, or
+The dense entry `bl[i, j]` is the branch length of edge `j` in tree `i`, or
 `0.0` if that edge is absent. Pendant (leaf-edge) columns are always non-zero
 because every tree has every leaf.
 
 Column order matches `bipartition_clade_bytes`, and is deterministic and
 stable across calls on the same tree set.
+
+#### Sparse branch-length format
+
+The dict has the keys of the RF presence payload (`format_version`, `encoding`, `n_entries`, `row_offsets`, `column_indices`) plus one more:
+
+| Key | Type | Description |
+| --- | --- | --- |
+| `lengths` | `bytes` | Native-endian `float64`, shape `(n_entries,)`, one branch length per entry in the order of `column_indices` |
+
+Tree `i` holds the edges `column_indices[row_offsets[i]:row_offsets[i + 1]]`, with their lengths at the same positions in `lengths`. Edges a tree lacks have no entry; the dense matrix wrote them as `0.0`.
 
 #### Decode and compute Fréchet ESS traces
 
@@ -416,7 +418,7 @@ stable across calls on the same tree set.
 import rapidtrees as rtd
 import numpy as np
 
-tree_names, wrf_bytes, leaf_names, n_bip, bl_bytes, bip_clade_bytes = (
+tree_names, wrf_bytes, leaf_names, n_bip, sparse, bip_clade_bytes = (
     rtd.pairwise_wrf_with_snapshots_from_newick_iter(
         list(names), iter(newicks), [tmap], [0] * len(names)
     )
@@ -425,8 +427,13 @@ n = len(tree_names)
 # Actual wRF distance matrix (trees x trees)
 wrf = np.frombuffer(wrf_bytes, dtype=np.float64).reshape(n, n)
 
-# Branch length matrix (trees x bipartitions)
-bl  = np.frombuffer(bl_bytes,  dtype=np.float64).reshape(n, n_bip)
+# Branch length matrix (trees x bipartitions), expanded from the sparse rows
+offsets = np.frombuffer(sparse["row_offsets"], dtype=np.uint64)
+columns = np.frombuffer(sparse["column_indices"], dtype=np.uint32)
+lengths = np.frombuffer(sparse["lengths"], dtype=np.float64)
+bl = np.zeros((n, n_bip))
+for i in range(n):
+    bl[i, columns[offsets[i]:offsets[i + 1]]] = lengths[offsets[i]:offsets[i + 1]]
 
 # We can recompute distances relative to one reference tree using the branch-length matrix:
 ref_idx = 0
@@ -445,11 +452,11 @@ for i in range(n):
 
 `pairwise_kf_with_snapshots_from_newick_iter` is identical to the wRF variant
 except the distance matrix uses the Kuhner–Felsenstein (Branch Score) metric.
-The branch-length matrix is metric-agnostic and bit-for-bit identical across
+The sparse branch-length matrix is metric-agnostic and bit-for-bit identical across
 both functions for the same input.
 
 ```text
-(tree_names, kf_bytes, leaf_names, n_bip, branch_length_bytes, bipartition_clade_bytes)
+(tree_names, kf_bytes, leaf_names, n_bip, branch_lengths, bipartition_clade_bytes)
 ```
 
 | Field | Type | Description |
@@ -458,11 +465,11 @@ both functions for the same input.
 | `kf_bytes` | `bytes` | Flat `float64` KF matrix, row-major, shape `(n, n)` |
 | `leaf_names` | `list[str]` | Sorted taxon names |
 | `n_bip` | `int` | Number of unique edges |
-| `branch_length_bytes` | `bytes` | Flat `float64`, shape `(n_trees, n_bip)` — same as wRF variant |
+| `branch_lengths` | `dict` | Sparse branch-length rows — same as wRF variant |
 | `bipartition_clade_bytes` | `bytes` | Packed bitmasks — same as RF/wRF snapshot |
 
 ```python
-tree_names, kf_bytes, leaf_names, n_bip, bl_bytes, bip_clade_bytes = (
+tree_names, kf_bytes, leaf_names, n_bip, sparse, bip_clade_bytes = (
     rtd.pairwise_kf_with_snapshots_from_newick_iter(
         list(names), iter(newicks), [tmap], [0] * len(names)
     )
@@ -472,8 +479,13 @@ n = len(tree_names)
 # Actual KF distance matrix (trees x trees)
 kf = np.frombuffer(kf_bytes, dtype=np.float64).reshape(n, n)
 
-# Branch length matrix (trees x bipartitions)
-bl  = np.frombuffer(bl_bytes, dtype=np.float64).reshape(n, n_bip)
+# Branch length matrix (trees x bipartitions), expanded from the sparse rows as in the wRF example
+offsets = np.frombuffer(sparse["row_offsets"], dtype=np.uint64)
+columns = np.frombuffer(sparse["column_indices"], dtype=np.uint32)
+lengths = np.frombuffer(sparse["lengths"], dtype=np.float64)
+bl = np.zeros((n, n_bip))
+for i in range(n):
+    bl[i, columns[offsets[i]:offsets[i + 1]]] = lengths[offsets[i]:offsets[i + 1]]
 
 # L2 identity: sqrt(sum((bl[i,:]-bl[j,:])**2)) == kf[i,j]
 ```

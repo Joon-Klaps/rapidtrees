@@ -71,43 +71,89 @@ impl Snapshots {
     ///
     /// Columns follow [`Snapshots::build_presence_matrix`], so setting each tree's listed columns to `1` reproduces the dense matrix. Rows differ in length when trees hold different numbers of splits, as polytomies do.
     pub fn build_sparse_presence_matrix(&self) -> (Vec<u8>, Vec<u8>, Vec<usize>) {
+        let (row_offsets, column_indices, _, col_to_bip_id) = self.build_csr(false);
+        (row_offsets, column_indices, col_to_bip_id)
+    }
+
+    /// Build the branch-length matrix in compressed sparse-row (CSR) form.
+    ///
+    /// Returns `(row_offsets, column_indices, lengths, col_to_bip_id)`:
+    /// - `row_offsets` and `column_indices`: as in [`Snapshots::build_sparse_presence_matrix`]
+    /// - `lengths`: native-endian `f64` bytes, one branch length per entry, in the order of `column_indices`
+    /// - `col_to_bip_id`: as returned by [`Snapshots::build_presence_matrix`]
+    ///
+    /// Writing each tree's lengths at its listed columns into a zeroed row reproduces the dense matrix of [`Snapshots::build_branch_length_matrix`].
+    pub fn build_sparse_branch_length_matrix(&self) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<usize>) {
+        self.build_csr(true)
+    }
+
+    /// Shared CSR builder; `lengths` is empty unless `with_lengths` is set.
+    fn build_csr(&self, with_lengths: bool) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<usize>) {
         let (id_to_col, col_to_bip_id) = self.column_order();
         // Without a clade table (`Retain::bipartitions` off) there are no columns, as in the dense builders.
         if col_to_bip_id.is_empty() {
             let row_offsets = vec![0u8; (self.snapshots.len() + 1) * size_of::<u64>()];
-            return (row_offsets, Vec::new(), col_to_bip_id);
+            return (row_offsets, Vec::new(), Vec::new(), col_to_bip_id);
         }
         let n_entries: usize = self.snapshots.iter().map(InternSnap::n_splits).sum();
         let mut row_offsets = Vec::with_capacity((self.snapshots.len() + 1) * size_of::<u64>());
         let mut column_indices = vec![0u8; n_entries * size_of::<u32>()];
+        let mut lengths = vec![
+            0u8;
+            if with_lengths {
+                n_entries * size_of::<f64>()
+            } else {
+                0
+            }
+        ];
 
-        // Prefix sum over row lengths, carving `column_indices` into one slice per tree on the way so the rows can be filled in parallel.
+        // Prefix sum over row lengths, carving the buffers into one slice per tree on the way so the rows can be filled in parallel.
         let mut rows = Vec::with_capacity(self.snapshots.len());
-        let mut rest = column_indices.as_mut_slice();
+        let mut rest_columns = column_indices.as_mut_slice();
+        let mut rest_lengths = lengths.as_mut_slice();
         let mut end = 0u64;
         row_offsets.extend_from_slice(&end.to_ne_bytes());
         for snap in &self.snapshots {
-            let (row, tail) =
-                std::mem::take(&mut rest).split_at_mut(snap.n_splits() * size_of::<u32>());
-            rows.push(row);
-            rest = tail;
-            end += snap.n_splits() as u64;
+            let n = snap.n_splits();
+            let (columns, tail) =
+                std::mem::take(&mut rest_columns).split_at_mut(n * size_of::<u32>());
+            rest_columns = tail;
+            let width = if with_lengths {
+                n * size_of::<f64>()
+            } else {
+                0
+            };
+            let (values, tail) = std::mem::take(&mut rest_lengths).split_at_mut(width);
+            rest_lengths = tail;
+            rows.push((columns, values));
+            end += n as u64;
             row_offsets.extend_from_slice(&end.to_ne_bytes());
         }
 
-        self.snapshots.par_iter().zip(rows).for_each(|(snap, row)| {
-            let entries = sorted_row(snap, &id_to_col);
-            for (dst, (col, _)) in row
-                .as_chunks_mut::<{ size_of::<u32>() }>()
-                .0
-                .iter_mut()
-                .zip(entries)
-            {
-                dst.copy_from_slice(&col.to_ne_bytes());
-            }
-        });
+        self.snapshots
+            .par_iter()
+            .zip(rows)
+            .for_each(|(snap, (columns, values))| {
+                let entries = sorted_row(snap, &id_to_col);
+                for (dst, &(col, _)) in columns
+                    .as_chunks_mut::<{ size_of::<u32>() }>()
+                    .0
+                    .iter_mut()
+                    .zip(&entries)
+                {
+                    dst.copy_from_slice(&col.to_ne_bytes());
+                }
+                for (dst, &(_, pos)) in values
+                    .as_chunks_mut::<{ size_of::<f64>() }>()
+                    .0
+                    .iter_mut()
+                    .zip(&entries)
+                {
+                    dst.copy_from_slice(&snap.lengths[pos as usize].to_ne_bytes());
+                }
+            });
 
-        (row_offsets, column_indices, col_to_bip_id)
+        (row_offsets, column_indices, lengths, col_to_bip_id)
     }
 
     /// Build a flat row-major branch-length matrix `(n_trees × n_bip)` as native-endian

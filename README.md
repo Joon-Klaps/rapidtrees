@@ -178,12 +178,11 @@ rapidtrees \
 | Function | Returns |
 | --- | --- |
 | `pairwise_rf_from_newick_iter` | `(names, bytes)` — RF matrix as flat `uint32` bytes, row-major |
-| `pairwise_rf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, bytes)` — RF matrix + presence matrix + clade bitmasks |
-| `pairwise_rf_with_sparse_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, dict)` — RF matrix + clade bitmasks + presence matrix as sparse rows |
+| `pairwise_rf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, dict, bytes)` — RF matrix + presence matrix as sparse rows + clade bitmasks |
 | `pairwise_wrf_from_newick_iter` | `(names, list[float])` — Weighted RF, flat row-major |
-| `pairwise_wrf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, bytes)` — wRF matrix + branch-length matrix + clade bitmasks |
+| `pairwise_wrf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, dict, bytes)` — wRF matrix + branch-length matrix as sparse rows + clade bitmasks |
 | `pairwise_kf_from_newick_iter` | `(names, list[float])` — Kuhner-Felsenstein, flat row-major |
-| `pairwise_kf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, bytes)` — KF matrix + branch-length matrix + clade bitmasks |
+| `pairwise_kf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, dict, bytes)` — KF matrix + branch-length matrix as sparse rows + clade bitmasks |
 
 ```python
 import rapidtrees as rtd
@@ -239,13 +238,19 @@ import numpy as np
 
 import math
 
-tree_names, rf_bytes, leaf_names, n_bip, pres_bytes, bip_clade_bytes = (
+tree_names, rf_bytes, leaf_names, n_bip, sparse, bip_clade_bytes = (
     rtd.pairwise_rf_with_snapshots_from_newick_iter(
         names, iter(newicks), translate_maps, map_indices
     )
 )
 n = len(tree_names)
-presence = np.frombuffer(pres_bytes, dtype=np.uint8).reshape(n, n_bip).copy()
+
+# The presence matrix comes as compressed sparse rows; expand it when you need the dense form
+offsets = np.frombuffer(sparse["row_offsets"], dtype=np.uint64)
+columns = np.frombuffer(sparse["column_indices"], dtype=np.uint32)
+presence = np.zeros((n, n_bip), dtype=np.uint8)
+for i in range(n):
+    presence[i, columns[offsets[i]:offsets[i + 1]]] = 1
 
 # Global split frequencies (for Pseudo ESS / ASDSF)
 global_freq = presence.mean(axis=0)

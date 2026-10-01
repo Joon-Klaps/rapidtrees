@@ -46,10 +46,6 @@ fn rapidtrees(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        rf::pairwise_rf_with_sparse_snapshots_from_newick_iter,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
         weighted::pairwise_wrf_with_snapshots_from_newick_iter,
         m
     )?)?;
