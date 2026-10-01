@@ -71,13 +71,14 @@ pub fn detect_format(content: &str) -> TreeFormat {
     }
 }
 
-/// Buffer between the file and the reader: large enough that a wide tree's
-/// line arrives in a few reads.
-const READ_BUFFER_BYTES: usize = 16 << 20;
+/// Buffer between the file and the reader. Every file allocates one, and a
+/// larger one reads no faster, not even lines of over a megabyte.
+const READ_BUFFER_BYTES: usize = 64 << 10;
 
-/// Bytes of tree text the background reader may hold ahead of the parser.
+/// Bytes of tree text the background reader may hold ahead of the parser:
+/// enough to keep it fed, and never fewer than two trees.
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
-const READ_AHEAD_BYTES: usize = 256 << 20;
+const READ_AHEAD_BYTES: usize = 32 << 20;
 
 /// One tree as read from a tree file.
 ///
