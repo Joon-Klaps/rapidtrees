@@ -264,12 +264,14 @@ The file is streamed the same way. A background thread reads it a tree at a time
 
 ## Step 7 — Interning: from fingerprints to `u32` IDs
 
-Across 4 000 trees the *same* splits recur constantly — that's what it means for trees to be similar. So each distinct split is assigned a `u32` **ID**, once, in first-seen order.
+Across 4 000 trees the *same* splits recur constantly — that's what it means for trees to be similar. So each distinct split is assigned a `u32` **ID**, once.
+
+The split table is cut into 256 **shards** by the low bits of the fingerprint, and every shard interns a chunk of trees at the same time as the others, on its own thread. A shard numbers the splits it has not seen in the order it meets them, walking the chunk tree by tree, and the shards are then numbered one after another. The IDs therefore depend on the trees alone, not on the thread count or the chunk size:
 
 ```text
-split {A,B}    → ID 0
-split {C,D}    → ID 1
-split {A,B,C,D}→ ID 2
+split {B}          → ID 0
+split {C,D,E,F,G}  → ID 1     (the {A,B} split, stored as the side without A)
+split {G}          → ID 2
 ...
 ```
 
@@ -284,13 +286,13 @@ struct InternSnap {
 
 The interner matches a candidate on **both** its fingerprint and the cardinality of its smaller side. The cardinality is equal for both sides of a bipartition, so it costs one integer compare and rules out a slice of the collision space for free.
 
-For our two trees the whole run has **13 distinct splits** (7 pendants + 6 internal), so:
+For our two trees the whole run has **13 distinct splits** (7 pendants + 6 internal), so, sorted (a tree keeps its IDs in part order):
 
 ```text
-tree 1: split_ids = [0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12]
-tree 2: split_ids = [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 12]
-                              ↑  ↑  ↑           ↑
-                       differ here — 4 positions total → RF = 4
+tree 1: split_ids = [0, 1, 2,    4, 5,    7, 8, 9, 10, 11, 12]
+tree 2: split_ids = [0, 1, 2, 3, 4, 5, 6,    8, 9,     11, 12]
+                              ↑        ↑  ↑        ↑
+                       held by one tree only — 4 splits → RF = 4
 ```
 
 Two payoffs:
@@ -305,12 +307,12 @@ Two payoffs:
 RF counts the splits one tree has and the other lacks, so with splits as integers it becomes a question about two lists of IDs. Line them up by ID:
 
 ```text
-t1: [0, 1, 2, 3, 4, 5,       8, 9, 10, 11, 12]
-t2: [0, 1, 2, 3,    5, 6, 7, 8, 9, 10,     12]
-                 ↑     ↑  ↑            ↑
+t1: [0, 1, 2,    4, 5,    7, 8, 9, 10, 11, 12]
+t2: [0, 1, 2, 3, 4, 5, 6,    8, 9,     11, 12]
+              ↑        ↑  ↑        ↑
 ```
 
-IDs 4 and 11 are in `t1` only, 6 and 7 in `t2` only, and the other 9 are `shared`. Then
+IDs 7 and 10 are in `t1` only, 3 and 6 in `t2` only, and the other 9 are `shared`. Then
 
 ```text
 RF = (len(t1) − shared) + (len(t2) − shared)
@@ -436,7 +438,7 @@ That last row is the `{A,B}` split — stored as its complement, because the can
     Snapshot { parts, leaf_order }                   ── per tree, dropped after interning
             │
             │  [intern]  dedupe by (fingerprint, smaller-side size)
-            │            assign u32 IDs in first-seen order
+            │            assign u32 IDs, 256 shards in parallel
             │            record ONE leaf set per new split
             ▼
     InternSnap { split_ids, lengths }                ── per tree, KEPT
@@ -496,7 +498,7 @@ Not every path needs everything, and both extras cost real work:
 | `snapshot/fingerprint.rs` | the two run-wide tables, and the `Fingerprint` type |
 | `snapshot/newick.rs` | the reader: Newick text straight to a `Snapshot` |
 | `snapshot/build.rs` | `Part` and `Snapshot`, what one tree becomes |
-| `snapshot/intern.rs` | `Interner`, `InternSnap` — dedupe to `u32` IDs |
+| `snapshot/intern.rs` | `Interner`, `InternSnap` — dedupe to `u32` IDs, in parallel shards |
 | `snapshot/export.rs` | the flat byte buffers Python reads |
 | `snapshot/mod.rs` | `Snapshots`, the construction pipeline, `Retain` |
 | `distances.rs` | RF over dense bit-rows plus posting lists; WRF / KF over dense columns plus posting lists |
