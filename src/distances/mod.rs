@@ -71,5 +71,5 @@ mod tests;
 #[cfg(test)]
 mod treedist;
 
-pub(crate) use rf::{distance_rf, distance_rf_owned};
-pub(crate) use weighted::{distance_kf, distance_kf_owned, distance_wrf, distance_wrf_owned};
+pub(crate) use rf::distance_rf;
+pub(crate) use weighted::{distance_kf, distance_wrf};

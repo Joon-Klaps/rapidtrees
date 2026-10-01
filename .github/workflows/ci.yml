@@ -100,8 +100,8 @@ jobs:
             - name: Run Python API tests
               run: pixi run -e ${{ matrix.environment }} test-python
 
-    wasm-compat:
-        name: Wasm Compatibility
+    wasm-test:
+        name: Wasm smoke test
         runs-on: ubuntu-latest
 
         steps:
@@ -121,10 +121,27 @@ jobs:
                       ~/.cargo/registry
                       ~/.cargo/git
                       target
-                  key: ${{ runner.os }}-wasm-cargo-${{ hashFiles('**/Cargo.lock') }}
+                      tests/wasm/target
+                  key: ${{ runner.os }}-wasm-cargo-${{ hashFiles('**/Cargo.lock', 'tests/wasm/Cargo.toml') }}
+
+            - name: Setup Node
+              uses: actions/setup-node@v4
+              with:
+                  node-version: 24
 
             - name: Check wasm32 build (no default features)
               run: cargo check --lib --no-default-features --target wasm32-unknown-unknown
 
             - name: Clippy on the wasm32 build
               run: cargo clippy --lib --no-default-features --target wasm32-unknown-unknown -- -D warnings
+
+            - name: Lint the wasm smoke-test harness
+              working-directory: tests/wasm
+              run: |
+                  cargo fmt -- --check
+                  cargo clippy --target wasm32-unknown-unknown -- -D warnings
+
+            # Checking if wasm32 build for all files in data/
+            # match those of CLI
+            - name: Run the wasm32 build on BEAST files
+              run: node tests/wasm/run.ts

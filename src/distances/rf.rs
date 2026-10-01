@@ -1,11 +1,8 @@
 //! Robinson–Foulds.
 
 use super::boundary::{min_dense, rf_dense_share};
-use super::layout::{Layout, Trees, block_size, column};
+use super::layout::{Column, Input, Laid, Layout, Rows, lay_out};
 use super::matrix::{fill_symmetric, row_slice};
-use super::postings::Postings;
-use crate::par::*;
-use crate::snapshot::Snapshots;
 use std::sync::atomic::AtomicUsize;
 
 /// Fewest trees at which RF gives any split a posting list.
@@ -17,15 +14,21 @@ const RF_MIN_TREES_FOR_POSTINGS: usize = 256;
 /// `spans[i]` is the half-open range of words where row `i` has bits set,
 /// `(0, 0)` when it has none. Columns run in descending tree count, so a row's
 /// bits cluster and a pair only sweeps the words where both spans overlap.
+///
+/// The rows are kept flat rather than in [`Rows`]' blocks: a pair reads two
+/// short rows and does little else, so a block lookup per row would show in
+/// the sweep, and bit rows are small enough to copy once.
 struct BitRows {
-    words: usize,
-    packed: Vec<u64>,
-    spans: Vec<(usize, usize)>,
+    pub(super) words: usize,
+    pub(super) packed: Vec<u64>,
+    pub(super) spans: Vec<(usize, usize)>,
 }
 
 impl BitRows {
-    /// The `n` rows packed `words` to a row in `packed`.
-    fn from_packed(packed: Vec<u64>, words: usize, n: usize) -> Self {
+    /// The `n` trees' `rows`, flattened, with the span of each.
+    fn new(rows: Rows<u64>, n: usize) -> Self {
+        let words = rows.stride;
+        let packed = rows.into_flat();
         let spans = (0..n)
             .map(|i| {
                 let row = row_slice(&packed, i, words);
@@ -58,69 +61,6 @@ impl BitRows {
     }
 }
 
-/// RF's bit rows and posting lists, laid out a block of trees at a time, with
-/// every tree's `self` count: its splits less the `n_universal` that every
-/// tree holds.
-fn rf_layout(
-    trees: Trees,
-    counts: &[u32],
-    layout: &Layout,
-    n_universal: usize,
-) -> (BitRows, Postings, Vec<u32>) {
-    let n = trees.len();
-    let words = layout.n_dense.div_ceil(64);
-    // A zero-width row still gets one scratch word, so that every tree is
-    // handed a row; no bit is ever set in it.
-    let width = words.max(1);
-    let mut packed = vec![0u64; n * width];
-    let size = block_size();
-    let mut postings = Postings::sized(counts, layout, size, false);
-    let mut self_count = Vec::with_capacity(n);
-    let mut first = 0;
-    trees.by_blocks(size, |block| {
-        let rows = &mut packed[first * width..(first + block.len()) * width];
-        let posted: Vec<Vec<(u32, f64)>> = rows
-            .par_chunks_mut(width)
-            .zip(block.par_iter())
-            .map(|(row, snap)| {
-                let mut own = Vec::new();
-                for &id in &snap.split_ids {
-                    match column(&layout.column_of, id) {
-                        Some(col) if col < layout.n_dense => row[col / 64] |= 1u64 << (col % 64),
-                        Some(col) => own.push(((col - layout.n_dense) as u32, 0.0)),
-                        None => {}
-                    }
-                }
-                own.sort_unstable_by_key(|&(col, _)| col);
-                own
-            })
-            .collect();
-        postings.push_block(&posted);
-        self_count.extend(
-            block
-                .iter()
-                .map(|snap| (snap.n_splits() - n_universal) as u32),
-        );
-        first += block.len();
-    });
-    postings.fill = Vec::new();
-    if words == 0 {
-        packed = Vec::new();
-    }
-    (BitRows::from_packed(packed, words, n), postings, self_count)
-}
-
-/// The bit/posting boundary RF uses for `n` trees: a split held by fewer than
-/// [`rf_dense_share`] of them gets a posting list, once there are enough trees
-/// for lists to pay.
-fn rf_min_dense(n: usize) -> u32 {
-    if n < RF_MIN_TREES_FOR_POSTINGS {
-        2 // every shareable split gets a bit column
-    } else {
-        min_dense(n, rf_dense_share())
-    }
-}
-
 /// `RF(i, j) = selfᵢ + selfⱼ − 2·shared(i, j)`, where `self` counts a tree's
 /// splits and `shared` the splits both trees hold.
 ///
@@ -130,51 +70,63 @@ fn rf_min_dense(n: usize) -> u32 {
 /// either. On a posterior that is most of the distinct splits. The rest are
 /// shared by a popcount over packed bit-rows for the widely held ones and by
 /// posting lists for the rare ones.
-pub(crate) fn distance_rf(snaps: &Snapshots, progress: Option<&AtomicUsize>) -> Vec<u32> {
-    let trees = Trees::Borrowed(&snaps.snapshots);
-    let min_dense = rf_min_dense(trees.len());
-    distance_rf_split(trees, &snaps.split_counts, progress, min_dense)
-}
-
-/// [`distance_rf`] for a caller that is done with `snaps`: each block of trees
-/// is dropped once its bit rows and posting entries are written, before the
-/// pairwise sweep.
-pub(crate) fn distance_rf_owned(snaps: Snapshots, progress: Option<&AtomicUsize>) -> Vec<u32> {
-    let Snapshots {
-        snapshots,
-        split_counts,
-        ..
-    } = snaps;
-    let min_dense = rf_min_dense(snapshots.len());
-    distance_rf_split(Trees::Owned(snapshots), &split_counts, progress, min_dense)
+pub(crate) fn distance_rf(input: Input<'_>, progress: Option<&AtomicUsize>) -> Vec<u32> {
+    let n = input.trees.len();
+    let min_dense = if n < RF_MIN_TREES_FOR_POSTINGS {
+        2 // every shareable split gets a bit column
+    } else {
+        min_dense(n, rf_dense_share())
+    };
+    distance_rf_split(input, progress, min_dense)
 }
 
 /// [`distance_rf`] with the bit/posting boundary given: a split held by at
 /// least `min_dense` trees (but not all) gets a bit column, one held by fewer
 /// (but at least two) gets a posting list.
 pub(super) fn distance_rf_split(
-    trees: Trees,
-    counts: &[u32],
+    input: Input<'_>,
     progress: Option<&AtomicUsize>,
     min_dense: u32,
 ) -> Vec<u32> {
-    let n = trees.len();
+    let n = input.trees.len();
     if n == 0 {
         return Vec::new();
     }
 
     // A split held by all `n` trees cancels, so it gets no column of either kind.
     let all = n as u32;
-    let layout = Layout::new(counts, n, min_dense.min(all), |count| {
+    let layout = Layout::new(&input.counts, n, min_dense.min(all), |count| {
         (2..all).contains(&count)
     });
     // Every tree holds each of the `n_universal` splits, so its `self` is its
     // split count minus that fixed number.
-    let n_universal = counts.iter().filter(|&&count| count == all).count();
-    let (bits, postings, self_count) = rf_layout(trees, counts, &layout, n_universal);
-    drop(layout);
+    let n_universal = input.counts.iter().filter(|&&count| count == all).count();
+    let words = layout.n_dense.div_ceil(64);
+    let Laid {
+        rows,
+        postings,
+        selfs: self_count,
+    } = lay_out(
+        input,
+        layout,
+        words,
+        false,
+        |layout, snap, row: &mut [u64]| {
+            let mut posted = Vec::new();
+            for id in snap.ids() {
+                match layout.place(id) {
+                    Some(Column::Dense(col)) => row[col / 64] |= 1u64 << (col % 64),
+                    Some(Column::Posted(col)) => posted.push((col, 0.0)),
+                    None => {}
+                }
+            }
+            posted.sort_unstable_by_key(|&(col, _)| col);
+            (posted, (snap.n_splits() - n_universal) as u32)
+        },
+    );
+    let bits = BitRows::new(rows, n);
 
-    fill_symmetric(n, progress, |i, row: &mut [u32]| {
+    fill_symmetric(n, 1, progress, |i, row: &mut [u32]| {
         // Shared splits from the posting lists first, counted in place.
         for &col in postings.of_tree(i).0 {
             for &j in postings.after(col, i).0 {

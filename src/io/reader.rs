@@ -2,7 +2,7 @@
 
 use super::annotations::strip_annotations;
 use super::format::TreeFormat;
-use super::nexus::{extract_name_state, starts_with_ci, translate_entry};
+use super::nexus::{closes_translate, extract_name_state, starts_with_ci, translate_entry};
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -10,13 +10,14 @@ use std::io::{self, BufRead, BufReader};
 use std::ops::Range;
 use std::path::Path;
 
-/// Buffer between the file and the reader: large enough that a wide tree's
-/// line arrives in a few reads.
-const READ_BUFFER_BYTES: usize = 16 << 20;
+/// Buffer between the file and the reader. Every file allocates one, and a
+/// larger one reads no faster, not even lines of over a megabyte.
+const READ_BUFFER_BYTES: usize = 64 << 10;
 
-/// Bytes of tree text the background reader may hold ahead of the parser.
-#[cfg(feature = "parallel")]
-const READ_AHEAD_BYTES: usize = 256 << 20;
+/// Bytes of tree text the background reader may hold ahead of the parser:
+/// enough to keep it fed, and never fewer than two trees.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+const READ_AHEAD_BYTES: usize = 32 << 20;
 
 /// One tree as read from a tree file.
 ///
@@ -143,6 +144,11 @@ impl<R: BufRead> TreeReader<R> {
             done: false,
         };
         reader.read_line()?;
+        // A byte-order mark is not text: left in, it hides `#NEXUS` from the
+        // sniff below and a Newick tree's opening `(`.
+        if reader.line.starts_with('\u{feff}') {
+            reader.line.drain(..'\u{feff}'.len_utf8());
+        }
         while !reader.line.is_empty() && reader.line.trim().is_empty() {
             reader.read_line()?;
         }
@@ -196,8 +202,11 @@ impl<R: BufRead> TreeReader<R> {
         while !self.line.is_empty() && !starts_with_ci(self.line.trim(), "tree ") {
             if use_real_taxa && starts_with_ci(self.line.trim(), "translate") {
                 self.read_line()?;
-                while !self.line.is_empty() && !self.line.trim().starts_with(';') {
+                while !self.line.is_empty() {
                     translate.extend(translate_entry(&self.line));
+                    if closes_translate(&self.line) {
+                        break;
+                    }
                     self.read_line()?;
                 }
             }
@@ -345,7 +354,7 @@ impl<R: BufRead> Iterator for TreeReader<R> {
 
 /// A reader's trees, read on a background thread about [`READ_AHEAD_BYTES`]
 /// ahead of the consumer, so that reading the file overlaps parsing it.
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 pub(super) fn read_ahead<R>(
     mut reader: TreeReader<R>,
 ) -> Box<dyn Iterator<Item = io::Result<TreeRecord>>>
@@ -361,12 +370,22 @@ where
     let (tx, rx) = std::sync::mpsc::sync_channel(depth);
     // The thread stops at the end of the file, or as soon as the consumer
     // hangs up and a send fails.
-    std::thread::spawn(move || reader.try_for_each(|tree| tx.send(tree)));
-    Box::new(std::iter::once(first).chain(rx))
+    let mut thread = Some(std::thread::spawn(move || {
+        reader.try_for_each(|tree| tx.send(tree))
+    }));
+    // A panic drops the sender just as the end of the file does, so once the
+    // queue is drained the thread is joined, and a panic becomes an error
+    // instead of a quietly shortened file.
+    let panicked = std::iter::from_fn(move || {
+        thread.take()?.join().err()?;
+        Some(Err(io::Error::other("the tree reader thread panicked")))
+    });
+    Box::new(std::iter::once(first).chain(rx).chain(panicked))
 }
 
-/// Without the `parallel` feature, and so on wasm32, trees are read inline.
-#[cfg(not(feature = "parallel"))]
+/// Without the `parallel` feature trees are read inline, and so on wasm32,
+/// which has no `std::thread::spawn` even where `parallel` is on.
+#[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
 pub(super) fn read_ahead<R>(
     reader: TreeReader<R>,
 ) -> Box<dyn Iterator<Item = io::Result<TreeRecord>>>
@@ -567,6 +586,33 @@ mod tests {
         assert_eq!(translate.len(), 2);
         assert_eq!(translate.get("2").map(String::as_str), Some("B"));
         assert!(trees.next().is_none());
+    }
+
+    /// Input that serves `data` and then panics, as a bug in the reader would.
+    #[cfg(feature = "parallel")]
+    struct PanicsAfter(&'static [u8]);
+
+    #[cfg(feature = "parallel")]
+    impl io::Read for PanicsAfter {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            assert!(!self.0.is_empty(), "reader bug");
+            let n = buf.len().min(self.0.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+
+    /// A panic on the read-ahead thread ends the trees with an error, not with
+    /// what looks like the end of the file.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_read_ahead_reports_a_reader_panic() {
+        let input = BufReader::new(PanicsAfter(b"(A:1,B:1,C:1);\n(A:2,B:2,C:2);\n"));
+        let (_, trees) = TreeReader::new(input, "f", "input", None, 0, 0, false).unwrap();
+        let mut trees: Vec<_> = read_ahead(trees).collect();
+        assert!(trees.pop().is_some_and(|last| last.is_err()));
+        assert!(trees.iter().all(Result::is_ok));
     }
 
     // ── collect_newick_trees ──────────────────────────────────────────────────

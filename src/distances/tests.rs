@@ -5,14 +5,15 @@ use super::boundary::{
     RF_DENSE_SHARE, WEIGHTED_DENSE_SHARE, min_dense, parse_share, rf_dense_share,
     weighted_dense_share,
 };
-use super::layout::{Layout, NO_COLUMN, Trees, assign_columns};
+use super::layout::{Input, Laid, NO_COLUMN, assign_columns};
 use super::matrix::fill_symmetric;
 use super::rf::distance_rf_split;
 use super::treedist::TREEDIST_TREES;
-use super::weighted::{PANEL, sweep, weighted_distances_split, weighted_layout};
+use super::weighted::{PANEL, sweep, weighted_distances_split, weighted_lay_out};
 use crate::snapshot::{InternSnap, Snapshots};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
-
+use std::fmt::Debug;
 const T0: &str = "(A:0.1,(B:0.1,(H:0.1,(D:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);";
 const T1: &str = "(A:0.1,(B:0.1,(D:0.1,((J:0.1,H:0.1):0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1);";
 const T2: &str = "(A:0.1,(B:0.1,(D:0.1,(H:0.1,(J:0.1,(((G:0.1,E:0.1):0.1,(F:0.1,I:0.1):0.1):0.1,C:0.1):0.1):0.1):0.1):0.1):0.1);";
@@ -321,31 +322,34 @@ fn pairwise_backends_match_reference_on_random_trees() {
     }
 }
 
-/// WRF and KF with the dense/posting boundary at `min_dense`, mirroring
-/// [`super::distance_wrf`] and [`super::distance_kf`]. The trees are read
-/// borrowed and owned, and the two have to agree to the bit.
-fn weighted_at(snaps: &Snapshots, min_dense: u32) -> (Vec<f64>, Vec<f64>) {
-    let counts = &snaps.split_counts;
-    let both = |trees: fn(&Snapshots) -> Trees| {
-        (
-            weighted_distances_split(trees(snaps), counts, None, min_dense, f64::min, |d| d),
-            weighted_distances_split(
-                trees(snaps),
-                counts,
-                None,
-                min_dense,
-                |a, b| a * b,
-                f64::sqrt,
-            ),
-        )
-    };
-    let borrowed = both(|snaps| Trees::Borrowed(&snaps.snapshots));
-    let owned = both(|snaps| Trees::Owned(snaps.snapshots.clone()));
-    assert_eq!(
-        borrowed, owned,
-        "borrowed and owned trees disagree at min_dense={min_dense}"
-    );
+/// `kernel` on `snaps`' trees borrowed and on an owned copy of them, which
+/// have to agree to the bit.
+fn borrowed_and_owned<T: PartialEq + Debug>(
+    snaps: &Snapshots,
+    ctx: &str,
+    kernel: impl Fn(Input<'_>) -> T,
+) -> T {
+    let borrowed = kernel(snaps.into());
+    let owned = kernel(Input {
+        trees: Cow::Owned(snaps.snapshots.clone()),
+        counts: Cow::Borrowed(&snaps.split_counts),
+    });
+    assert_eq!(borrowed, owned, "borrowed and owned trees disagree, {ctx}");
     borrowed
+}
+
+/// WRF and KF with the dense/posting boundary at `min_dense`, mirroring
+/// [`super::distance_wrf`] and [`super::distance_kf`], from borrowed and
+/// from owned trees.
+fn weighted_at(snaps: &Snapshots, min_dense: u32) -> (Vec<f64>, Vec<f64>) {
+    (
+        borrowed_and_owned(snaps, &format!("WRF min_dense={min_dense}"), |input| {
+            weighted_distances_split(input, None, min_dense, f64::min, |d| d)
+        }),
+        borrowed_and_owned(snaps, &format!("KF min_dense={min_dense}"), |input| {
+            weighted_distances_split(input, None, min_dense, |a, b| a * b, f64::sqrt)
+        }),
+    )
 }
 
 /// The boundary decides which path a split takes and must decide nothing
@@ -408,30 +412,26 @@ fn dense_shares_follow_the_environment() {
 #[test]
 fn tiled_sweep_matches_the_untiled_formula_to_the_bit() {
     let (_, snaps) = random_snapshots(603, 13, 4, 51);
-    let (counts, n) = (&snaps.split_counts, snaps.snapshots.len());
+    let n = snaps.snapshots.len();
     let min_dense = min_dense(n, weighted_dense_share());
     type Overlap = fn(f64, f64) -> f64;
     type Finish = fn(f64) -> f64;
     let metrics: [(Overlap, Finish); 2] = [(f64::min, |d| d), (|a, b| a * b, f64::sqrt)];
     for (overlap, finish) in metrics {
-        let trees = || Trees::Borrowed(&snaps.snapshots);
-        let tiled = weighted_distances_split(trees(), counts, None, min_dense, overlap, finish);
+        let tiled = weighted_distances_split((&snaps).into(), None, min_dense, overlap, finish);
 
-        let layout = Layout::new(counts, n, min_dense, |count| count >= 2);
-        let (dense, postings, self_total) = weighted_layout(trees(), counts, &layout, &overlap);
+        let Laid {
+            rows: dense,
+            postings,
+            selfs: self_total,
+        } = weighted_lay_out((&snaps).into(), min_dense, &overlap);
         assert!(
             dense.stride > PANEL && dense.stride % 8 != 0,
             "{}",
             dense.stride
         );
-        let untiled = fill_symmetric(n, None, |i, row: &mut [f64]| {
-            let (cols, lengths) = postings.of_tree(i);
-            for (&col, &length) in cols.iter().zip(lengths) {
-                let (trees, others) = postings.after(col, i);
-                for (&j, &other) in trees.iter().zip(others) {
-                    row[j as usize] += overlap(length, other);
-                }
-            }
+        let untiled = fill_symmetric(n, 1, None, |i, row: &mut [f64]| {
+            postings.add_shared(i, row, &overlap);
             for (j, slot) in row.iter_mut().enumerate().skip(i + 1) {
                 let shared = sweep(dense.row(i), dense.row(j), &overlap) + *slot;
                 *slot = finish((self_total[i] + self_total[j] - 2.0 * shared).max(0.0));
@@ -490,19 +490,11 @@ fn rf_boundary_does_not_change_distances() {
         let (_, snaps) = random_snapshots(n_taxa, n_trees, duplicates, seed);
         let n = snaps.snapshots.len();
         for min_dense in [2, 3, n as u32 / 2, n as u32, n as u32 + 1] {
-            let counts = &snaps.split_counts;
-            let rf = distance_rf_split(Trees::Borrowed(&snaps.snapshots), counts, None, min_dense);
-            let owned = distance_rf_split(
-                Trees::Owned(snaps.snapshots.clone()),
-                counts,
-                None,
-                min_dense,
-            );
-            assert_eq!(
-                rf, owned,
-                "borrowed and owned trees disagree at min_dense={min_dense}"
-            );
-            assert_rf_matches_reference(&snaps, &rf, &format!("seed={seed} min_dense={min_dense}"));
+            let ctx = format!("seed={seed} min_dense={min_dense}");
+            let rf = borrowed_and_owned(&snaps, &ctx, |input| {
+                distance_rf_split(input, None, min_dense)
+            });
+            assert_rf_matches_reference(&snaps, &rf, &ctx);
         }
     }
 }

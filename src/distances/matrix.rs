@@ -3,25 +3,16 @@
 use crate::par::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Fill a symmetric `n × n` matrix one row at a time, one rayon task per row.
+/// Fill a symmetric `n × n` matrix a band of `band` rows at a time, one rayon
+/// task per band.
 ///
-/// `fill_row(i, row)` writes `row[j]` for every `j > i`. `row` arrives holding
-/// `T::default()` throughout, so a caller may accumulate into it first. The
-/// diagonal stays at `T::default()` and the lower triangle is mirrored from
-/// the upper. `progress` is bumped by each row's pair count as that row
-/// finishes.
-pub(super) fn fill_symmetric<T, F>(n: usize, progress: Option<&AtomicUsize>, fill_row: F) -> Vec<T>
-where
-    T: Copy + Default + Send,
-    F: Fn(usize, &mut [T]) + Sync,
-{
-    fill_symmetric_banded(n, 1, progress, fill_row)
-}
-
-/// [`fill_symmetric`] with one rayon task per band of `band` rows:
 /// `fill_band(i0, rows)` writes `rows[r * n + j]` for every row `i0 + r` of the
-/// band and every `j > i0 + r`.
-pub(super) fn fill_symmetric_banded<T, F>(
+/// band and every `j > i0 + r`; with `band == 1` that is `rows[j]` of row `i0`.
+/// `rows` arrives holding `T::default()` throughout, so a caller may accumulate
+/// into it first. The last band may be shorter. The diagonal stays at
+/// `T::default()` and the lower triangle is mirrored from the upper.
+/// `progress` is bumped by each band's pair count as that band finishes.
+pub(super) fn fill_symmetric<T, F>(
     n: usize,
     band: usize,
     progress: Option<&AtomicUsize>,
@@ -31,6 +22,7 @@ where
     T: Copy + Default + Send,
     F: Fn(usize, &mut [T]) + Sync,
 {
+    debug_assert!(band > 0, "a band holds at least one row");
     let mut matrix = vec![T::default(); n * n];
 
     matrix
@@ -47,7 +39,7 @@ where
 
     // Mirror into the lower triangle in tiles: a plain row-read/column-write
     // sweep puts every write on its own cache line at large `n`.
-    const TILE: usize = 64;
+    pub(super) const TILE: usize = 64;
     for i0 in (0..n).step_by(TILE) {
         for j0 in (i0..n).step_by(TILE) {
             for i in i0..(i0 + TILE).min(n) {

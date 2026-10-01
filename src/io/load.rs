@@ -43,16 +43,20 @@ pub fn load_beast_trees<P: AsRef<Path>>(
 
     let mut names = Vec::new();
     let mut failed = None;
-    let entries = read_ahead(reader).map_while(|tree| match tree {
-        Ok(mut tree) => {
-            names.push(std::mem::take(&mut tree.name));
-            Some((tree, &translate))
-        }
-        Err(e) => {
-            failed = Some(e);
-            None
-        }
-    });
+    // Fused: the builder asks again after a short chunk, and `map_while`
+    // would read on past the error that ended it.
+    let entries = read_ahead(reader)
+        .map_while(|tree| match tree {
+            Ok(mut tree) => {
+                names.push(std::mem::take(&mut tree.name));
+                Some((tree, &translate))
+            }
+            Err(e) => {
+                failed = Some(e);
+                None
+            }
+        })
+        .fuse();
     let built = Snapshots::from_newick_iter_opts(entries, rooted, retain);
     match (failed, built) {
         (None, Ok(snaps)) => return (names, snaps),
@@ -97,6 +101,32 @@ mod tests {
         let (names, snaps) = load_bytes(content, ".trees");
         assert_eq!(names.len(), 2);
         assert_eq!(snaps.len(), 2);
+    }
+
+    /// A MrBayes `.t` file: the TRANSLATE block ends on its last entry, so the
+    /// tree lines after it are still trees.
+    #[test]
+    fn test_load_beast_trees_mrbayes_translate() {
+        let content = b"#NEXUS\n[ID: 123]\nbegin trees;\n   translate\n       1 A,\n       2 B,\n       3 C,\n       4 D;\n   tree gen.0 = [&U] ((1:1,2:1):1,(3:1,4:1):1);\n   tree gen.100 = [&U] ((1:1,3:1):1,(2:1,4:1):1);\nend;\n";
+        let (names, snaps) = load_bytes(content, ".t");
+        assert_eq!(names.len(), 2);
+        assert_eq!(snaps.leaf_names, ["A", "B", "C", "D"]);
+        assert_eq!(snaps.pairwise_rf(None), vec![0, 2, 2, 0]);
+    }
+
+    /// A byte-order mark neither hides a `#NEXUS` header nor a Newick file's
+    /// first tree.
+    #[test]
+    fn test_load_beast_trees_byte_order_mark() {
+        let nexus = "\u{feff}#NEXUS\nBegin trees;\n\tTranslate\n\t\t1 A,\n\t\t2 B,\n\t\t3 C,\n\t\t4 D\n\t\t;\ntree STATE_0 = ((1:1,2:1):1,(3:1,4:1):1);\ntree STATE_10 = ((1:1,3:1):1,(2:1,4:1):1);\nEnd;\n";
+        let (names, snaps) = load_bytes(nexus.as_bytes(), ".trees");
+        assert_eq!(names.len(), 2);
+        assert_eq!(snaps.leaf_names, ["A", "B", "C", "D"]);
+
+        let newick = "\u{feff}((A:1,B:1):1,(C:1,D:1):1);\n((A:1,C:1):1,(B:1,D:1):1);\n";
+        let (names, snaps) = load_bytes(newick.as_bytes(), ".newick");
+        assert_eq!(names.len(), 2);
+        assert_eq!(snaps.pairwise_rf(None), vec![0, 2, 2, 0]);
     }
 
     /// More trees than the read-ahead queue holds still arrive complete and in

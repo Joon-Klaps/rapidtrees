@@ -53,18 +53,35 @@ pub(super) fn nexus_tree_lines(content: &str) -> impl Iterator<Item = (&str, &st
 
 /// Read a NEXUS `TRANSLATE` block into a numeric-ID → taxon-name map.
 pub fn parse_taxon_block(content: &str) -> HashMap<String, String> {
-    content
+    let mut translate = HashMap::new();
+    let block = content
         .lines()
         .skip_while(|line| !starts_with_ci(line.trim(), "translate"))
-        .skip(1)
-        .take_while(|line| !line.trim().starts_with(';'))
-        .filter_map(translate_entry)
-        .collect::<HashMap<_, _>>()
+        .skip(1);
+    for line in block {
+        translate.extend(translate_entry(line));
+        if closes_translate(line) {
+            break;
+        }
+    }
+    translate
 }
 
-/// One `TRANSLATE` line, `<id> <label>,`, as `(id, label)`, quotes dropped.
+/// Whether a `TRANSLATE` line ends the block: a line opening with `;`, or the
+/// last entry carrying the `;` itself, as MrBayes writes it.
+pub(super) fn closes_translate(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with(';') || line.ends_with(';')
+}
+
+/// One `TRANSLATE` line, `<id> <label>,` or a last `<id> <label>;`, as
+/// `(id, label)`, quotes dropped. A line opening with `;` holds none.
 pub(super) fn translate_entry(line: &str) -> Option<(String, String)> {
-    let line = line.trim().trim_end_matches(',');
+    let line = line.trim();
+    if line.starts_with(';') {
+        return None;
+    }
+    let line = line.trim_end_matches(';').trim_end().trim_end_matches(',');
     let mut parts = line.split_whitespace();
     let id = parts.next()?.to_string();
     let label = parts.next()?.trim_matches('\'').to_string();
@@ -107,6 +124,16 @@ mod tests {
         assert_eq!(map.get("1").map(String::as_str), Some("Alpha"));
         assert_eq!(map.get("2").map(String::as_str), Some("Beta"));
         assert_eq!(map.get("3").map(String::as_str), Some("Gamma"));
+    }
+
+    /// MrBayes ends the block on the last entry: its `;` is not part of the
+    /// label, and the tree lines after it are not entries.
+    #[test]
+    fn test_parse_taxon_block_semicolon_on_last_entry() {
+        let content = "begin trees;\n   translate\n       1 A,\n       2 'B';\n   tree gen.0 = [&U] (1:1,2:1);\nend;\n";
+        let map = parse_taxon_block(content);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("2").map(String::as_str), Some("B"));
     }
 
     #[test]
