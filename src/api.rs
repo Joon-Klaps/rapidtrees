@@ -82,9 +82,9 @@ fn collect_snapshots_from_iter(input: IterInput<'_, '_>, retain: Retain) -> PyRe
 /// share one body.
 type WeightedMetric = fn(&Snapshots, Option<&AtomicUsize>) -> Vec<f64>;
 
-/// A weighted metric that consumes the collection: for entry points that
+/// A [`WeightedMetric`] that consumes the collection: for entry points that
 /// return the matrix alone.
-type ConsumingMetric = fn(Snapshots, Option<&AtomicUsize>) -> Vec<f64>;
+type IntoWeightedMetric = fn(Snapshots, Option<&AtomicUsize>) -> Vec<f64>;
 
 /// Shared body of the plain WRF and KF entry points.
 ///
@@ -95,7 +95,7 @@ fn weighted_pairwise(
     py: Python<'_>,
     input: IterInput<'_, '_>,
     progress: Option<Py<ProgressCounter>>,
-    metric: ConsumingMetric,
+    metric: IntoWeightedMetric,
 ) -> PyResult<Vec<f64>> {
     let snaps = collect_snapshots_from_iter(
         input,
