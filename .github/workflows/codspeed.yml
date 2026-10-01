@@ -31,6 +31,9 @@ jobs:
 
         steps:
             - uses: actions/checkout@v5
+              with:
+                  # The real BEAST posteriors in tests/data are git LFS files.
+                  lfs: true
 
             - name: Setup Rust + cargo-codspeed
               uses: moonrepo/setup-rust@v1
