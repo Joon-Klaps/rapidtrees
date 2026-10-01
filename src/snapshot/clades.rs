@@ -50,10 +50,25 @@ impl CladeTable {
         }
     }
 
-    /// Number of leaf indices across all clades.
-    #[inline]
-    pub(crate) fn n_leaves(&self) -> usize {
-        self.leaves.len()
+    /// One single-leaf clade per leaf `0..n`, in order: the pendant splits.
+    pub(crate) fn singletons(n: usize) -> Self {
+        Self {
+            leaves: (0..n as u32).collect(),
+            starts: (0..=n as u32).collect(),
+        }
+    }
+
+    /// Every clade of `parts`, in order, in a table allocated once at its final
+    /// size. Grown by doubling instead, it could end up twice that size, and
+    /// every part is still alive while it grows.
+    pub(crate) fn concat(parts: Vec<CladeTable>) -> Self {
+        let clades = parts.iter().map(Self::len).sum();
+        let leaves = parts.iter().map(|part| part.leaves.len()).sum();
+        let mut merged = Self::with_capacity(clades, leaves);
+        for part in parts {
+            merged.append(part);
+        }
+        merged
     }
 
     /// Number of distinct splits in the table.
@@ -70,7 +85,7 @@ impl CladeTable {
     }
 
     /// Append every clade of `other`, in order.
-    pub(crate) fn append(&mut self, other: CladeTable) {
+    fn append(&mut self, other: CladeTable) {
         let base = self.leaves.len() as u32;
         self.leaves.extend_from_slice(&other.leaves);
         self.starts
@@ -166,18 +181,32 @@ mod tests {
     }
 
     #[test]
-    fn with_capacity_holds_appended_tables_without_growing() {
-        let parts = [table(&[&[2, 0], &[1]]), table(&[&[4, 3], &[], &[5]])];
-        let (clades, leaves) = (5, parts.iter().map(CladeTable::n_leaves).sum());
-        let mut merged = CladeTable::with_capacity(clades, leaves);
-        assert_eq!(merged.len(), 0);
-        for part in parts {
-            merged.append(part);
-        }
-        assert_eq!(merged.n_leaves(), 6);
+    fn concat_allocates_exactly_its_parts() {
+        let parts = vec![table(&[&[2, 0], &[1]]), table(&[&[4, 3], &[], &[5]])];
+        let merged = CladeTable::concat(parts);
+        assert_eq!(merged.len(), 5);
+        assert_eq!(merged.get(2), &[3, 4]);
         assert_eq!(merged.get(4), &[5]);
-        assert_eq!(merged.leaves.capacity(), leaves);
-        assert_eq!(merged.starts.capacity(), clades + 1);
+        assert_eq!(merged.leaves.capacity(), 6);
+        assert_eq!(merged.starts.capacity(), 6);
+    }
+
+    /// Parts that hold no clades — every shard when bipartitions are off —
+    /// must not reserve anything.
+    #[test]
+    fn concat_of_empty_parts_reserves_nothing() {
+        let merged = CladeTable::concat(vec![CladeTable::new(), CladeTable::new()]);
+        assert_eq!(merged.len(), 0);
+        assert_eq!(merged.leaves.capacity(), 0);
+        assert_eq!(merged.starts.capacity(), 1);
+    }
+
+    #[test]
+    fn singletons_holds_one_clade_per_leaf() {
+        let t = CladeTable::singletons(3);
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.get(0), &[0]);
+        assert_eq!(t.get(2), &[2]);
     }
 
     #[test]
