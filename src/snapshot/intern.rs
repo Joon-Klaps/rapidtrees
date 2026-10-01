@@ -116,8 +116,10 @@ impl Shard {
             .ok_or_else(|| "Too many distinct splits for 32-bit split IDs.".to_string())?;
         // Grow by half rather than double: the shards fill evenly, so doubling
         // would leave every one of them oversized by the same large margin.
+        // The floor stays small because it is paid [`SHARDS`] times over: a
+        // floor of 1024 cost 6 MiB per collection however few splits it held.
         if fps.len() == fps.capacity() {
-            let extra = (fps.capacity() / 2).max(1024);
+            let extra = (fps.capacity() / 2).max(16);
             fps.reserve_exact(extra);
             sizes.reserve_exact(extra);
             counts.reserve_exact(extra);
@@ -319,20 +321,18 @@ impl Interner {
         // Every tree holds every pendant once, and pendant `k` names leaf `k`.
         let mut counts = Vec::with_capacity(total as usize);
         counts.resize(base, snapshots.len() as u32);
-        let mut clades = CladeTable::new();
+        let mut clades = Vec::with_capacity(SHARDS + 1);
         if self.retain.bipartitions {
-            for leaf in 0..self.num_leaves as u32 {
-                clades.push(std::iter::once(leaf));
-            }
+            clades.push(CladeTable::singletons(self.num_leaves));
         }
         for shard in self.shards {
             counts.extend_from_slice(&shard.counts);
-            clades.append(shard.clades);
+            clades.push(shard.clades);
         }
 
         Snapshots {
             snapshots,
-            clades,
+            clades: CladeTable::concat(clades),
             split_counts: counts,
             words_per_bitset: self.words,
             leaf_names,

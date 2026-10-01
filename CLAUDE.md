@@ -52,7 +52,11 @@ docs/
    C-library codec deps, and every parallel loop goes through `par.rs`. That is
    what lets it link into a wasm build at all. Enforced by
    `cargo check --lib --no-default-features --target wasm32-unknown-unknown`,
-   which runs in pre-commit and in CI.
+   which runs in pre-commit and in CI, and at runtime by `pixi run test-wasm`
+   (`node tests/wasm/run.ts`), which CI also runs: it loads the wasm32 build in
+   Node, reads the BEAST files in `tests/data`, and checks the matrices against
+   the native CLI. `tests/wasm` is a standalone `extern "C"` cdylib, so the test
+   needs no wasm-bindgen.
 3. **Browser-only algorithms do not belong here.** They go in treetracer-web's
    `core/`. The test is whether the Python API or CLI can reach it: if not, it
    is not a `rapidtrees` concern. MCMC diagnostics — log densities, chain
