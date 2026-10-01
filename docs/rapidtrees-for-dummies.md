@@ -99,7 +99,7 @@ Two splits in Tree 1 only, two in Tree 2 only → **RF = 4**. ✅
 
 Two kinds of split get special treatment:
 
-- **Pendant edges** (`{A}`, `{B}`, …) — the branch leading to a single leaf. Every tree over the same taxa has all of them, so they never contribute to RF. They are kept anyway, because the *weighted* metrics need their branch lengths.
+- **Pendant edges** (`{A}`, `{B}`, …) — the branch leading to a single leaf. Every tree over the same taxa has all of them, so they never contribute to RF, and plain RF does not store them. They are kept for the *weighted* metrics, which need their branch lengths.
 - **Trivial splits** — a split whose one side is everything-but-one-leaf is just a pendant edge seen from the other direction, so it is dropped to avoid double-counting.
 
 So the entire job reduces to: **turn each tree into its set of splits, then compare sets.** Everything that follows is about making both halves cheap.
@@ -268,10 +268,13 @@ Across 4 000 trees the *same* splits recur constantly — that's what it means f
 
 The split table is cut into 256 **shards** by the low bits of the fingerprint, and every shard interns a chunk of trees at the same time as the others, on its own thread. A shard numbers the splits it has not seen in the order it meets them, walking the chunk tree by tree, and the shards are then numbered one after another. The IDs therefore depend on the trees alone, not on the thread count or the chunk size:
 
+Pendant edges never reach a shard. Every tree has all of them, so the pendant of leaf `k` is split `k` outright, and the shards number the internal splits after them. A tree's IDs open with its pendants in leaf order, followed by its internal splits. Plain RF stores no pendants at all: every tree holds every one of them, so they cancel.
+
 ```text
-split {B}          → ID 0
-split {C,D,E,F,G}  → ID 1     (the {A,B} split, stored as the side without A)
-split {G}          → ID 2
+split {A}          → ID 0     (pendants: one ID per leaf, A to G)
+...
+split {G}          → ID 6
+split {C,D,E,F,G}  → ID 7     (the {A,B} split, stored as the side without A)
 ...
 ```
 
@@ -286,12 +289,12 @@ struct InternSnap {
 
 The interner matches a candidate on **both** its fingerprint and the cardinality of its smaller side. The cardinality is equal for both sides of a bipartition, so it costs one integer compare and rules out a slice of the collision space for free.
 
-For our two trees the whole run has **13 distinct splits** (7 pendants + 6 internal), so, sorted (a tree keeps its IDs in part order):
+For our two trees the whole run has **13 distinct splits** (7 pendants + 6 internal), so, sorted (a tree keeps its pendants first, then its internal splits in part order):
 
 ```text
-tree 1: split_ids = [0, 1, 2,    4, 5,    7, 8, 9, 10, 11, 12]
-tree 2: split_ids = [0, 1, 2, 3, 4, 5, 6,    8, 9,     11, 12]
-                              ↑        ↑  ↑        ↑
+tree 1: split_ids = [0, 1, 2, 3, 4, 5, 6, 7,       10, 11, 12]
+tree 2: split_ids = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,         12]
+                                             ↑  ↑  ↑   ↑
                        held by one tree only — 4 splits → RF = 4
 ```
 
@@ -307,12 +310,12 @@ Two payoffs:
 RF counts the splits one tree has and the other lacks, so with splits as integers it becomes a question about two lists of IDs. Line them up by ID:
 
 ```text
-t1: [0, 1, 2,    4, 5,    7, 8, 9, 10, 11, 12]
-t2: [0, 1, 2, 3, 4, 5, 6,    8, 9,     11, 12]
-              ↑        ↑  ↑        ↑
+t1: [0, 1, 2, 3, 4, 5, 6, 7,       10, 11, 12]
+t2: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,         12]
+                             ↑  ↑  ↑   ↑
 ```
 
-IDs 7 and 10 are in `t1` only, 3 and 6 in `t2` only, and the other 9 are `shared`. Then
+IDs 10 and 11 are in `t1` only, 8 and 9 in `t2` only, and the other 9 are `shared`. Then
 
 ```text
 RF = (len(t1) − shared) + (len(t2) − shared)

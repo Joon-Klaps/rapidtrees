@@ -13,6 +13,7 @@ This project uses release names based on random words from [codenamegenerator.co
 - ([#44](https://github.com/Joon-Klaps/rapidtrees/pull/44)) - __PERFORMANCE__: Tree files are streamed a chunk of trees at a time instead of being read whole and copied, so memory no longer grows with the size of the input file.
 - ([#45](https://github.com/Joon-Klaps/rapidtrees/pull/45)) - __PERFORMANCE__: The Python entry points pull newick strings from their iterator a chunk at a time instead of collecting every string first.
 - ([#46](https://github.com/Joon-Klaps/rapidtrees/pull/46)) - __PERFORMANCE__: Splits are interned by 256 fingerprint shards in parallel instead of in one table on one thread, and the split table's key columns carry no padding.
+- ([#48](https://github.com/Joon-Klaps/rapidtrees/pull/48)) - __PERFORMANCE__: Pendant edges take their leaf's index as split ID instead of going through the split table, and plain RF no longer stores them.
 
 ## [0.10.0] - Surface Copperhead (2026-09-24)
 

@@ -1354,18 +1354,29 @@ fn split_ids_do_not_depend_on_the_thread_count() {
     }
 }
 
-/// Every part's split ID names that part's canonical leaf set: the shards'
-/// clade tables, their concatenation and the dense renumbering agree.
+/// Every part's split ID names that part's canonical leaf set: the pendant of
+/// leaf `k` is split `k`, and the internal parts follow the pendants in part
+/// order. Checks the shards' clade tables, their concatenation and the dense
+/// renumbering together.
 #[test]
 fn every_split_id_names_its_parts_clade() {
     let trees = random_trees(17);
     let refs: Vec<&str> = trees.iter().map(String::as_str).collect();
     for rooted in [false, true] {
         let snaps = Snapshots::from_newicks(&refs, rooted).unwrap();
+        let n = snaps.leaf_names.len();
         assert_eq!(snaps.clades.len(), snaps.n_distinct_splits());
         for (newick, interned) in refs.iter().zip(&snaps.snapshots) {
             let snap = snapshot_of(newick, rooted);
-            for (part, &id) in snap.parts.iter().zip(&interned.split_ids) {
+            let (pendants, internal): (Vec<&Part>, Vec<&Part>) =
+                snap.parts.iter().partition(|part| part.size == 1);
+            assert_eq!(pendants.len(), n);
+            assert_eq!(interned.split_ids.len(), n + internal.len());
+            let ids = pendants
+                .iter()
+                .map(|part| snap.leaf_order[part.first as usize])
+                .chain(interned.split_ids[n..].iter().copied());
+            for (part, id) in pendants.iter().chain(&internal).zip(ids) {
                 let mut clade = CladeTable::new();
                 snap.push_canonical(part, rooted, &mut clade);
                 assert_eq!(
@@ -1376,4 +1387,52 @@ fn every_split_id_names_its_parts_clade() {
             }
         }
     }
+}
+
+/// Pendant edges skip the split table: every tree opens with the IDs `0..n`,
+/// each held by every tree, with its branch lengths in leaf order.
+#[test]
+fn pendants_are_the_first_split_ids_in_leaf_order() {
+    let snaps = Snapshots::from_newicks(
+        &[
+            "((C:3,A:1):9,(B:2,D:4):8);",
+            "((D:40,C:30):7,(B:20,A:10):6);",
+        ],
+        false,
+    )
+    .unwrap();
+    assert_eq!(snaps.leaf_names, ["A", "B", "C", "D"]);
+    for (snap, scale) in snaps.snapshots.iter().zip([1.0, 10.0]) {
+        assert_eq!(snap.split_ids[..4], [0, 1, 2, 3]);
+        assert_eq!(
+            snap.lengths[..4],
+            [scale, 2.0 * scale, 3.0 * scale, 4.0 * scale]
+        );
+    }
+    assert_eq!(snaps.split_counts[..4], [2, 2, 2, 2]);
+    for leaf in 0..4 {
+        assert_eq!(snaps.clades.get(leaf), &[leaf as u32]);
+    }
+}
+
+/// Plain RF stores no pendant edges at all, and still gives the matrix a
+/// collection that keeps them gives.
+#[test]
+fn rf_only_collections_store_no_pendants() {
+    let trees = random_trees(11);
+    let refs: Vec<&str> = trees.iter().map(String::as_str).collect();
+    let empty = HashMap::new();
+    let entries = refs.iter().map(|&n| (n, &empty));
+    let rf_only =
+        Snapshots::from_newick_iter_opts(entries, false, Retain::for_distances(false)).unwrap();
+    let everything = Snapshots::from_newicks(&refs, false).unwrap();
+    let n = everything.leaf_names.len();
+    for (lean, full) in rf_only.snapshots.iter().zip(&everything.snapshots) {
+        assert_eq!(lean.split_ids.len() + n, full.split_ids.len());
+    }
+    assert_eq!(
+        rf_only.n_distinct_splits() + n,
+        everything.n_distinct_splits()
+    );
+    assert_eq!(rf_only.pairwise_rf(None), everything.pairwise_rf(None));
 }
