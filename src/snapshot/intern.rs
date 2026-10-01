@@ -109,8 +109,10 @@ impl Shard {
             .ok_or_else(|| "Too many distinct splits for 32-bit split IDs.".to_string())?;
         // Grow by half rather than double: the shards fill evenly, so doubling
         // would leave every one of them oversized by the same large margin.
+        // The floor stays small because it is paid [`SHARDS`] times over: a
+        // floor of 1024 cost 6 MiB per collection however few splits it held.
         if fps.len() == fps.capacity() {
-            let extra = (fps.capacity() / 2).max(1024);
+            let extra = (fps.capacity() / 2).max(16);
             fps.reserve_exact(extra);
             sizes.reserve_exact(extra);
             counts.reserve_exact(extra);
@@ -273,8 +275,16 @@ impl Interner {
             }
         });
 
+        // Sized up front: grown by doubling, the merged table would end up to
+        // twice its size while the shards' tables are still alive.
         let mut counts = Vec::with_capacity(total as usize);
-        let mut clades = CladeTable::new();
+        let mut clades = CladeTable::with_capacity(
+            total as usize,
+            self.shards
+                .iter()
+                .map(|shard| shard.clades.n_leaves())
+                .sum(),
+        );
         for shard in self.shards {
             counts.extend_from_slice(&shard.counts);
             clades.append(shard.clades);
