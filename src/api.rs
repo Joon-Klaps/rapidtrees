@@ -82,15 +82,20 @@ fn collect_snapshots_from_iter(input: IterInput<'_, '_>, retain: Retain) -> PyRe
 /// share one body.
 type WeightedMetric = fn(&Snapshots, Option<&AtomicUsize>) -> Vec<f64>;
 
+/// A weighted metric that consumes the collection: for entry points that
+/// return the matrix alone.
+type ConsumingMetric = fn(Snapshots, Option<&AtomicUsize>) -> Vec<f64>;
+
 /// Shared body of the plain WRF and KF entry points.
 ///
 /// These paths export nothing and the dense kernels read only `split_ids` +
-/// `lengths`, so the bipartition table is never built in the first place.
+/// `lengths`, so the bipartition table is never built in the first place, and
+/// the kernel is handed the collection to drop as it goes.
 fn weighted_pairwise(
     py: Python<'_>,
     input: IterInput<'_, '_>,
     progress: Option<Py<ProgressCounter>>,
-    metric: WeightedMetric,
+    metric: ConsumingMetric,
 ) -> PyResult<Vec<f64>> {
     let snaps = collect_snapshots_from_iter(
         input,
@@ -101,7 +106,9 @@ fn weighted_pairwise(
     )?;
 
     let total = n_pairs(snaps.len());
-    with_counter(py, progress, total, |counter| metric(&snaps, Some(counter)))
+    with_counter(py, progress, total, move |counter| {
+        metric(snaps, Some(counter))
+    })
 }
 
 /// Shared body of the WRF and KF snapshot-exporting entry points.
@@ -223,8 +230,8 @@ fn pairwise_rf_from_newick_iter(
     )?;
 
     let n = snaps.len();
-    let rf_matrix = with_counter(py, progress, n_pairs(n), |counter| {
-        snaps.pairwise_rf(Some(counter))
+    let rf_matrix = with_counter(py, progress, n_pairs(n), move |counter| {
+        snaps.into_pairwise_rf(Some(counter))
     })?;
     let rf_bytes: Vec<u8> = rf_matrix
         .chunks(n)
@@ -487,7 +494,7 @@ fn pairwise_wrf_from_newick_iter(
         map_indices: &map_indices,
         rooted,
     };
-    let matrix = weighted_pairwise(py, input, progress, Snapshots::pairwise_wrf)?;
+    let matrix = weighted_pairwise(py, input, progress, Snapshots::into_pairwise_wrf)?;
     Ok((names, matrix))
 }
 
@@ -527,7 +534,7 @@ fn pairwise_kf_from_newick_iter(
         map_indices: &map_indices,
         rooted,
     };
-    let matrix = weighted_pairwise(py, input, progress, Snapshots::pairwise_kf)?;
+    let matrix = weighted_pairwise(py, input, progress, Snapshots::into_pairwise_kf)?;
     Ok((names, matrix))
 }
 

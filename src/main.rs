@@ -104,20 +104,23 @@ fn main() {
     // three tokens say here.
     macro_rules! compute_and_write {
         ($metric:ident) => {{
+            let n_trees = interned.len();
             let mat = run_with_progress(n_pairs, show_progress, |counter| {
                 interned.$metric(Some(counter))
             });
             log_computed(quiet, metric_label, &t);
             let t = Instant::now();
-            let r = write_matrix_tsv(output_path, &names, &mat, interned.len());
+            let r = write_matrix_tsv(output_path, &names, &mat, n_trees);
             (r, t)
         }};
     }
 
     let (write_result, t) = match args.metric {
-        MetricArg::Rf => compute_and_write!(pairwise_rf),
-        MetricArg::Weighted => compute_and_write!(pairwise_wrf),
-        MetricArg::Kf => compute_and_write!(pairwise_kf),
+        // The matrix is all the CLI needs, so each kernel is handed the
+        // collection and drops its per-tree data as it goes.
+        MetricArg::Rf => compute_and_write!(into_pairwise_rf),
+        MetricArg::Weighted => compute_and_write!(into_pairwise_wrf),
+        MetricArg::Kf => compute_and_write!(into_pairwise_kf),
     };
     if let Err(e) = write_result {
         eprintln!("Failed to write output {}: {e}", output_path.display());

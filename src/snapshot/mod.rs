@@ -292,6 +292,29 @@ impl Snapshots {
         crate::distances::distance_kf(self, progress)
     }
 
+    /// [`Self::pairwise_rf`] for a caller that is done with the collection.
+    ///
+    /// The per-tree split IDs are dropped a block of trees at a time as the
+    /// kernel lays them out, so they are gone before the pairwise sweep.
+    pub fn into_pairwise_rf(self, progress: Option<&std::sync::atomic::AtomicUsize>) -> Vec<u32> {
+        crate::distances::distance_rf_owned(self, progress)
+    }
+
+    /// [`Self::pairwise_wrf`] for a caller that is done with the collection.
+    ///
+    /// Each tree's split IDs and branch lengths are dropped a block of trees at
+    /// a time as the kernel lays them out, so the trees and the kernel's dense
+    /// rows and posting lists are never both whole.
+    pub fn into_pairwise_wrf(self, progress: Option<&std::sync::atomic::AtomicUsize>) -> Vec<f64> {
+        crate::distances::distance_wrf_owned(self, progress)
+    }
+
+    /// [`Self::pairwise_kf`] for a caller that is done with the collection; see
+    /// [`Self::into_pairwise_wrf`].
+    pub fn into_pairwise_kf(self, progress: Option<&std::sync::atomic::AtomicUsize>) -> Vec<f64> {
+        crate::distances::distance_kf_owned(self, progress)
+    }
+
     /// A collection of no trees.
     pub(crate) fn empty() -> Self {
         Self {
