@@ -12,6 +12,7 @@ This project uses release names based on random words from [codenamegenerator.co
 
 - ([#44](https://github.com/Joon-Klaps/rapidtrees/pull/44)) - __PERFORMANCE__: Tree files are streamed a chunk of trees at a time instead of being read whole and copied, so memory no longer grows with the size of the input file.
 - ([#45](https://github.com/Joon-Klaps/rapidtrees/pull/45)) - __PERFORMANCE__: The Python entry points pull newick strings from their iterator a chunk at a time instead of collecting every string first.
+- ([#56](https://github.com/Joon-Klaps/rapidtrees/pull/56)) - __PERFORMANCE__: Trees are parsed in smaller chunks, which lowers peak memory when building collections of up to tens of thousands of taxa.
 
 ## [0.10.0] - Surface Copperhead (2026-09-24)
 
