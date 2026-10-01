@@ -105,26 +105,16 @@ fn weighted_dense_share() -> f64 {
     })
 }
 
-/// Fill a symmetric `n × n` matrix one row at a time, one rayon task per row.
+/// Fill a symmetric `n × n` matrix a band of `band` rows at a time, one rayon
+/// task per band.
 ///
-/// `fill_row(i, row)` writes `row[j]` for every `j > i`. `row` arrives holding
-/// `T::default()` throughout, so a caller may accumulate into it first. The
-/// diagonal stays at `T::default()` and the lower triangle is mirrored from
-/// the upper. `progress` is bumped by each row's pair count as that row
-/// finishes.
-fn fill_symmetric<T, F>(n: usize, progress: Option<&AtomicUsize>, fill_row: F) -> Vec<T>
-where
-    T: Copy + Default + Send,
-    F: Fn(usize, &mut [T]) + Sync,
-{
-    fill_symmetric_banded(n, 1, progress, fill_row)
-}
-
-/// [`fill_symmetric`] with one rayon task per band of `band` rows:
 /// `fill_band(i0, rows)` writes `rows[r * n + j]` for every row `i0 + r` of the
-/// band and every `j > i0 + r`. The last band may be shorter. `progress` is
-/// bumped by each band's pair count as that band finishes.
-fn fill_symmetric_banded<T, F>(
+/// band and every `j > i0 + r`; with `band == 1` that is `rows[j]` of row `i0`.
+/// `rows` arrives holding `T::default()` throughout, so a caller may accumulate
+/// into it first. The last band may be shorter. The diagonal stays at
+/// `T::default()` and the lower triangle is mirrored from the upper.
+/// `progress` is bumped by each band's pair count as that band finishes.
+fn fill_symmetric<T, F>(
     n: usize,
     band: usize,
     progress: Option<&AtomicUsize>,
@@ -478,6 +468,20 @@ impl Postings {
         };
         (&trees[from..], lengths)
     }
+
+    /// Add `overlap(lengthᵢ, lengthⱼ)` into `row[j]` for each posted split tree
+    /// `i` holds and each later tree `j` holding it too, in tree `i`'s column
+    /// order. Reads the branch lengths, so the lists must be built with them.
+    #[inline]
+    fn add_shared(&self, i: usize, row: &mut [f64], overlap: &impl Fn(f64, f64) -> f64) {
+        let (cols, lengths) = self.of_tree(i);
+        for (&col, &length) in cols.iter().zip(lengths) {
+            let (trees, others) = self.after(col, i);
+            for (&j, &other) in trees.iter().zip(others) {
+                row[j as usize] += overlap(length, other);
+            }
+        }
+    }
 }
 
 impl PostingsBuilder {
@@ -689,7 +693,7 @@ fn distance_rf_split(input: Input<'_>, progress: Option<&AtomicUsize>, min_dense
     );
     let bits = BitRows::new(rows, n);
 
-    fill_symmetric(n, progress, |i, row: &mut [u32]| {
+    fill_symmetric(n, 1, progress, |i, row: &mut [u32]| {
         // Shared splits from the posting lists first, counted in place.
         for &col in postings.of_tree(i).0 {
             for &j in postings.after(col, i).0 {
@@ -719,19 +723,8 @@ const LANES: usize = 8;
 /// is what keeps identical trees at exactly 0.0.
 #[inline]
 fn sweep(a: &[f64], b: &[f64], overlap: &impl Fn(f64, f64) -> f64) -> f64 {
-    let (a_blocks, a_tail) = a.as_chunks::<LANES>();
-    let (b_blocks, b_tail) = b.as_chunks::<LANES>();
-
     let mut lanes = [0.0f64; LANES];
-    let mut add = |xs: &[f64], ys: &[f64]| {
-        for ((lane, &x), &y) in lanes.iter_mut().zip(xs).zip(ys) {
-            *lane += overlap(x, y);
-        }
-    };
-    for (xs, ys) in a_blocks.iter().zip(b_blocks) {
-        add(xs, ys);
-    }
-    add(a_tail, b_tail);
+    accumulate(&mut lanes, a, b, overlap);
     lanes.iter().sum()
 }
 
@@ -746,10 +739,10 @@ const PANEL: usize = 512;
 // add in `sweep`'s order.
 const _: () = assert!(PANEL.is_multiple_of(LANES));
 
-/// Add `overlap(a[k], b[k])` into `lanes` exactly as [`sweep`] does over the
-/// same columns: whole blocks of eight first, then the tail into the first
-/// lanes. Called panel by panel, with every panel but the last a multiple of
-/// eight wide, the lanes end up holding exactly what [`sweep`] adds up.
+/// Add `overlap(a[k], b[k])` into `lanes` in [`sweep`]'s order: whole blocks
+/// of eight first, then the tail into the first lanes. Called panel by panel,
+/// with every panel but the last a multiple of eight wide, the lanes end up
+/// holding exactly what one call over the whole rows would.
 #[inline(always)]
 fn accumulate(lanes: &mut [f64; LANES], a: &[f64], b: &[f64], overlap: &impl Fn(f64, f64) -> f64) {
     let (a_blocks, a_tail) = a.as_chunks::<LANES>();
@@ -844,17 +837,11 @@ fn weighted_distances_split(
         selfs: self_total,
     } = weighted_lay_out(input, min_dense, &overlap);
 
-    fill_symmetric_banded(n, TILE_I, progress, |i0, rows: &mut [f64]| {
+    fill_symmetric(n, TILE_I, progress, |i0, rows: &mut [f64]| {
         let i1 = i0 + rows.len() / n;
         // Shared terms from the posting lists first, accumulated in place.
         for (i, row) in (i0..i1).zip(rows.chunks_mut(n)) {
-            let (cols, lengths) = postings.of_tree(i);
-            for (&col, &length) in cols.iter().zip(lengths) {
-                let (trees, others) = postings.after(col, i);
-                for (&j, &other) in trees.iter().zip(others) {
-                    row[j as usize] += overlap(length, other);
-                }
-            }
+            postings.add_shared(i, row, &overlap);
         }
 
         // Then the dense columns, a tile of pairs at a time, a panel of
@@ -1770,14 +1757,8 @@ mod tests {
                 "{}",
                 dense.stride
             );
-            let untiled = fill_symmetric(n, None, |i, row: &mut [f64]| {
-                let (cols, lengths) = postings.of_tree(i);
-                for (&col, &length) in cols.iter().zip(lengths) {
-                    let (trees, others) = postings.after(col, i);
-                    for (&j, &other) in trees.iter().zip(others) {
-                        row[j as usize] += overlap(length, other);
-                    }
-                }
+            let untiled = fill_symmetric(n, 1, None, |i, row: &mut [f64]| {
+                postings.add_shared(i, row, &overlap);
                 for (j, slot) in row.iter_mut().enumerate().skip(i + 1) {
                     let shared = sweep(dense.row(i), dense.row(j), &overlap) + *slot;
                     *slot = finish((self_total[i] + self_total[j] - 2.0 * shared).max(0.0));
