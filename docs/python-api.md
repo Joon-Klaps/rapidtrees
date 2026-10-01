@@ -1,6 +1,6 @@
 # Python API reference
 
-`rapidtrees` exposes six functions from its Rust core via PyO3. All accept a
+`rapidtrees` exposes seven functions from its Rust core via PyO3. All accept a
 Python **iterator** of newick strings, which lets the library stream through
 arbitrarily large tree files without materialising all strings in memory at
 once.
@@ -23,12 +23,13 @@ once.
 | --- | --- |
 | `pairwise_rf_from_newick_iter` | `(names, bytes)` — RF matrix as flat `uint32` bytes, row-major |
 | `pairwise_rf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, bytes)` — RF matrix + bipartition presence matrix + bipartition clade bitmasks |
+| `pairwise_rf_with_sparse_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, dict)` — RF matrix + bipartition clade bitmasks + presence matrix as sparse rows |
 | `pairwise_wrf_from_newick_iter` | `(names, list[float])` — Weighted RF, flat row-major |
 | `pairwise_wrf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, bytes)` — wRF matrix + branch-length matrix + bipartition clade bitmasks |
 | `pairwise_kf_from_newick_iter` | `(names, list[float])` — Kuhner-Felsenstein, flat row-major |
 | `pairwise_kf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, bytes, bytes)` — KF matrix + branch-length matrix + bipartition clade bitmasks |
 
-All six share the same call signature:
+All seven share the same call signature:
 
 ```python
 func(
@@ -101,6 +102,7 @@ Notes:
 | `pairwise_wrf_from_newick_iter` | `list[float]` — flat, row-major | `np.array(lst, dtype=np.float64).reshape(n, n)` |
 | `pairwise_kf_from_newick_iter` | `list[float]` — flat, row-major | `np.array(lst, dtype=np.float64).reshape(n, n)` |
 | `pairwise_rf_with_snapshots_from_newick_iter` | 6-tuple — see below | see below |
+| `pairwise_rf_with_sparse_snapshots_from_newick_iter` | 6-tuple — see below | see below |
 | `pairwise_wrf_with_snapshots_from_newick_iter` | 6-tuple — see below | see below |
 | `pairwise_kf_with_snapshots_from_newick_iter` | 6-tuple — see below | see below |
 
@@ -343,6 +345,41 @@ col_labels = [
 
 df = pd.DataFrame(presence, index=tree_names, columns=col_labels)
 # e.g.  col "C|D|E" == 1 means the split {C,D,E}|rest is present in that tree
+```
+
+---
+
+### RF + sparse snapshot in one pass
+
+`pairwise_rf_with_sparse_snapshots_from_newick_iter` returns the same RF matrix, leaf names, `n_bip` and clade bitmasks as `pairwise_rf_with_snapshots_from_newick_iter`, but gives the presence matrix as compressed sparse rows (CSR), in a dict placed last:
+
+```text
+(tree_names, rf_bytes, leaf_names, n_bip, bipartition_clade_bytes, sparse)
+```
+
+Prefer it over the dense endpoint when `n_bip` is more than about four times the number of splits per tree: the dense matrix takes `n_trees × n_bip` bytes, the CSR rows 4 bytes per split in each tree.
+
+| Key | Type | Description |
+| --- | --- | --- |
+| `format_version` | `int` | `1` |
+| `encoding` | `str` | `"csr"` |
+| `n_entries` | `int` | Number of (tree, split) entries across all trees |
+| `row_offsets` | `bytes` | Native-endian `uint64`, shape `(n_trees + 1,)` |
+| `column_indices` | `bytes` | Native-endian `uint32`, shape `(n_entries,)` |
+
+Tree `i` holds the columns `column_indices[row_offsets[i]:row_offsets[i + 1]]`, in ascending order and in the column order of `bipartition_clade_bytes`. Setting those columns to `1` reproduces row `i` of the dense presence matrix exactly.
+
+```python
+tree_names, rf_bytes, leaf_names, n_bip, bip_clade_bytes, sparse = (
+    rtd.pairwise_rf_with_sparse_snapshots_from_newick_iter(
+        list(names), iter(newicks), [tmap], [0] * len(names)
+    )
+)
+offsets = np.frombuffer(sparse["row_offsets"], dtype=np.uint64)
+columns = np.frombuffer(sparse["column_indices"], dtype=np.uint32)
+
+tree_0 = columns[offsets[0]:offsets[1]]  # splits present in tree 0
+split_freq = np.bincount(columns, minlength=n_bip) / len(tree_names)  # presence.mean(axis=0)
 ```
 
 ---

@@ -18,6 +18,7 @@ This project uses release names based on random words from [codenamegenerator.co
 - ([#49](https://github.com/Joon-Klaps/rapidtrees/pull/49)) - __PERFORMANCE__: The kernels lay trees out a block at a time with posting lists sized from the split counts, and `Snapshots::into_pairwise_rf`, `into_pairwise_wrf` and `into_pairwise_kf`, used by the CLI and the matrix-only Python calls, drop each block of trees as it is laid out.
 - ([#50](https://github.com/Joon-Klaps/rapidtrees/pull/50)) - __PERFORMANCE__: The weighted RF and KF sweep fills tiles of tree pairs a panel of columns at a time, so a row is read from memory once per tile instead of once per pair.
 - ([#51](https://github.com/Joon-Klaps/rapidtrees/pull/51)) - __PERFORMANCE__: Trees no longer store the split IDs of their pendant edges, which are the same in every tree, only their branch lengths.
+- ([#58](https://github.com/Joon-Klaps/rapidtrees/pull/58)) - __FEATURE__: `pairwise_rf_with_sparse_snapshots_from_newick_iter` returns RF distances with the tree-by-clade presence matrix as compressed sparse rows instead of a dense matrix.
 
 ## [0.10.0] - Surface Copperhead (2026-09-24)
 

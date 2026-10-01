@@ -1292,6 +1292,45 @@ class TestPairwiseRFWithSnapshots:
         assert_col(s(*"GHIJKLMNO"),     [0, 0, 1])  # canonical of {A,B,C,D,E,F} | rest
 
 
+class TestSparseSnapshots:
+    """Tests for pairwise_rf_with_sparse_snapshots_from_newick_iter (CSR membership)."""
+
+    @staticmethod
+    def _args(trees):
+        return [f"t{i}" for i in range(len(trees))], iter(trees), FIXTURE_TRANSLATE, [0] * len(trees)
+
+    @staticmethod
+    def _rows(sparse):
+        """Split the CSR payload into one column array per tree."""
+        offsets = np.frombuffer(sparse["row_offsets"], dtype=np.uint64)
+        columns = np.frombuffer(sparse["column_indices"], dtype=np.uint32)
+        return [columns[start:stop] for start, stop in zip(offsets[:-1], offsets[1:])]
+
+    @pytest.mark.parametrize("rooted", [False, True])
+    def test_matches_dense_endpoint(self, rooted):
+        """Everything but the membership payload is byte-identical to the dense endpoint, and setting each row's columns to 1 rebuilds its presence matrix."""
+        names, rf_bytes, leaf_names, n_bip, clade_bytes, sparse = (
+            rtd.pairwise_rf_with_sparse_snapshots_from_newick_iter(*self._args(FIXTURE_TREES), rooted=rooted)
+        )
+        dense = rtd.pairwise_rf_with_snapshots_from_newick_iter(*self._args(FIXTURE_TREES), rooted=rooted)
+        assert (names, rf_bytes, leaf_names, n_bip, clade_bytes) == (*dense[:4], dense[5])
+
+        presence = np.zeros((len(names), n_bip), dtype=np.uint8)
+        for i, row in enumerate(self._rows(sparse)):
+            assert np.all(row[:-1] < row[1:]), f"row {i} is not strictly ascending"
+            presence[i, row] = 1
+        assert presence.tobytes() == dense[4]
+        assert sparse["n_entries"] == presence.sum()
+
+    def test_polytomy_rows_known_values(self):
+        """A rooted star tree holds only its four pendant clades, so its row is shorter than the binary tree's. Columns ascend by packed leaf set: A, B, AB, C, D, CD."""
+        trees = ["(A:1,B:1,C:1,D:1);", "((A:1,B:1):1,(C:1,D:1):1);"]
+        *_, sparse = rtd.pairwise_rf_with_sparse_snapshots_from_newick_iter(*self._args(trees), rooted=True)
+        assert set(sparse) == {"format_version", "encoding", "n_entries", "row_offsets", "column_indices"}
+        assert (sparse["format_version"], sparse["encoding"], sparse["n_entries"]) == (1, "csr", 10)
+        assert [row.tolist() for row in self._rows(sparse)] == [[0, 1, 3, 4], [0, 1, 2, 3, 4, 5]]
+
+
 @pytest.mark.skipif(not RUST_MODULE_AVAILABLE, reason="rapidtrees not available")
 class TestPairwiseWrfWithSnapshots:
     """Tests for pairwise_wrf_with_snapshots_from_newick_iter (6-tuple API)."""

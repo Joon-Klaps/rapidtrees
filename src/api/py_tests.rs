@@ -71,6 +71,7 @@ fn rapidtrees_module_exports_expected_symbols() {
             "pairwise_wrf_from_newick_iter",
             "pairwise_kf_from_newick_iter",
             "pairwise_rf_with_snapshots_from_newick_iter",
+            "pairwise_rf_with_sparse_snapshots_from_newick_iter",
             "pairwise_wrf_with_snapshots_from_newick_iter",
             "pairwise_kf_with_snapshots_from_newick_iter",
             "ProgressCounter",
@@ -139,6 +140,28 @@ fn pairwise_rf_with_snapshots_via_python() {
     Python::attach(|py| {
         let pc = fresh_counter(py);
         let _ = call_pairwise(py, "pairwise_rf_with_snapshots_from_newick_iter", Some(&pc));
+    });
+}
+
+/// Everything but the membership payload matches the dense endpoint, with the clade bitmasks one slot earlier.
+#[test]
+fn pairwise_rf_with_sparse_snapshots_via_python() {
+    ensure_python();
+    Python::attach(|py| {
+        let pc = fresh_counter(py);
+        let sparse = call_pairwise(
+            py,
+            "pairwise_rf_with_sparse_snapshots_from_newick_iter",
+            Some(&pc),
+        );
+        let dense = call_pairwise(py, "pairwise_rf_with_snapshots_from_newick_iter", None);
+        for (s, d) in [(0, 0), (1, 1), (2, 2), (3, 3), (4, 5)] {
+            let same = sparse.get_item(s).unwrap().eq(dense.get_item(d).unwrap());
+            assert!(same.unwrap(), "sparse[{s}] != dense[{d}]");
+        }
+        let csr = sparse.get_item(5).unwrap();
+        let version: u8 = csr.get_item("format_version").unwrap().extract().unwrap();
+        assert_eq!(version, 1);
     });
 }
 
@@ -236,6 +259,7 @@ fn bad_trees_raise_value_error_from_every_entry_point() {
             "pairwise_wrf_from_newick_iter",
             "pairwise_kf_from_newick_iter",
             "pairwise_rf_with_snapshots_from_newick_iter",
+            "pairwise_rf_with_sparse_snapshots_from_newick_iter",
             "pairwise_wrf_with_snapshots_from_newick_iter",
             "pairwise_kf_with_snapshots_from_newick_iter",
         ] {
