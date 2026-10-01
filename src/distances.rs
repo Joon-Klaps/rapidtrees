@@ -122,7 +122,8 @@ where
 
 /// [`fill_symmetric`] with one rayon task per band of `band` rows:
 /// `fill_band(i0, rows)` writes `rows[r * n + j]` for every row `i0 + r` of the
-/// band and every `j > i0 + r`.
+/// band and every `j > i0 + r`. The last band may be shorter. `progress` is
+/// bumped by each band's pair count as that band finishes.
 fn fill_symmetric_banded<T, F>(
     n: usize,
     band: usize,
@@ -133,6 +134,7 @@ where
     T: Copy + Default + Send,
     F: Fn(usize, &mut [T]) + Sync,
 {
+    debug_assert!(band > 0, "a band holds at least one row");
     let mut matrix = vec![T::default(); n * n];
 
     matrix
@@ -704,6 +706,9 @@ fn distance_rf_split(input: Input<'_>, progress: Option<&AtomicUsize>, min_dense
 
 // ─── weighted metrics (WRF, KF) ─────────────────────────────────────────────
 
+/// Running sums per weighted sweep: see [`sweep`].
+const LANES: usize = 8;
+
 /// `Σ overlap(aₖ, bₖ)` over two rows of equal length, in a fixed order.
 ///
 /// Eight running sums rather than one. A single `f64` sum is a chain the
@@ -714,7 +719,6 @@ fn distance_rf_split(input: Input<'_>, progress: Option<&AtomicUsize>, min_dense
 /// is what keeps identical trees at exactly 0.0.
 #[inline]
 fn sweep(a: &[f64], b: &[f64], overlap: &impl Fn(f64, f64) -> f64) -> f64 {
-    const LANES: usize = 8;
     let (a_blocks, a_tail) = a.as_chunks::<LANES>();
     let (b_blocks, b_tail) = b.as_chunks::<LANES>();
 
@@ -738,15 +742,18 @@ fn sweep(a: &[f64], b: &[f64], overlap: &impl Fn(f64, f64) -> f64) -> f64 {
 const TILE_I: usize = 8;
 const TILE_J: usize = 4;
 const PANEL: usize = 512;
+// Every panel but the last must end on a block boundary for `accumulate` to
+// add in `sweep`'s order.
+const _: () = assert!(PANEL.is_multiple_of(LANES));
 
 /// Add `overlap(a[k], b[k])` into `lanes` exactly as [`sweep`] does over the
 /// same columns: whole blocks of eight first, then the tail into the first
 /// lanes. Called panel by panel, with every panel but the last a multiple of
 /// eight wide, the lanes end up holding exactly what [`sweep`] adds up.
 #[inline(always)]
-fn accumulate(lanes: &mut [f64; 8], a: &[f64], b: &[f64], overlap: &impl Fn(f64, f64) -> f64) {
-    let (a_blocks, a_tail) = a.as_chunks::<8>();
-    let (b_blocks, b_tail) = b.as_chunks::<8>();
+fn accumulate(lanes: &mut [f64; LANES], a: &[f64], b: &[f64], overlap: &impl Fn(f64, f64) -> f64) {
+    let (a_blocks, a_tail) = a.as_chunks::<LANES>();
+    let (b_blocks, b_tail) = b.as_chunks::<LANES>();
     for (xs, ys) in a_blocks.iter().zip(b_blocks) {
         for ((lane, &x), &y) in lanes.iter_mut().zip(xs).zip(ys) {
             *lane += overlap(x, y);
@@ -838,10 +845,9 @@ fn weighted_distances_split(
     } = weighted_lay_out(input, min_dense, &overlap);
 
     fill_symmetric_banded(n, TILE_I, progress, |i0, rows: &mut [f64]| {
-        let band = rows.len() / n;
+        let i1 = i0 + rows.len() / n;
         // Shared terms from the posting lists first, accumulated in place.
-        for (r, row) in rows.chunks_mut(n).enumerate() {
-            let i = i0 + r;
+        for (i, row) in (i0..i1).zip(rows.chunks_mut(n)) {
             let (cols, lengths) = postings.of_tree(i);
             for (&col, &length) in cols.iter().zip(lengths) {
                 let (trees, others) = postings.after(col, i);
@@ -854,28 +860,24 @@ fn weighted_distances_split(
         // Then the dense columns, a tile of pairs at a time, a panel of
         // columns per pass, each pair keeping its own eight lanes throughout.
         for j0 in (i0 + 1..n).step_by(TILE_J) {
-            let width = (n - j0).min(TILE_J);
-            let mut lanes = [[[0.0f64; 8]; TILE_J]; TILE_I];
+            let j1 = (j0 + TILE_J).min(n);
+            // Row `i` skips the tile's trees up to and including itself.
+            let at_or_before = |i: usize| (i + 1).saturating_sub(j0);
+            let mut lanes = [[[0.0f64; LANES]; TILE_J]; TILE_I];
             for p0 in (0..dense.stride).step_by(PANEL) {
                 let panel = p0..(p0 + PANEL).min(dense.stride);
-                for (r, lanes_r) in lanes.iter_mut().enumerate().take(band) {
-                    let a = &dense.row(i0 + r)[panel.clone()];
-                    for (c, lane) in lanes_r.iter_mut().enumerate().take(width) {
-                        if j0 + c > i0 + r {
-                            accumulate(lane, a, &dense.row(j0 + c)[panel.clone()], &overlap);
-                        }
+                for (i, lanes_i) in (i0..i1).zip(&mut lanes) {
+                    let a = &dense.row(i)[panel.clone()];
+                    for (j, lane) in (j0..j1).zip(lanes_i).skip(at_or_before(i)) {
+                        accumulate(lane, a, &dense.row(j)[panel.clone()], &overlap);
                     }
                 }
             }
-            for (r, lanes_r) in lanes.iter().enumerate().take(band) {
-                let i = i0 + r;
-                for (c, lane) in lanes_r.iter().enumerate().take(width) {
-                    let j = j0 + c;
-                    if j > i {
-                        let slot = &mut rows[r * n + j];
-                        let shared = lane.iter().sum::<f64>() + *slot;
-                        *slot = finish((self_total[i] + self_total[j] - 2.0 * shared).max(0.0));
-                    }
+            for ((i, row), lanes_i) in (i0..i1).zip(rows.chunks_mut(n)).zip(&lanes) {
+                let tile = (j0..j1).zip(lanes_i).zip(&mut row[j0..j1]);
+                for ((j, lane), slot) in tile.skip(at_or_before(i)) {
+                    let shared = lane.iter().sum::<f64>() + *slot;
+                    *slot = finish((self_total[i] + self_total[j] - 2.0 * shared).max(0.0));
                 }
             }
         }
