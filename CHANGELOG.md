@@ -10,6 +10,8 @@ This project uses release names based on random words from [codenamegenerator.co
 
 ## [UNRELEASED] - MICROSOFT_COORPERATION SNAKE (YYYY-MM-DD)
 
+## [0.11.0] - Redmond Rattlesnake (2026-10-02)
+
 - ([#44](https://github.com/Joon-Klaps/rapidtrees/pull/44)) - __PERFORMANCE__: Tree files are streamed a chunk of trees at a time instead of being read whole and copied, so memory no longer grows with the size of the input file.
 - ([#45](https://github.com/Joon-Klaps/rapidtrees/pull/45)) - __PERFORMANCE__: The Python entry points pull newick strings from their iterator a chunk at a time instead of collecting every string first.
 - ([#56](https://github.com/Joon-Klaps/rapidtrees/pull/56)) - __PERFORMANCE__: Trees are parsed in smaller chunks, which lowers peak memory when building collections of up to tens of thousands of taxa.
@@ -18,7 +20,7 @@ This project uses release names based on random words from [codenamegenerator.co
 - ([#49](https://github.com/Joon-Klaps/rapidtrees/pull/49)) - __PERFORMANCE__: The kernels lay trees out a block at a time with posting lists sized from the split counts, and `Snapshots::into_pairwise_rf`, `into_pairwise_wrf` and `into_pairwise_kf`, used by the CLI and the matrix-only Python calls, drop each block of trees as it is laid out.
 - ([#50](https://github.com/Joon-Klaps/rapidtrees/pull/50)) - __PERFORMANCE__: The weighted RF and KF sweep fills tiles of tree pairs a panel of columns at a time, so a row is read from memory once per tile instead of once per pair.
 - ([#51](https://github.com/Joon-Klaps/rapidtrees/pull/51)) - __PERFORMANCE__: Trees no longer store the split IDs of their pendant edges, which are the same in every tree, only their branch lengths.
-- ([#57](https://github.com/Joon-Klaps/rapidtrees/pull/57)) - __BUGFIX__: Rooted distances and exports read a tree with unary nodes, a unary root included, as the same tree without them, and rooted weighted RF and KF no longer panic on such a tree.
+- ([#57](https://github.com/Joon-Klaps/rapidtrees/pull/57)) - __BUGFIX__: Rooted distances and exports read a tree with unary nodes, a unary root included, as the same tree without them, and rooted weighted RF and KF no longer panic on such a tree. Thanks @hongsamL for spotting!
 
 ## [0.10.0] - Surface Copperhead (2026-09-24)
 
