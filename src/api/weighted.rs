@@ -1,13 +1,13 @@
 //! Weighted Robinson–Foulds and Kuhner–Felsenstein entry points.
 
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyIterator};
+use pyo3::types::{PyBytes, PyIterator};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 
 use super::input::{IterInput, collect_snapshots_from_iter, validate_iter_args};
 use super::progress::{ProgressCounter, with_counter};
-use super::{PyRfSnapshotResult, n_pairs};
+use super::{PyRfSnapshotResult, csr_dict, n_pairs};
 use crate::snapshot::{Retain, Snapshots};
 
 /// A pairwise weighted metric, as a plain function pointer so WRF and KF can
@@ -62,23 +62,15 @@ fn weighted_pairwise_with_snapshots(
 
     let n_bip = snaps.n_distinct_splits();
     let leaf_names = snaps.leaf_names.clone();
-    let (row_offsets, column_indices, lengths, col_to_bip_id) =
-        snaps.build_sparse_branch_length_matrix();
+    let (sparse, col_to_bip_id) = csr_dict(py, &snaps, true)?;
     let bip_bytes = snaps.build_bipartition_bytes(&col_to_bip_id);
-    let sparse = PyDict::new(py);
-    sparse.set_item("format_version", 1)?;
-    sparse.set_item("encoding", "csr")?;
-    sparse.set_item("n_entries", column_indices.len() / size_of::<u32>())?;
-    sparse.set_item("row_offsets", PyBytes::new(py, &row_offsets))?;
-    sparse.set_item("column_indices", PyBytes::new(py, &column_indices))?;
-    sparse.set_item("lengths", PyBytes::new(py, &lengths))?;
 
     Ok((
         names,
         PyBytes::new(py, &matrix_bytes).into(),
         leaf_names,
         n_bip,
-        sparse.into_any().unbind(),
+        sparse,
         PyBytes::new(py, &bip_bytes).into(),
     ))
 }

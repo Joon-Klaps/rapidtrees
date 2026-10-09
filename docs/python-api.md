@@ -280,6 +280,8 @@ for i in range(len(tree_names)):
     dense[i, columns[offsets[i]:offsets[i + 1]]] = 1
 ```
 
+Pass `lengths=True` to also get each entry's branch length under a `lengths` key, laid out as in the [wRF variant](#wrf--branch-length-matrix-in-one-pass). This keeps the branch lengths in memory during the call and adds 8 bytes per entry to the output, so it is off by default. Rooted with lengths, the payload is enough to rebuild every tree with its node heights, which is what consensus methods such as MrHIPSTR need.
+
 #### Edge table contents
 
 `n_bip` counts **all** edges: pendant (leaf) edges and internal bipartitions.

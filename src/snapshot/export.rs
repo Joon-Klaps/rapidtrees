@@ -88,7 +88,7 @@ impl Snapshots {
     }
 
     /// Shared CSR builder; `lengths` is empty unless `with_lengths` is set.
-    fn build_csr(&self, with_lengths: bool) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<usize>) {
+    pub(crate) fn build_csr(&self, with_lengths: bool) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<usize>) {
         let (id_to_col, col_to_bip_id) = self.column_order();
         // Without a clade table (`Retain::bipartitions` off) there are no columns, as in the dense builders.
         if col_to_bip_id.is_empty() {

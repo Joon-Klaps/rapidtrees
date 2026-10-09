@@ -1377,6 +1377,16 @@ class TestSparseSnapshots:
             [1.0, 2.0, 5.0, 3.0, 4.0, 6.0],
         ]
 
+    @pytest.mark.parametrize("rooted", [False, True])
+    def test_lengths_match_wrf_payload(self, rooted):
+        """With lengths=True the RF payload is the wRF payload, branch lengths included; by default it has no lengths key."""
+        trees = ["(A:1,B:2,C:3,D:4);", "((A:1,B:2):5,(C:3,D:4):6);", "((A:1,C:2):5,(B:3,D:4):6);"]
+        rf = rtd.pairwise_rf_with_snapshots_from_newick_iter(*self._args(trees), rooted=rooted, lengths=True)
+        wrf = rtd.pairwise_wrf_with_snapshots_from_newick_iter(*self._args(trees), rooted=rooted)
+        assert rf[2:] == wrf[2:]
+        *_, sparse, _ = rtd.pairwise_rf_with_snapshots_from_newick_iter(*self._args(trees), rooted=rooted)
+        assert "lengths" not in sparse
+
 
 @pytest.mark.skipif(not RUST_MODULE_AVAILABLE, reason="rapidtrees not available")
 class TestPairwiseWrfWithSnapshots:

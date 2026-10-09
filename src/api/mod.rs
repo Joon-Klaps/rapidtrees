@@ -18,7 +18,9 @@ mod weighted;
 mod py_tests;
 
 use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyDict};
 
+use crate::snapshot::Snapshots;
 use progress::ProgressCounter;
 
 /// Number of upper-triangle pairs for `n` trees — what a [`ProgressCounter`]
@@ -36,6 +38,25 @@ pub(super) type PyRfSnapshotResult = (
     Py<PyAny>,
     Py<PyAny>,
 );
+
+/// The CSR dict a snapshot entry point returns fifth, with the column order its clade bitmasks must follow. `lengths` is a key only when `with_lengths` is set.
+pub(super) fn csr_dict(
+    py: Python<'_>,
+    snaps: &Snapshots,
+    with_lengths: bool,
+) -> PyResult<(Py<PyAny>, Vec<usize>)> {
+    let (row_offsets, column_indices, lengths, col_to_bip_id) = snaps.build_csr(with_lengths);
+    let sparse = PyDict::new(py);
+    sparse.set_item("format_version", 1)?;
+    sparse.set_item("encoding", "csr")?;
+    sparse.set_item("n_entries", column_indices.len() / size_of::<u32>())?;
+    sparse.set_item("row_offsets", PyBytes::new(py, &row_offsets))?;
+    sparse.set_item("column_indices", PyBytes::new(py, &column_indices))?;
+    if with_lengths {
+        sparse.set_item("lengths", PyBytes::new(py, &lengths))?;
+    }
+    Ok((sparse.into_any().unbind(), col_to_bip_id))
+}
 
 /// Python module definition
 #[pymodule]
