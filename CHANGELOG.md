@@ -10,6 +10,10 @@ This project uses release names based on random words from [codenamegenerator.co
 
 ## [UNRELEASED] - MICROSOFT_COORPERATION SNAKE (YYYY-MM-DD)
 
+## [0.12.0] - Vienna Viper (2026-10-09)
+
+- ([#58](https://github.com/Joon-Klaps/rapidtrees/pull/58)) - __FEATURE__ __BREAKING API CHANGE__: `pairwise_rf_with_snapshots_from_newick_iter`, `pairwise_wrf_with_snapshots_from_newick_iter` and `pairwise_kf_with_snapshots_from_newick_iter` return the tree-by-clade presence or branch-length matrix as compressed sparse rows instead of a dense matrix, and the RF one adds the branch lengths when called with `lengths=True`.
+
 ## [0.11.0] - Redmond Rattlesnake (2026-10-02)
 
 - ([#44](https://github.com/Joon-Klaps/rapidtrees/pull/44)) - __PERFORMANCE__: Tree files are streamed a chunk of trees at a time instead of being read whole and copied, so memory no longer grows with the size of the input file.

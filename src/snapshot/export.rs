@@ -2,11 +2,11 @@
 //! each edge is worth, and which taxa each split names.
 //!
 //! Every builder here shares one column order — ascending packed leaf set,
-//! stable across calls on the same tree set — so the three buffers can be
+//! stable across calls on the same tree set — so their buffers can be
 //! indexed against each other and against `leaf_names`.
 
-use super::Snapshots;
 use super::clades::cmp_packed;
+use super::{InternSnap, Snapshots};
 use crate::par::*;
 impl Snapshots {
     /// The one column order every builder here shares, in both directions.
@@ -60,6 +60,61 @@ impl Snapshots {
             });
 
         (presence, col_to_bip_id)
+    }
+
+    /// Build the presence matrix in compressed sparse-row (CSR) form: `(row_offsets, column_indices, col_to_bip_id)`.
+    ///
+    /// `row_offsets` is `n_trees + 1` native-endian `u64`s and `column_indices` one native-endian `u32` per entry, ascending within each tree. Columns follow [`Snapshots::build_presence_matrix`], so setting each tree's listed columns to `1` reproduces the dense matrix.
+    pub fn build_sparse_presence_matrix(&self) -> (Vec<u8>, Vec<u8>, Vec<usize>) {
+        let (row_offsets, column_indices, _, col_to_bip_id) = self.build_csr(false);
+        (row_offsets, column_indices, col_to_bip_id)
+    }
+
+    /// Build the branch-length matrix in compressed sparse-row (CSR) form: `(row_offsets, column_indices, lengths, col_to_bip_id)`.
+    ///
+    /// The first two are as in [`Snapshots::build_sparse_presence_matrix`]; `lengths` holds one native-endian `f64` per entry, in the order of `column_indices`. Writing each tree's lengths at its listed columns into a zeroed row reproduces [`Snapshots::build_branch_length_matrix`].
+    pub fn build_sparse_branch_length_matrix(&self) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<usize>) {
+        self.build_csr(true)
+    }
+
+    /// Shared CSR builder; `lengths` is empty unless `with_lengths` is set.
+    pub(crate) fn build_csr(&self, with_lengths: bool) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<usize>) {
+        let (id_to_col, col_to_bip_id) = self.column_order();
+        // Without a clade table (`Retain::bipartitions` off) there are no columns, as in the dense builders.
+        if col_to_bip_id.is_empty() {
+            let row_offsets = vec![0u8; (self.snapshots.len() + 1) * size_of::<u64>()];
+            return (row_offsets, Vec::new(), Vec::new(), col_to_bip_id);
+        }
+        let row_lens: Vec<usize> = self.snapshots.iter().map(InternSnap::n_splits).collect();
+        let n_entries: usize = row_lens.iter().sum();
+        // Without lengths every tree gets an empty slice, so `snap.lengths` is never read.
+        let length_width = if with_lengths { size_of::<f64>() } else { 0 };
+        let mut column_indices = vec![0u8; n_entries * size_of::<u32>()];
+        let mut lengths = vec![0u8; n_entries * length_width];
+
+        self.snapshots
+            .par_iter()
+            .zip(split_rows(&mut column_indices, &row_lens, size_of::<u32>()))
+            .zip(split_rows(&mut lengths, &row_lens, length_width))
+            .for_each(|((snap, columns), values)| {
+                let entries = sorted_row(snap, &id_to_col);
+                write_ne(columns, entries.iter().map(|&(col, _)| col.to_ne_bytes()));
+                write_ne(
+                    values,
+                    entries
+                        .iter()
+                        .map(|&(_, pos)| snap.lengths[pos as usize].to_ne_bytes()),
+                );
+            });
+
+        let row_offsets = std::iter::once(0)
+            .chain(row_lens.iter().scan(0u64, |end, &n| {
+                *end += n as u64;
+                Some(*end)
+            }))
+            .flat_map(u64::to_ne_bytes)
+            .collect();
+        (row_offsets, column_indices, lengths, col_to_bip_id)
     }
 
     /// Build a flat row-major branch-length matrix `(n_trees × n_bip)` as native-endian
@@ -137,5 +192,35 @@ impl Snapshots {
             }
         }
         out
+    }
+}
+
+/// One tree's splits as `(column, position)` pairs in ascending column order, where `position` indexes [`InternSnap::ids`] and so also `lengths`.
+fn sorted_row(snap: &InternSnap, id_to_col: &[usize]) -> Vec<(u32, u32)> {
+    let mut row: Vec<(u32, u32)> = snap
+        .ids()
+        .zip(0..)
+        .map(|(id, pos)| (id_to_col[id as usize] as u32, pos))
+        .collect();
+    row.sort_unstable();
+    row
+}
+
+/// Carves `buf` into consecutive rows of `lens[i] * width` bytes, one per tree, so the rows can be filled in parallel.
+fn split_rows<'a>(mut buf: &'a mut [u8], lens: &[usize], width: usize) -> Vec<&'a mut [u8]> {
+    lens.iter()
+        .map(|&n| {
+            let (row, rest) = std::mem::take(&mut buf).split_at_mut(n * width);
+            buf = rest;
+            row
+        })
+        .collect()
+}
+
+/// Writes `values` into the consecutive `N`-byte cells of `dst`, stopping at whichever runs out first.
+#[inline]
+fn write_ne<const N: usize>(dst: &mut [u8], values: impl Iterator<Item = [u8; N]>) {
+    for (cell, bytes) in dst.as_chunks_mut::<N>().0.iter_mut().zip(values) {
+        *cell = bytes;
     }
 }
