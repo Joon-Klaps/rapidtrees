@@ -62,27 +62,17 @@ impl Snapshots {
         (presence, col_to_bip_id)
     }
 
-    /// Build the presence matrix in compressed sparse-row (CSR) form.
+    /// Build the presence matrix in compressed sparse-row (CSR) form: `(row_offsets, column_indices, col_to_bip_id)`.
     ///
-    /// Returns `(row_offsets, column_indices, col_to_bip_id)`:
-    /// - `row_offsets`: native-endian `u64` bytes, `n_trees + 1` values; tree `i` owns entries `row_offsets[i]..row_offsets[i + 1]`
-    /// - `column_indices`: native-endian `u32` bytes, one column per entry, ascending within each tree
-    /// - `col_to_bip_id`: as returned by [`Snapshots::build_presence_matrix`]
-    ///
-    /// Columns follow [`Snapshots::build_presence_matrix`], so setting each tree's listed columns to `1` reproduces the dense matrix. Rows differ in length when trees hold different numbers of splits, as polytomies do.
+    /// `row_offsets` is `n_trees + 1` native-endian `u64`s and `column_indices` one native-endian `u32` per entry, ascending within each tree. Columns follow [`Snapshots::build_presence_matrix`], so setting each tree's listed columns to `1` reproduces the dense matrix.
     pub fn build_sparse_presence_matrix(&self) -> (Vec<u8>, Vec<u8>, Vec<usize>) {
         let (row_offsets, column_indices, _, col_to_bip_id) = self.build_csr(false);
         (row_offsets, column_indices, col_to_bip_id)
     }
 
-    /// Build the branch-length matrix in compressed sparse-row (CSR) form.
+    /// Build the branch-length matrix in compressed sparse-row (CSR) form: `(row_offsets, column_indices, lengths, col_to_bip_id)`.
     ///
-    /// Returns `(row_offsets, column_indices, lengths, col_to_bip_id)`:
-    /// - `row_offsets` and `column_indices`: as in [`Snapshots::build_sparse_presence_matrix`]
-    /// - `lengths`: native-endian `f64` bytes, one branch length per entry, in the order of `column_indices`
-    /// - `col_to_bip_id`: as returned by [`Snapshots::build_presence_matrix`]
-    ///
-    /// Writing each tree's lengths at its listed columns into a zeroed row reproduces the dense matrix of [`Snapshots::build_branch_length_matrix`].
+    /// The first two are as in [`Snapshots::build_sparse_presence_matrix`]; `lengths` holds one native-endian `f64` per entry, in the order of `column_indices`. Writing each tree's lengths at its listed columns into a zeroed row reproduces [`Snapshots::build_branch_length_matrix`].
     pub fn build_sparse_branch_length_matrix(&self) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<usize>) {
         self.build_csr(true)
     }
@@ -205,9 +195,7 @@ impl Snapshots {
     }
 }
 
-/// One tree's splits as `(column, position)` pairs in ascending column order, where `position` indexes [`InternSnap::ids`].
-///
-/// `lengths` follows the same order as `ids`, so the position lets a caller carry a branch length, or any value laid out like it, into the order of the columns.
+/// One tree's splits as `(column, position)` pairs in ascending column order, where `position` indexes [`InternSnap::ids`] and so also `lengths`.
 fn sorted_row(snap: &InternSnap, id_to_col: &[usize]) -> Vec<(u32, u32)> {
     let mut row: Vec<(u32, u32)> = snap
         .ids()

@@ -759,7 +759,7 @@ fn test_presence_export_independent_of_lengths() {
     assert_eq!(bip_a, bip_b, "bipartition clade bytes must be identical");
 }
 
-/// Each CSR row lists, in ascending order, exactly the columns its dense presence row sets, in both rooting modes and with a polytomy in the set.
+/// Each CSR row lists exactly the columns its dense presence row sets.
 #[test]
 fn sparse_presence_matrix_expands_to_dense() {
     let trees = [
@@ -790,7 +790,7 @@ fn sparse_presence_matrix_expands_to_dense() {
     }
 }
 
-/// Scattering each CSR row's lengths into a zeroed row rebuilds the dense branch-length matrix, in both rooting modes and with a polytomy in the set.
+/// Scattering each CSR row's lengths into a zeroed row rebuilds the dense branch-length matrix.
 #[test]
 fn sparse_branch_lengths_expand_to_dense() {
     let trees = [
@@ -823,7 +823,7 @@ fn sparse_branch_lengths_expand_to_dense() {
     }
 }
 
-/// A polytomy holds fewer splits than a binary tree, so its CSR row is shorter. Rooted, the star tree has its four pendant clades and the binary tree adds `{A,B}` and `{C,D}`; columns ascend by packed leaf set, so `{A,B}` sorts between `{B}` and `{C}`.
+/// A polytomy holds fewer splits than a binary tree, so its row is shorter; `{A,B}` sorts between `{B}` and `{C}`.
 #[test]
 fn sparse_presence_rows_vary_in_width() {
     let trees = ["(A:1,B:1,C:1,D:1);", "((A:1,B:1):1,(C:1,D:1):1);"];
@@ -835,7 +835,7 @@ fn sparse_presence_rows_vary_in_width() {
     );
 }
 
-/// Without a clade table there are no columns to list, so every CSR row is empty, as every dense row is.
+/// Without a clade table every CSR row is empty.
 #[test]
 fn sparse_presence_without_bipartitions_has_empty_rows() {
     let empty = HashMap::new();
