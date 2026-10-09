@@ -95,64 +95,35 @@ impl Snapshots {
             let row_offsets = vec![0u8; (self.snapshots.len() + 1) * size_of::<u64>()];
             return (row_offsets, Vec::new(), Vec::new(), col_to_bip_id);
         }
-        let n_entries: usize = self.snapshots.iter().map(InternSnap::n_splits).sum();
-        let mut row_offsets = Vec::with_capacity((self.snapshots.len() + 1) * size_of::<u64>());
+        let row_lens: Vec<usize> = self.snapshots.iter().map(InternSnap::n_splits).collect();
+        let n_entries: usize = row_lens.iter().sum();
+        // Without lengths every tree gets an empty slice, so `snap.lengths` is never read.
+        let length_width = if with_lengths { size_of::<f64>() } else { 0 };
         let mut column_indices = vec![0u8; n_entries * size_of::<u32>()];
-        let mut lengths = vec![
-            0u8;
-            if with_lengths {
-                n_entries * size_of::<f64>()
-            } else {
-                0
-            }
-        ];
-
-        // Prefix sum over row lengths, carving the buffers into one slice per tree on the way so the rows can be filled in parallel.
-        let mut rows = Vec::with_capacity(self.snapshots.len());
-        let mut rest_columns = column_indices.as_mut_slice();
-        let mut rest_lengths = lengths.as_mut_slice();
-        let mut end = 0u64;
-        row_offsets.extend_from_slice(&end.to_ne_bytes());
-        for snap in &self.snapshots {
-            let n = snap.n_splits();
-            let (columns, tail) =
-                std::mem::take(&mut rest_columns).split_at_mut(n * size_of::<u32>());
-            rest_columns = tail;
-            let width = if with_lengths {
-                n * size_of::<f64>()
-            } else {
-                0
-            };
-            let (values, tail) = std::mem::take(&mut rest_lengths).split_at_mut(width);
-            rest_lengths = tail;
-            rows.push((columns, values));
-            end += n as u64;
-            row_offsets.extend_from_slice(&end.to_ne_bytes());
-        }
+        let mut lengths = vec![0u8; n_entries * length_width];
 
         self.snapshots
             .par_iter()
-            .zip(rows)
-            .for_each(|(snap, (columns, values))| {
+            .zip(split_rows(&mut column_indices, &row_lens, size_of::<u32>()))
+            .zip(split_rows(&mut lengths, &row_lens, length_width))
+            .for_each(|((snap, columns), values)| {
                 let entries = sorted_row(snap, &id_to_col);
-                for (dst, &(col, _)) in columns
-                    .as_chunks_mut::<{ size_of::<u32>() }>()
-                    .0
-                    .iter_mut()
-                    .zip(&entries)
-                {
-                    dst.copy_from_slice(&col.to_ne_bytes());
-                }
-                for (dst, &(_, pos)) in values
-                    .as_chunks_mut::<{ size_of::<f64>() }>()
-                    .0
-                    .iter_mut()
-                    .zip(&entries)
-                {
-                    dst.copy_from_slice(&snap.lengths[pos as usize].to_ne_bytes());
-                }
+                write_ne(columns, entries.iter().map(|&(col, _)| col.to_ne_bytes()));
+                write_ne(
+                    values,
+                    entries
+                        .iter()
+                        .map(|&(_, pos)| snap.lengths[pos as usize].to_ne_bytes()),
+                );
             });
 
+        let row_offsets = std::iter::once(0)
+            .chain(row_lens.iter().scan(0u64, |end, &n| {
+                *end += n as u64;
+                Some(*end)
+            }))
+            .flat_map(u64::to_ne_bytes)
+            .collect();
         (row_offsets, column_indices, lengths, col_to_bip_id)
     }
 
@@ -245,4 +216,23 @@ fn sorted_row(snap: &InternSnap, id_to_col: &[usize]) -> Vec<(u32, u32)> {
         .collect();
     row.sort_unstable();
     row
+}
+
+/// Carves `buf` into consecutive rows of `lens[i] * width` bytes, one per tree, so the rows can be filled in parallel.
+fn split_rows<'a>(mut buf: &'a mut [u8], lens: &[usize], width: usize) -> Vec<&'a mut [u8]> {
+    lens.iter()
+        .map(|&n| {
+            let (row, rest) = std::mem::take(&mut buf).split_at_mut(n * width);
+            buf = rest;
+            row
+        })
+        .collect()
+}
+
+/// Writes `values` into the consecutive `N`-byte cells of `dst`, stopping at whichever runs out first.
+#[inline]
+fn write_ne<const N: usize>(dst: &mut [u8], values: impl Iterator<Item = [u8; N]>) {
+    for (cell, bytes) in dst.as_chunks_mut::<N>().0.iter_mut().zip(values) {
+        *cell = bytes;
+    }
 }
