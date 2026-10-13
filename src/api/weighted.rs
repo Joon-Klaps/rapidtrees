@@ -192,7 +192,7 @@ pub(super) fn pairwise_kf_with_snapshots_from_newick_iter(
 ///         ``pairwise_rf_from_newick_iter`` for details.
 ///
 /// Returns:
-///     (tree_names, distance_matrix) — a 2D list of Weighted RF distances.
+///     (tree_names, distances) — flat row-major list of n×n Weighted RF distances (float).
 ///
 /// Raises:
 ///     ValueError: If fewer than 2 trees, leaf sets differ, or argument lengths mismatch.
@@ -232,7 +232,7 @@ pub(super) fn pairwise_wrf_from_newick_iter(
 ///         ``pairwise_rf_from_newick_iter`` for details.
 ///
 /// Returns:
-///     (tree_names, distance_matrix) — a 2D list of KF distances.
+///     (tree_names, distances) — flat row-major list of n×n KF distances (float).
 ///
 /// Raises:
 ///     ValueError: If fewer than 2 trees, leaf sets differ, or argument lengths mismatch.
