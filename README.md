@@ -43,13 +43,16 @@
 
 ### 🚀 Performance
 
-Benchmarked on a simulated posterior (10 000 taxa · 5 000 trees · ~12.5 M comparisons) on one Intel Xeon Platinum 8360Y node (VSC wICE), rapidtrees 0.11.0, median of three runs:
+Measured on an Apple M1 Max laptop (10 cores, 64 GB RAM) with rapidtrees 0.11.0 from crates.io, on four published BEAST posteriors from the BEAST workshop tutorials ([YFV](https://beast.community/workshop_continuous_diffusion_yfv), [WNV](https://beast.community/workshop_continuous_diffusion_wnv), [batRABV](https://beast.community/workshop_discrete_diffusion_rabv), [EBOV](https://beast.community/workshop_discrete_diffusion_ebov)). Wall-clock time for the whole run, reading the NEXUS file included, with all 10 cores and with one thread in brackets; median of three runs after a warm-up, matrix written to `/dev/null`:
 
-| Metric             | Total time (1 thread) | Throughput (1 thread)       | Total time (32 threads) |
-| ------------------ | --------------------- | --------------------------- | ----------------------- |
-| Robinson-Foulds    | ~18 s                 | **~0.70 M comparisons/sec** | ~1.1 s                  |
-| Weighted RF        | ~143 s                | **~0.09 M comparisons/sec** | ~6.1 s                  |
-| Kuhner-Felsenstein | ~98 s                 | **~0.13 M comparisons/sec** | ~4.7 s                  |
+| Dataset | Taxa · trees | Pairs   | Robinson-Foulds | Weighted RF     | Kuhner-Felsenstein | Peak memory |
+| ------- | ------------ | ------- | --------------- | --------------- | ------------------ | ----------- |
+| YFV     | 65 · 5 001   | 12.5 M  | 0.12 s (0.56 s) | 0.41 s (2.38 s) | 0.37 s (2.21 s)    | 393 MiB     |
+| WNV     | 104 · 1 001  | 0.50 M  | 0.02 s (0.07 s) | 0.04 s (0.15 s) | 0.04 s (0.14 s)    | 85 MiB      |
+| batRABV | 372 · 1 001  | 0.50 M  | 0.05 s (0.15 s) | 0.07 s (0.27 s) | 0.06 s (0.27 s)    | 157 MiB     |
+| EBOV    | 836 · 1 167  | 0.68 M  | 0.07 s (0.30 s) | 0.11 s (0.70 s) | 0.10 s (0.54 s)    | 159 MiB     |
+
+On YFV that is about **100 M Robinson-Foulds comparisons per second**. Command: `RAYON_NUM_THREADS=<n> rapidtrees --input <file>.trees --metric <rf|weighted|kf> --output /dev/null --use-real-taxa --quiet`, no burn-in, unrooted.
 
 ---
 
