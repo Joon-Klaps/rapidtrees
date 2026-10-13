@@ -8,7 +8,7 @@ This project uses release names based on random words from [codenamegenerator.co
     - PREFIX: Microsoft Corperation
     - DICTIONARY: Snakes
 
-## [UNRELEASED] - MICROSOFT_COORPERATION SNAKE (YYYY-MM-DD)
+## [UNRELEASED] - MICROSOFT_CORPORATION SNAKE (YYYY-MM-DD)
 
 ## [0.11.0] - Redmond Rattlesnake (2026-10-02)
 

@@ -43,13 +43,13 @@
 
 ### 🚀 Performance
 
-Benchmarked on a ZIKA dataset (283 taxa · 4 000 trees · ~8 M comparisons) (non-gzipped output):
+Benchmarked on a simulated posterior (10 000 taxa · 5 000 trees · ~12.5 M comparisons) on one Intel Xeon Platinum 8360Y node (VSC wICE), rapidtrees 0.11.0, median of three runs:
 
-| Metric             | Total time | Throughput                 |
-| ------------------ | ---------- | -------------------------- |
-| Robinson-Foulds    | ~2.7 s     | **~3.0 M comparisons/sec** |
-| Weighted RF        | ~3.4 s     | **~2.3 M comparisons/sec** |
-| Kuhner-Felsenstein | ~3.3 s     | **~2.3 M comparisons/sec** |
+| Metric             | Total time (1 thread) | Throughput (1 thread)       | Total time (32 threads) |
+| ------------------ | --------------------- | --------------------------- | ----------------------- |
+| Robinson-Foulds    | ~18 s                 | **~0.70 M comparisons/sec** | ~1.1 s                  |
+| Weighted RF        | ~143 s                | **~0.09 M comparisons/sec** | ~6.1 s                  |
+| Kuhner-Felsenstein | ~98 s                 | **~0.13 M comparisons/sec** | ~4.7 s                  |
 
 ---
 
