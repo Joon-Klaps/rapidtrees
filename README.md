@@ -43,13 +43,16 @@
 
 ### 🚀 Performance
 
-Benchmarked on a ZIKA dataset (283 taxa · 4 000 trees · ~8 M comparisons) (non-gzipped output):
+Measured on an Apple M1 Max laptop (10 cores, 64 GB RAM) with rapidtrees 0.11.0 from crates.io, on four published BEAST posteriors from the BEAST workshop tutorials ([YFV](https://beast.community/workshop_continuous_diffusion_yfv), [WNV](https://beast.community/workshop_continuous_diffusion_wnv), [batRABV](https://beast.community/workshop_discrete_diffusion_rabv), [EBOV](https://beast.community/workshop_discrete_diffusion_ebov)). Wall-clock time for the whole run, reading the NEXUS file included, with all 10 cores and with one thread in brackets; median of three runs after a warm-up, matrix written to `/dev/null`:
 
-| Metric             | Total time | Throughput                 |
-| ------------------ | ---------- | -------------------------- |
-| Robinson-Foulds    | ~2.7 s     | **~3.0 M comparisons/sec** |
-| Weighted RF        | ~3.4 s     | **~2.3 M comparisons/sec** |
-| Kuhner-Felsenstein | ~3.3 s     | **~2.3 M comparisons/sec** |
+| Dataset | Taxa · trees | Pairs   | Robinson-Foulds | Weighted RF     | Kuhner-Felsenstein | Peak memory |
+| ------- | ------------ | ------- | --------------- | --------------- | ------------------ | ----------- |
+| YFV     | 65 · 5 001   | 12.5 M  | 0.12 s (0.56 s) | 0.41 s (2.38 s) | 0.37 s (2.21 s)    | 393 MiB     |
+| WNV     | 104 · 1 001  | 0.50 M  | 0.02 s (0.07 s) | 0.04 s (0.15 s) | 0.04 s (0.14 s)    | 85 MiB      |
+| batRABV | 372 · 1 001  | 0.50 M  | 0.05 s (0.15 s) | 0.07 s (0.27 s) | 0.06 s (0.27 s)    | 157 MiB     |
+| EBOV    | 836 · 1 167  | 0.68 M  | 0.07 s (0.30 s) | 0.11 s (0.70 s) | 0.10 s (0.54 s)    | 159 MiB     |
+
+On YFV that is about **100 M Robinson-Foulds comparisons per second**. Command: `RAYON_NUM_THREADS=<n> rapidtrees --input <file>.trees --metric <rf|weighted|kf> --output /dev/null --use-real-taxa --quiet`, no burn-in, unrooted.
 
 ---
 
@@ -71,9 +74,6 @@ Install the standalone command-line binary. Requires the [Rust toolchain](https:
 cargo install rapidtrees
 ```
 
-### 🎛️ Tuning the kernels
-
-Every metric keeps a dense column only for splits held by a large enough share of the trees, and gives the rarer ones posting lists. The defaults were tuned on simulated posteriors. `RAPIDTREES_RF_DENSE_SHARE` (default `0.03`) and `RAPIDTREES_WEIGHTED_DENSE_SHARE` (default `0.25`) override them, for re-tuning on other data or hardware. They change the speed only, never a distance.
 
 ### 🛠️ From source
 
@@ -171,9 +171,15 @@ rapidtrees \
 
 ---
 
+
+### 🎛️ Tuning the kernels
+
+Every metric keeps a dense column only for splits held by a large enough share of the trees, and gives the rarer ones posting lists. The defaults were tuned on simulated posteriors. `RAPIDTREES_RF_DENSE_SHARE` (default `0.03`) and `RAPIDTREES_WEIGHTED_DENSE_SHARE` (default `0.25`) override them, for re-tuning on other data or hardware. They change the speed only, never a distance.
+
+
 ## 🐍 Python API
 
-`rapidtrees` exposes four functions from its Rust core. All accept a Python **iterator** of newick strings, keeping memory constant regardless of tree count.
+`rapidtrees` exposes six functions and the `ProgressCounter` class from its Rust core. All six functions accept a Python **iterator** of newick strings, keeping memory constant regardless of tree count, and share the signature `(names, newick_iter, translate_maps, map_indices, rooted=False, progress=None)`.
 
 | Function | Returns |
 | --- | --- |
@@ -189,16 +195,20 @@ import rapidtrees as rtd
 import numpy as np
 
 trees = [
-    "(A:0.1,(B:0.1,C:0.1):0.1);",
-    "(A:0.1,(C:0.1,B:0.1):0.1);",
-    "((A:0.1,B:0.1):0.1,C:0.1);",
+    "((A:0.1,B:0.1):0.1,(C:0.1,D:0.1):0.1);",
+    "((A:0.1,C:0.1):0.1,(B:0.1,D:0.1):0.1);",
+    "((A:0.1,B:0.1):0.1,(C:0.1,D:0.1):0.2);",
 ]
 names = ["t1", "t2", "t3"]
 
+# Newick strings already use real taxon names, so pass one empty translate map for every tree
 tree_names, rf_bytes = rtd.pairwise_rf_from_newick_iter(
-    names, iter(trees), [{}], [0, 0, 0]
+    names, iter(trees), [{}], [0] * len(trees)
 )
 rf = np.frombuffer(rf_bytes, dtype=np.uint32).reshape(len(tree_names), -1)
+# [[0 2 0]
+#  [2 0 2]
+#  [0 2 0]]
 ```
 
 For BEAST `.trees` files, translate maps, the snapshot API, and multi-file usage see **[docs/python-api.md](docs/python-api.md)**.
@@ -233,14 +243,16 @@ alongside the RF distances, from one parse — see the
 [Python API section](#-python-api) above.
 
 ```python
-import rapidtrees as rtd
-import numpy as np
-
 import math
 
+import numpy as np
+import pandas as pd
+import rapidtrees as rtd
+
+# `trees` and `names` are the ones from the Python API example above
 tree_names, rf_bytes, leaf_names, n_bip, pres_bytes, bip_clade_bytes = (
     rtd.pairwise_rf_with_snapshots_from_newick_iter(
-        names, iter(newicks), translate_maps, map_indices
+        names, iter(trees), [{}], [0] * len(trees)
     )
 )
 n = len(tree_names)
@@ -257,7 +269,6 @@ bytes_per_bip = math.ceil(len(leaf_names) / 8)
 bip_arr  = np.frombuffer(bip_clade_bytes, dtype=np.uint8).reshape(n_bip, bytes_per_bip)
 bip_bool = np.unpackbits(bip_arr, axis=1, bitorder="little")[:, :len(leaf_names)]
 col_labels = ["|".join(leaf_names[i] for i in np.where(bip_bool[j])[0]) for j in range(n_bip)]
-import pandas as pd
 df = pd.DataFrame(presence, index=tree_names, columns=col_labels)
 ```
 
@@ -274,35 +285,33 @@ Benchmarks were run on a MacBook Pro M1. Trees are parsed **once** and their int
 
 > Output of `cargo bench --bench memory_time_benchmark`
 
-| Taxa (N) | Trees (T) | Combinations | Est. Memory | Actual Memory | Wall Time | CPU Time |
-|----------|-----------|--------------|-------------|---------------|-----------|----------|
-| 10       | 100       | 5.0K        | 13.96 KB    | 17.87 KB      | 172.29 µs | 733.00 µs |
-| 10       | 1000      | 500.0K         | 139.65 KB   | 168.95 KB     | 5.94 ms   | 12.99 ms |
-| 10       | 10000     | 50.0M       | 1.36 MB     | 1.64 MB       | 717.43 ms | 1.36 s   |
-| 10       | 100000    | 5.0B        | 13.64 MB    | 16.40 MB      | 3.53 min  | 4.04 min |
-| 100      | 100       | 5.0K        | 133.59 KB   | 136.09 KB     | 244.42 µs | 1.75 ms  |
-| 100      | 1000      | 500.0K         | 1.30 MB     | 1.21 MB       | 17.49 ms  | 50.99 ms |
-| 100      | 10000     | 50.0M       | 13.05 MB    | 11.95 MB      | 1.08 s    | 4.81 s   |
-| 100      | 100000    | 5.0B        | 130.46 MB   | 119.41 MB     | 4.29 min  | 9.86 min |
-| 500      | 100       | 5.0K        | 706.84 KB   | 713.93 KB     | 2.02 ms   | 3.08 ms  |
-| 500      | 1000      | 500.0K         | 6.90 MB     | 5.89 MB       | 27.77 ms  | 216.87 ms |
-| 500      | 10000     | 50.0M       | 69.03 MB    | 57.84 MB      | 2.82 s    | 21.30 s  |
-| 500      | 100000    | 5.0B        | 690.27 MB   | 577.28 MB     | 7.44 min  | 37.13 min |
-| 1000     | 100       | 5.0K        | 1.50 MB     | 1.51 MB       | 873.75 µs | 5.63 ms  |
-| 1000     | 1000      | 500.0K         | 15.03 MB    | 11.86 MB      | 51.22 ms  | 420.94 ms |
-| 1000     | 10000     | 50.0M       | 150.32 MB   | 115.30 MB     | 5.12 s    | 42.92 s  |
-| 1000     | 100000    | 5.0B        | 1.47 GB     | 1.12 GB       | 11.26 min | 74.74 min |
-| 2000     | 100       | 5.0K        | 3.50 MB     | 3.51 MB       | 1.14 ms   | 9.92 ms  |
-| 2000     | 1000      | 500.0K         | 35.01 MB    | 24.15 MB      | 93.73 ms  | 838.01 ms |
-| 2000     | 10000     | 50.0M       | 350.06 MB   | 230.59 MB     | 9.42 s    | 1.38 min |
-| 2000     | 100000    | 5.0B        | 3.42 GB     | 2.24 GB       | 18.57 min | 141.11 min |
-| 5000     | 100       | 5.0K        | 14.30 MB    | 12.43 MB      | 61.36 ms  | 83.85 ms |
-| 5000     | 1000      | 500.0K         | 143.02 MB   | 63.97 MB      | 224.40 ms | 2.09 s   |
-| 5000     | 10000     | 50.0M       | 1.40 GB     | 579.40 MB     | 22.45 s   | 3.44 min |
-
+| Taxa (N) | Trees (T) | Combinations | Actual Memory | Wall Time | CPU Time |
+|----------|-----------|--------------|---------------|-----------|----------|
+| 10       | 100       | 5.0K         | ████░░░░░░ 22.19 KB | ░░░░░░░░░░ 96.31 µs | 393.50 µs |
+| 10       | 1000      | 500.0K       | █████░░░░░ 215.55 KB | ░░░░░░░░░░ 911.52 µs | 4.63 ms  |
+| 10       | 10000     | 50.0M        | ██████░░░░ 2.10 MB | ░░░░░░░░░░ 41.71 ms | 132.37 ms |
+| 100      | 100       | 5.0K         | █████░░░░░ 206.12 KB | ░░░░░░░░░░ 167.12 µs | 834.50 µs |
+| 100      | 1000      | 500.0K       | ██████░░░░ 1.94 MB | ░░░░░░░░░░ 1.27 ms | 5.02 ms  |
+| 100      | 10000     | 50.0M        | ███████░░░ 19.27 MB | ░░░░░░░░░░ 42.22 ms | 131.66 ms |
+| 500      | 100       | 5.0K         | ██████░░░░ 1.00 MB | ░░░░░░░░░░ 151.79 µs | 818.00 µs |
+| 500      | 1000      | 500.0K       | ███████░░░ 9.60 MB | ░░░░░░░░░░ 1.08 ms | 6.33 ms  |
+| 500      | 10000     | 50.0M        | ████████░░ 95.61 MB | ░░░░░░░░░░ 43.19 ms | 151.38 ms |
+| 1000     | 100       | 5.0K         | ██████░░░░ 2.01 MB | ░░░░░░░░░░ 118.50 µs | 683.00 µs |
+| 1000     | 1000      | 500.0K       | ███████░░░ 19.20 MB | ░░░░░░░░░░ 1.44 ms | 8.53 ms  |
+| 1000     | 10000     | 50.0M        | ████████░░ 191.03 MB | ░░░░░░░░░░ 51.35 ms | 137.48 ms |
+| 2000     | 100       | 5.0K         | ██████░░░░ 4.04 MB | ░░░░░░░░░░ 216.77 µs | 1.09 ms  |
+| 2000     | 1000      | 500.0K       | ███████░░░ 38.39 MB | ░░░░░░░░░░ 1.45 ms | 9.02 ms  |
+| 2000     | 10000     | 50.0M        | ████████░░ 381.89 MB | ░░░░░░░░░░ 36.07 ms | 127.28 ms |
+| 5000     | 100       | 5.0K         | ███████░░░ 10.24 MB | ░░░░░░░░░░ 195.81 µs | 981.50 µs |
+| 5000     | 1000      | 500.0K       | ████████░░ 96.09 MB | ░░░░░░░░░░ 1.58 ms | 9.22 ms  |
+| 5000     | 10000     | 50.0M        | █████████░ 954.57 MB | ░░░░░░░░░░ 39.01 ms | 152.59 ms |
+| 10000    | 100       | 5.0K         | ███████░░░ 20.56 MB | ░░░░░░░░░░ 267.69 µs | 1.65 ms  |
+| 10000    | 1000      | 500.0K       | ████████░░ 192.24 MB | ░░░░░░░░░░ 2.10 ms | 13.65 ms |
+| 10000    | 10000     | 50.0M        | █████████░ 1.86 GB | ░░░░░░░░░░ 48.65 ms | 224.52 ms |
+| 20000    | 100       | 5.0K         | ███████░░░ 41.28 MB | ░░░░░░░░░░ 1.37 ms | 3.38 ms  |
+| 20000    | 1000      | 500.0K       | ████████░░ 384.62 MB | ░░░░░░░░░░ 3.40 ms | 21.16 ms |
+| 20000    | 10000     | 50.0M        | █████████░ 3.73 GB | ░░░░░░░░░░ 113.57 ms | 352.03 ms |
 </details>
-
-> **Note:** Weighted RF and KF produce floating-point matrices; RF produces integer matrices.
 
 ---
 
