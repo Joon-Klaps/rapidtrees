@@ -33,9 +33,6 @@ identifiers:
   - type: doi
     value: 10.5281/zenodo.23811107
     description: "Concept DOI: resolves to the latest archived version"
-  - type: doi
-    value: 10.5281/zenodo.23811108
-    description: "Version 0.11.0"
 repository-code: "https://github.com/Joon-Klaps/rapidtrees"
 license: MIT
 keywords:
