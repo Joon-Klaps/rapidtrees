@@ -1,0 +1,46 @@
+cff-version: 1.2.0
+message: "If you use rapidtrees, please cite it using the metadata below."
+type: software
+title: "rapidtrees: fast all-pairs phylogenetic tree distances"
+abstract: "rapidtrees is a high-performance Rust library, with Python bindings and a command-line interface, for all-pairs phylogenetic tree distances: Robinson-Foulds, weighted Robinson-Foulds and Kuhner-Felsenstein."
+authors:
+  - family-names: Klaps
+    given-names: Joon
+    affiliation: "Rega Institute for Medical Research, KU Leuven"
+    orcid: "https://orcid.org/0000-0002-2507-0430"
+  - family-names: Hong
+    given-names: Samuel L.
+    affiliation: "Rega Institute for Medical Research, KU Leuven"
+    orcid: "https://orcid.org/0000-0001-6354-4943"
+  - family-names: Brusselmans
+    given-names: Marius
+    affiliation: "Rega Institute for Medical Research, KU Leuven"
+    orcid: "https://orcid.org/0009-0000-2134-1515"
+  - family-names: Kafetzopoulou
+    given-names: Liana E.
+    affiliation: "Rega Institute for Medical Research, KU Leuven"
+    orcid: "https://orcid.org/0000-0003-4531-1374"
+  - family-names: Lemey
+    given-names: Philippe
+    affiliation: "Rega Institute for Medical Research, KU Leuven"
+    orcid: "https://orcid.org/0000-0003-2826-5353"
+  - family-names: Baele
+    given-names: Guy
+    affiliation: "Rega Institute for Medical Research, KU Leuven"
+    orcid: "https://orcid.org/0000-0002-1915-7732"
+doi: 10.5281/zenodo.23811107
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.23811107
+    description: "Concept DOI: resolves to the latest archived version"
+  - type: doi
+    value: 10.5281/zenodo.23811108
+    description: "Version 0.11.0"
+repository-code: "https://github.com/Joon-Klaps/rapidtrees"
+license: MIT
+keywords:
+  - phylogenetics
+  - tree-distance
+  - robinson-foulds
+  - bioinformatics
+  - kuhner-felsenstein
