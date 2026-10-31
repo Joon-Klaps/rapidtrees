@@ -10,6 +10,8 @@ This project uses release names based on random words from [codenamegenerator.co
 
 ## [UNRELEASED] - MICROSOFT_CORPORATION SNAKE (YYYY-MM-DD)
 
+- ([#63](https://github.com/Joon-Klaps/rapidtrees/pull/63)) - __FEATURE__: An npm package, built from a separate wasm-bindgen binding crate with wasm-pack, runs the three pairwise metrics in the browser and in Node.
+
 ## [0.11.0] - Redmond Rattlesnake (2026-10-02)
 
 - ([#44](https://github.com/Joon-Klaps/rapidtrees/pull/44)) - __PERFORMANCE__: Tree files are streamed a chunk of trees at a time instead of being read whole and copied, so memory no longer grows with the size of the input file.
