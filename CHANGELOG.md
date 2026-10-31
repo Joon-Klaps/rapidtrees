@@ -10,6 +10,8 @@ This project uses release names based on random words from [codenamegenerator.co
 
 ## [UNRELEASED] - MICROSOFT_CORPORATION SNAKE (YYYY-MM-DD)
 
+- ([#63](https://github.com/Joon-Klaps/rapidtrees/pull/63)) - __FEATURE__: An npm package gives browser and Node users the three pairwise metrics from BEAST NEXUS or Newick text.
+
 ## [0.11.0] - Redmond Rattlesnake (2026-10-02)
 
 - ([#44](https://github.com/Joon-Klaps/rapidtrees/pull/44)) - __PERFORMANCE__: Tree files are streamed a chunk of trees at a time instead of being read whole and copied, so memory no longer grows with the size of the input file.

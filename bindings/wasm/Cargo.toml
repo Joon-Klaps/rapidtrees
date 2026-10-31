@@ -1,0 +1,28 @@
+# The npm package for the browser and Node: wasm-bindgen glue over the `rapidtrees` library. This crate is a leaf that nothing links, which keeps `rapidtrees` itself free of wasm-bindgen (rule 1 in CLAUDE.md). Built with `node bindings/wasm/build.mjs`, never published to crates.io.
+[package]
+name = "rapidtrees-wasm"
+version = "0.11.0"
+edition = "2024"
+description = "WebAssembly bindings for rapidtrees: pairwise Robinson-Foulds, weighted RF and Kuhner-Felsenstein tree distances in the browser and Node"
+license = "MIT"
+repository = "https://github.com/Joon-Klaps/rapidtrees"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# No default features (no rayon, clap or flate2): the same build tests/wasm checks.
+rapidtrees = { path = "../..", default-features = false }
+wasm-bindgen = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+
+# wasm-pack runs wasm-opt itself; the flag below keeps the wasm32 sign-ext and bulk-memory instructions that current rustc emits.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O3", "--enable-bulk-memory", "--enable-sign-ext", "--enable-nontrapping-float-to-int", "--enable-mutable-globals"]
+
+# Standalone, so it never joins the parent package's build.
+[workspace]

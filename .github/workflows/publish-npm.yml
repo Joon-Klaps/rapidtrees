@@ -1,0 +1,58 @@
+name: Publish to npm
+
+on:
+    release:
+        types: ["published"]
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+jobs:
+    # ── Validate tag matches Cargo.toml version ──────────────────────────
+    validate-release-tag:
+        name: Validate git tag
+        runs-on: ubuntu-latest
+        if: github.event_name == 'release'
+        steps:
+            - uses: actions/checkout@v4
+            - name: Compare git tag with both Cargo.toml versions
+              run: |
+                  PUSHED_TAG=${GITHUB_REF##*/}
+                  CURR_VER=$( grep '^version' Cargo.toml | head -n 1 | awk '{print $3}' | tr -d '"' )
+                  NPM_VER=$( grep '^version' bindings/wasm/Cargo.toml | head -n 1 | awk '{print $3}' | tr -d '"' )
+                  if [[ "${PUSHED_TAG}" != "${CURR_VER}" || "${PUSHED_TAG}" != "${NPM_VER}" ]]; then
+                    echo "::error::tag is ${PUSHED_TAG}, Cargo.toml has ${CURR_VER} and bindings/wasm/Cargo.toml has ${NPM_VER}"
+                    exit 1
+                  fi
+
+    # ── Build, test and publish the npm package ──────────────────────────
+    publish-npm:
+        name: Publish to npm
+        needs: validate-release-tag
+        if: always() && (needs.validate-release-tag.result == 'success' || needs.validate-release-tag.result == 'skipped')
+        runs-on: ubuntu-latest
+        steps:
+            # LFS: the test reads the BEAST files in tests/data
+            - uses: actions/checkout@v4
+              with:
+                  lfs: true
+            - uses: dtolnay/rust-toolchain@stable
+              with:
+                  targets: wasm32-unknown-unknown
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 24
+                  registry-url: https://registry.npmjs.org
+            # Same wasm-pack version as ci.yml
+            - uses: taiki-e/install-action@v2
+              with:
+                  tool: wasm-pack@0.15.0
+            - name: Build the package
+              run: node bindings/wasm/build.mjs
+            - name: Test the built package against the native CLI
+              run: node bindings/wasm/tests/run.mjs
+            - name: Publish to npm
+              run: npm publish bindings/wasm/pkg --access public
+              env:
+                  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
