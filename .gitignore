@@ -1,5 +1,7 @@
 /target
 tests/wasm/target/
+bindings/wasm/target/
+bindings/wasm/pkg/
 bigdata/
 out/
 Cargo.lock

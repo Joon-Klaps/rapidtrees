@@ -18,6 +18,7 @@
   <a href="#-installing">Installing</a> •
   <a href="#-usage">Usage</a> •
   <a href="#-python-api">Python API</a> •
+  <a href="#-browser-and-node">Browser and Node</a> •
   <a href="#-presence-matrix">Presence Matrix</a> •
   <a href="#%EF%B8%8F-benchmarks">Benchmarks</a>
 </p>
@@ -75,6 +76,14 @@ Install the standalone command-line binary. Requires the [Rust toolchain](https:
 cargo install rapidtrees
 ```
 
+
+### 🌐 Browser and Node (npm)
+
+The library compiled to WebAssembly, single-threaded, for browsers and Node. See [Browser and Node](#-browser-and-node) below.
+
+```bash
+npm install rapidtrees
+```
 
 ### 🛠️ From source
 
@@ -213,6 +222,33 @@ rf = np.frombuffer(rf_bytes, dtype=np.uint32).reshape(len(tree_names), -1)
 ```
 
 For BEAST `.trees` files, translate maps, the snapshot API, and multi-file usage see **[docs/python-api.md](docs/python-api.md)**.
+
+---
+
+## 🌐 Browser and Node
+
+`npm install rapidtrees` gives `pairwise_rf`, `pairwise_wrf` and `pairwise_kf`, each taking the text of a BEAST/NEXUS file or of a Newick file with one tree per line, plus an optional burn-in in trees, and returning the tree names and the row-major matrix (`Uint32Array` for RF, `Float64Array` for the others). The package is built from [`bindings/wasm`](bindings/wasm) and the `rapidtrees` crate itself never depends on `wasm-bindgen`. The whole file is read into memory first, so the browser build does not stream.
+
+In a browser, call `init()` once to load the `.wasm` file:
+
+```js
+import init, { pairwise_rf } from "rapidtrees";
+
+await init();
+const rf = pairwise_rf(await fileInput.files[0].text(), 100);
+console.log(rf.n_trees, rf.names, rf.matrix);
+```
+
+In Node there is no `init()`:
+
+```js
+import { readFileSync } from "node:fs";
+import { pairwise_kf } from "rapidtrees";
+
+const kf = pairwise_kf(readFileSync("posterior.trees", "utf8"), 1000);
+```
+
+Build and test it locally with `pixi run test-npm` (needs wasm-pack, Node 18 or later and `rustup target add wasm32-unknown-unknown`). The full reference is in [bindings/wasm/README.md](bindings/wasm/README.md).
 
 ---
 
