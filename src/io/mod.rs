@@ -23,9 +23,6 @@ mod write;
 
 pub use annotations::strip_beast_annotations;
 pub use format::{TreeFormat, detect_format};
-// Re-exporting a deprecated item counts as using it.
-#[allow(deprecated)]
-pub use load::load_beast_trees;
 pub use load::{MIN_TREES, ReadOptions, ReadTreesError, read_tree_file, read_trees};
 pub use nexus::{extract_name_state, nexus_tree_lines, parse_taxon_block};
 #[cfg(feature = "cli")]

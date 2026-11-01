@@ -130,44 +130,8 @@ pub fn read_tree_file<P: AsRef<Path>>(
     path: P,
     opts: &ReadOptions,
 ) -> Result<(Vec<String>, Snapshots), ReadTreesError> {
-    enough_trees(load_file(path.as_ref(), opts)?)
-}
-
-/// Load and parse all trees from a NEXUS or plain-Newick tree file.
-///
-/// [`read_tree_file`] with positional arguments, and an empty result where
-/// that returns an error: the error is printed to stderr instead. Unlike
-/// [`read_tree_file`], it loads a file of a single tree.
-///
-/// `retain` says what to build besides the split IDs; pass `None` to keep
-/// everything.
-#[deprecated(note = "use `read_tree_file`, which returns the error instead of printing it")]
-pub fn load_beast_trees<P: AsRef<Path>>(
-    path: P,
-    burnin_trees: usize,
-    burnin_states: usize,
-    use_real_taxa: bool,
-    rooted: bool,
-    retain: impl Into<Option<Retain>>,
-) -> (Vec<String>, Snapshots) {
-    let opts = ReadOptions {
-        burnin_trees,
-        burnin_states,
-        use_real_taxa,
-        rooted,
-        retain: retain.into().unwrap_or_default(),
-    };
-    let path = path.as_ref();
-    load_file(path, &opts).unwrap_or_else(|e| {
-        eprintln!("Failed to read {path:?}: {e}");
-        (Vec::new(), Snapshots::empty())
-    })
-}
-
-/// The trees of the file at `path`, however few.
-fn load_file(path: &Path, opts: &ReadOptions) -> Result<(Vec<String>, Snapshots), ReadTreesError> {
-    let (translate, reader) = TreeReader::open(path, opts)?;
-    build(read_ahead(reader), &translate, opts)
+    let (translate, reader) = TreeReader::open(path.as_ref(), opts)?;
+    enough_trees(build(read_ahead(reader), &translate, opts)?)
 }
 
 /// Parse `trees` into [`Snapshots`], stopping at the first error, whether it
@@ -490,27 +454,5 @@ mod tests {
             newick_snaps.pairwise_rf(None),
             nexus_snaps.pairwise_rf(None)
         );
-    }
-
-    // ── load_beast_trees ──────────────────────────────────────────────────────
-
-    /// The deprecated wrapper keeps its contract: errors become an empty
-    /// result, and a single tree still loads.
-    #[test]
-    #[allow(deprecated)]
-    fn test_load_beast_trees_keeps_its_contract() {
-        let (names, snaps) = load_beast_trees(hiv2_path(), 5, 0, false, false, None);
-        assert_eq!((names.len(), snaps.len()), (16, 16));
-
-        let (names, snaps) = load_beast_trees("nonexistent.trees", 0, 0, false, false, None);
-        assert!(names.is_empty() && snaps.is_empty());
-
-        let mut tmp = tempfile::Builder::new()
-            .suffix(".newick")
-            .tempfile()
-            .unwrap();
-        io::Write::write_all(&mut tmp, b"((A:1,B:1):1,(C:1,D:1):1);\n").unwrap();
-        let (names, snaps) = load_beast_trees(tmp.path(), 0, 0, false, false, None);
-        assert_eq!((names.len(), snaps.len()), (1, 1));
     }
 }
