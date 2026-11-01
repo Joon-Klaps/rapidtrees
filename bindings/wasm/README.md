@@ -8,7 +8,7 @@ npm install rapidtrees
 
 ## API
 
-All three functions take the text of a BEAST/NEXUS file (with or without a `TRANSLATE` block) or of a Newick file with one tree per line. They are named after the Python API.
+All three functions take the text of a BEAST/NEXUS file (with or without a `TRANSLATE` block) or of a plain Newick file, and read it with the same code as the native CLI. They are named after the Python API.
 
 | Function | Returns |
 | --- | --- |
@@ -17,7 +17,7 @@ All three functions take the text of a BEAST/NEXUS file (with or without a `TRAN
 | `pairwise_kf(content, burnin_trees?, rooted?)` | `FloatMatrix`: `matrix` is a `Float64Array` |
 | `rapidtrees_version()` | the version of the `rapidtrees` crate behind the build, as a string |
 
-`burnin_trees` drops that many trees from the start (default 0) and `rooted` compares clades instead of bipartitions (default `false`). A result has `n_trees`, `names` (the NEXUS tree names such as `STATE_10000`, or `line<N>` for Newick) and `matrix`, the row-major `n_trees * n_trees` matrix. Each read of `names` or `matrix` copies out of wasm memory, so read them once and call `free()` on the result when you are done. Functions throw an `Error` if no trees are left after burn-in, a tree fails to parse or the trees do not share one leaf set. Weighted RF and KF need branch lengths.
+`burnin_trees` drops that many trees from the start (default 0) and `rooted` compares clades instead of bipartitions (default `false`). A result has `n_trees`, `names` (the NEXUS tree names such as `STATE_10000`, or `line<N>` for Newick) and `matrix`, the row-major `n_trees * n_trees` matrix. Each read of `names` or `matrix` copies out of wasm memory, so read them once and call `free()` on the result when you are done. Functions throw an `Error` if the input holds no trees, fewer than two are left after burn-in, a tree fails to parse or the trees do not share one leaf set. Weighted RF and KF need branch lengths.
 
 ## Browser
 
@@ -48,7 +48,7 @@ kf.free();
 
 ## Memory
 
-The input is not streamed. The whole file goes in as one string, so the page or process holds the JS string, its UTF-8 copy in wasm linear memory and the text of the trees being parsed, and wasm32 caps linear memory at 4 GiB. The native CLI and the Python package stream; use them for files that approach that size.
+The input is not streamed. The whole file goes in as one string, so the page or process holds the JS string, its UTF-8 copy in wasm linear memory and one chunk of trees while it is parsed, and wasm32 caps linear memory at 4 GiB. The native CLI and the Python package stream; use them for files that approach that size.
 
 ## Source
 
