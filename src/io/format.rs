@@ -2,7 +2,7 @@
 
 use super::nexus::{nexus_tree_lines, starts_with_ci};
 
-/// Tree-file formats [`load_beast_trees`](super::load_beast_trees) can read.
+/// Tree-file formats [`read_trees`](super::read_trees) can read.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TreeFormat {
     /// NEXUS: optional `#NEXUS` header and `TRANSLATE` block, one
@@ -10,6 +10,17 @@ pub enum TreeFormat {
     Nexus,
     /// Plain Newick: `;`-terminated trees and nothing else — no tree names.
     Newick,
+}
+
+impl TreeFormat {
+    /// What a tree of this format looks like, for the message of an input
+    /// that holds none.
+    pub(super) fn tree_shape(self) -> &'static str {
+        match self {
+            Self::Nexus => "NEXUS `tree <name> = <newick>` lines",
+            Self::Newick => "`;`-terminated Newick trees",
+        }
+    }
 }
 
 /// Sniff whether `content` is a NEXUS trees file or a plain Newick file.

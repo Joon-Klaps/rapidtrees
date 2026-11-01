@@ -1,6 +1,6 @@
 use clap::{Parser, ValueEnum};
 use rapidtrees::Retain;
-use rapidtrees::io::{load_beast_trees, write_matrix_tsv};
+use rapidtrees::io::{ReadOptions, read_tree_file, write_matrix_tsv};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -61,14 +61,20 @@ fn main() {
     let t_total = Instant::now();
     let t = Instant::now();
 
-    let (names, interned) = load_beast_trees(
-        &args.input,
-        args.burnin_trees,
-        args.burnin_states,
-        args.use_real_taxa,
-        args.rooted,
-        Retain::for_distances(args.metric != MetricArg::Rf),
-    );
+    let mut opts = ReadOptions::default();
+    opts.burnin_trees = args.burnin_trees;
+    opts.burnin_states = args.burnin_states;
+    opts.use_real_taxa = args.use_real_taxa;
+    opts.rooted = args.rooted;
+    opts.retain = Retain::for_distances(args.metric != MetricArg::Rf);
+    // Too few trees is an error here too, so every failure to load exits 2.
+    let (names, interned) = match read_tree_file(&args.input, &opts) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            eprintln!("Failed to load {}: {e}", args.input.display());
+            std::process::exit(2);
+        }
+    };
 
     log_if(
         quiet,
@@ -78,11 +84,6 @@ fn main() {
             t.elapsed().as_secs_f64()
         ),
     );
-
-    if names.len() < 2 {
-        eprintln!("Need at least 2 trees to compute pairwise distances");
-        std::process::exit(2);
-    }
 
     log_collision_bound(quiet, interned.n_distinct_splits());
 

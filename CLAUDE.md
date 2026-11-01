@@ -46,7 +46,7 @@ src/                    — the distance kernel. No wasm-bindgen here.
     nexus.rs      — NEXUS primitives (tree headers, TRANSLATE)
     format.rs     — NEXUS vs Newick detection
     reader.rs     — streaming TreeReader, burn-in
-    load.rs       — load_beast_trees
+    load.rs       — read_trees / read_tree_file, ReadOptions, ReadTreesError
     write.rs      — write_matrix_tsv (cli feature)
   par.rs        — rayon-or-sequential shim; `pub` so dependents share one policy
   main.rs       — CLI binary
@@ -79,11 +79,12 @@ docs/
    is not a `rapidtrees` concern. MCMC diagnostics — log densities, chain
    splitting, burnin, subsampling — are the browser's, which is why BEAST
    *header* semantics live there while NEXUS *primitives* (`parse_taxon_block`,
-   `extract_name_state`, `strip_beast_annotations`) stay here and are `pub` for
-   it to build on. `rename_leaf_nodes` was removed with the Newick reader: it
-   took a phylotree `Tree`, and rapidtrees no longer parses into one.
+   `extract_name_state`, `nexus_tree_lines`, `strip_beast_annotations`) stay
+   here and are `pub` for it to build on. `rename_leaf_nodes` was removed with
+   the Newick reader: it took a phylotree `Tree`, and rapidtrees no longer
+   parses into one.
 4. **Anything `pub` in `io/` is treetracer-web's API.** Changing one of those
-   three signatures breaks that repo's build with no compiler to warn you, since
+   four signatures breaks that repo's build with no compiler to warn you, since
    it is a git dependency rather than a workspace member. Treat them as
    published surface.
 

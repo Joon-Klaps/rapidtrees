@@ -4,12 +4,13 @@
 //! - `nexus`: NEXUS primitives — tree headers, tree lines, the `TRANSLATE` block.
 //! - `format`: telling NEXUS from plain Newick.
 //! - `reader`: the streaming reader that hands trees out one at a time.
-//! - `load`: [`load_beast_trees`], a whole file into [`crate::Snapshots`].
+//! - `load`: [`read_trees`] and [`read_tree_file`], a whole input into
+//!   [`crate::Snapshots`], with their [`ReadOptions`] and [`ReadTreesError`].
 //! - `write`: [`write_matrix_tsv`] (behind the `cli` feature).
 //!
 //! Everything public here is re-exported flat, so the paths stay
-//! `rapidtrees::io::*`. `strip_beast_annotations`, `extract_name_state` and
-//! `parse_taxon_block` are treetracer-web's API.
+//! `rapidtrees::io::*`. `strip_beast_annotations`, `extract_name_state`,
+//! `nexus_tree_lines` and `parse_taxon_block` are treetracer-web's API.
 
 mod annotations;
 mod format;
@@ -21,8 +22,11 @@ mod write;
 
 pub use annotations::strip_beast_annotations;
 pub use format::{TreeFormat, detect_format};
+// Re-exporting a deprecated item counts as using it.
+#[allow(deprecated)]
 pub use load::load_beast_trees;
-pub use nexus::{extract_name_state, parse_taxon_block};
+pub use load::{MIN_TREES, ReadOptions, ReadTreesError, read_tree_file, read_trees};
+pub use nexus::{extract_name_state, nexus_tree_lines, parse_taxon_block};
 #[cfg(feature = "cli")]
 pub use write::write_matrix_tsv;
 

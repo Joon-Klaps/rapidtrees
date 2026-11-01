@@ -515,5 +515,5 @@ Not every path needs everything, and both extras cost real work:
 | `snapshot/clades.rs` | the export-only leaf-set table, and its packed ordering |
 | `io/reader.rs` | NEXUS/Newick file reading, streamed a tree at a time: tree lines, TRANSLATE, burn-in |
 | `io/nexus.rs`, `annotations.rs`, `format.rs` | NEXUS primitives, `[&...]` stripping, format detection |
-| `io/load.rs`, `write.rs` | `load_beast_trees`, `write_matrix_tsv` |
+| `io/load.rs`, `write.rs` | `read_trees`, `read_tree_file`, `write_matrix_tsv` |
 | `api/` | PyO3 bindings — glue only, no computation |
