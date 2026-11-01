@@ -1,7 +1,7 @@
 //! NEXUS primitives: tree headers, tree lines and the `TRANSLATE` block.
 //!
-//! `extract_name_state`, `nexus_tree_lines` and `parse_taxon_block` are
-//! treetracer-web's API: change their signatures only together with that repo.
+//! Readers outside this crate build on `extract_name_state`, `nexus_tree_lines`
+//! and `parse_taxon_block`, so treat their signatures as published surface.
 
 use std::collections::HashMap;
 

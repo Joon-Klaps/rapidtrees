@@ -10,7 +10,8 @@
 //!
 //! Everything public here is re-exported flat, so the paths stay
 //! `rapidtrees::io::*`. `strip_beast_annotations`, `extract_name_state`,
-//! `nexus_tree_lines` and `parse_taxon_block` are treetracer-web's API.
+//! `nexus_tree_lines` and `parse_taxon_block` are what readers outside this
+//! crate build on, so their signatures are published surface.
 
 mod annotations;
 mod format;
