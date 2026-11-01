@@ -225,6 +225,21 @@ For BEAST `.trees` files, translate maps, the snapshot API, and multi-file usage
 
 ---
 
+## 🦀 Rust API
+
+The CLI reads its input with `io::read_tree_file`, and `io::read_trees` does the same for anything that implements `BufRead`, such as bytes already in memory. Both tell NEXUS from Newick by the contents, apply burn-in, and return the tree names with a `Snapshots` ready for `pairwise_rf`, `pairwise_wrf` or `pairwise_kf`. An input that cannot be read, holds no trees, has fewer than two left after burn-in, or holds a tree that does not parse gives a `ReadTreesError`.
+
+```rust
+use rapidtrees::io::{ReadOptions, read_tree_file};
+
+let mut opts = ReadOptions::default();
+opts.burnin_trees = 100;
+let (names, snaps) = read_tree_file("posterior.trees", &opts)?;
+let rf = snaps.pairwise_rf(None); // row-major, names.len() × names.len()
+```
+
+---
+
 ## 🌐 Browser and Node
 
 `npm install rapidtrees` gives `pairwise_rf`, `pairwise_wrf` and `pairwise_kf`, each taking the text of a BEAST/NEXUS file or of a Newick file with one tree per line, plus an optional burn-in in trees, and returning the tree names and the row-major matrix (`Uint32Array` for RF, `Float64Array` for the others). The package is built from [`bindings/wasm`](bindings/wasm) and the `rapidtrees` crate itself never depends on `wasm-bindgen`. The whole file is read into memory first, so the browser build does not stream.

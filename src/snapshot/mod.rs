@@ -85,7 +85,7 @@ pub struct Snapshots {
 /// lengths are `~n_bip × 8` bytes per tree, and materialising a bipartition is
 /// an `O(subtree)` walk per distinct split. A path that computes a matrix and
 /// exports nothing wants both off.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Retain {
     /// Per-edge branch lengths. Required by WRF and KF; dead weight for RF.
     pub lengths: bool,
@@ -109,6 +109,13 @@ impl Retain {
             lengths: weighted,
             bipartitions: false,
         }
+    }
+}
+
+/// [`Retain::everything`], as the constructors that take no `Retain` keep.
+impl Default for Retain {
+    fn default() -> Self {
+        Self::everything()
     }
 }
 

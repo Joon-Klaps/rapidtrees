@@ -5,6 +5,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyIterator;
 use std::collections::HashMap;
 
+use crate::io::MIN_TREES;
 use crate::snapshot::{Retain, Snapshots};
 
 /// The tree source as handed in from Python: the newicks, how to rename their
@@ -51,12 +52,17 @@ pub(super) fn collect_snapshots_from_iter(
         return Err(e);
     }
     let snaps = built.map_err(PyValueError::new_err)?;
-    if snaps.len() < 2 {
-        return Err(PyValueError::new_err(
-            "Need at least 2 trees to compute pairwise distances",
-        ));
+    if snaps.len() < MIN_TREES {
+        return Err(too_few_trees());
     }
     Ok(snaps)
+}
+
+/// The core's minimum, [`MIN_TREES`], as Python sees it.
+fn too_few_trees() -> PyErr {
+    PyValueError::new_err(format!(
+        "Need at least {MIN_TREES} trees to compute pairwise distances"
+    ))
 }
 
 /// Validate argument consistency for iterator-based functions.
@@ -67,10 +73,8 @@ pub(super) fn validate_iter_args(
 ) -> PyResult<()> {
     let n_names = names.len();
 
-    if n_names < 2 {
-        return Err(PyValueError::new_err(
-            "Need at least 2 trees to compute pairwise distances",
-        ));
+    if n_names < MIN_TREES {
+        return Err(too_few_trees());
     }
 
     if n_names != map_indices.len() {
