@@ -1,12 +1,11 @@
 //! WebAssembly bindings for `rapidtrees`, built with wasm-pack into the npm package.
 //!
-//! One function per metric, named after the Python API: [`pairwise_rf`], [`pairwise_wrf`] and [`pairwise_kf`]. Each takes the text of a BEAST NEXUS file (with or without a `TRANSLATE` block) or of a Newick file with one tree per line, drops the first `burnin_trees` trees, and returns the tree names with the flat row-major `n * n` matrix.
+//! One function per metric, named after the Python API: [`pairwise_rf`], [`pairwise_wrf`] and [`pairwise_kf`]. Each takes the text of a BEAST/NEXUS or plain-Newick file, drops the first `burnin_trees` trees, and returns the tree names with the flat row-major `n * n` matrix.
 //!
-//! The whole file is passed in as one string, so the browser build needs the input in memory: the JS string, its UTF-8 copy in wasm linear memory, and the trees' text while they are parsed. Only the public API that `tests/wasm` already uses is called, and nothing here adds to `rapidtrees::io`.
+//! The text is read by `rapidtrees::io::read_trees`, the reader the CLI uses, so format detection, burn-in, tree names and the two-tree minimum are the library's, and this crate only converts arguments and errors. The whole file is passed in as one string, so the browser build holds it in memory twice, as the JS string and as its UTF-8 copy in wasm linear memory, plus one chunk of trees while they are parsed.
 
-use rapidtrees::io::{TreeFormat, detect_format, parse_taxon_block, strip_beast_annotations};
+use rapidtrees::io::{ReadOptions, read_trees};
 use rapidtrees::{Retain, Snapshots};
-use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 
 /// Result of [`pairwise_rf`]: the trees kept after burn-in and their `uint32` Robinson-Foulds matrix.
@@ -67,7 +66,7 @@ impl FloatMatrix {
 
 /// Pairwise Robinson-Foulds distances between all trees in `content`.
 ///
-/// `content` is a BEAST/NEXUS file or a Newick file with one tree per line, as text. `burnin_trees` drops that many trees from the start (default 0). `rooted` compares clades instead of bipartitions (default false). Throws if the input holds no trees, the trees fail to parse or their leaf sets differ.
+/// `content` is a BEAST/NEXUS or plain-Newick file, as text. `burnin_trees` drops that many trees from the start (default 0). `rooted` compares clades instead of bipartitions (default false). Throws if the input holds no trees, fewer than two are left after burn-in, a tree fails to parse or the leaf sets differ.
 #[wasm_bindgen]
 pub fn pairwise_rf(
     content: &str,
@@ -115,51 +114,16 @@ pub fn rapidtrees_version() -> String {
     env!("CARGO_PKG_VERSION").to_owned()
 }
 
+/// The trees of `content`, read with what a matrix of this metric needs.
 fn load(
     content: &str,
     burnin_trees: Option<usize>,
     rooted: Option<bool>,
     weighted: bool,
 ) -> Result<(Vec<String>, Snapshots), JsError> {
-    let (translate, trees): (_, Box<dyn Iterator<Item = (String, &str)>>) =
-        match detect_format(content) {
-            TreeFormat::Nexus => (parse_taxon_block(content), Box::new(nexus_trees(content))),
-            TreeFormat::Newick => (HashMap::new(), Box::new(newick_trees(content))),
-        };
-    let (names, newicks): (Vec<String>, Vec<String>) = trees
-        .skip(burnin_trees.unwrap_or(0))
-        .map(|(name, body)| (name, strip_beast_annotations(body)))
-        .unzip();
-    if names.is_empty() {
-        return Err(JsError::new("no trees left to compare after burn-in"));
-    }
-    let snaps = Snapshots::from_newick_iter_opts(
-        newicks.iter().map(|n| (n.as_str(), &translate)),
-        rooted.unwrap_or(false),
-        Retain::for_distances(weighted),
-    )
-    .map_err(|e| JsError::new(&e))?;
-    Ok((names, snaps))
-}
-
-/// `(name, Newick)` of every `tree NAME = BODY` line in the NEXUS trees block. Splits on `" = "`, not `'='`: BEAST headers carry `[&lnP=…]`.
-fn nexus_trees(content: &str) -> impl Iterator<Item = (String, &str)> {
-    content
-        .lines()
-        .skip_while(|line| !line.trim_start().to_ascii_lowercase().starts_with("tree "))
-        .take_while(|line| !line.trim_start().to_ascii_lowercase().starts_with("end;"))
-        .filter_map(|line| {
-            let (header, body) = line.split_once(" = ")?;
-            let name = header.split_whitespace().nth(1)?;
-            Some((name.trim_matches('\'').to_owned(), body.trim()))
-        })
-}
-
-/// `(line<N>, Newick)` of every non-empty line of a plain Newick file, `N` counting from 1.
-fn newick_trees(content: &str) -> impl Iterator<Item = (String, &str)> {
-    content
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
-        .map(|(i, line)| (format!("line{}", i + 1), line.trim()))
+    let mut opts = ReadOptions::default();
+    opts.burnin_trees = burnin_trees.unwrap_or(0);
+    opts.rooted = rooted.unwrap_or(false);
+    opts.retain = Retain::for_distances(weighted);
+    Ok(read_trees(content.as_bytes(), &opts)?)
 }

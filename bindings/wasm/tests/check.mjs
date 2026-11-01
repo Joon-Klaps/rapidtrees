@@ -64,11 +64,37 @@ for (const file of FILES) {
   console.log(`${failures === 0 ? "ok  " : "FAIL"} ${file}: rf / weighted / kf against the native CLI`);
 }
 
-try {
-  rapidtrees.pairwise_rf(readFileSync(join(ROOT, "tests/data", FILES[0]), "utf8"), 1000);
-  check(false, "burn-in past the last tree did not throw");
-} catch (e) {
-  check(e instanceof Error && /no trees/.test(e.message), `unexpected error: ${e}`);
+// Where the package once read trees itself and disagreed with the CLI. It now calls the library's reader, and these keep it that way.
+const QUARTETS = ["((A:1,B:1):1,(C:1,D:1):1);", "((A:1,C:1):1,(B:1,D:1):1);"];
+const MRBAYES = "#NEXUS\nbegin trees;\n   translate\n       1 A,\n       2 B,\n       3 C,\n       4 D;\n   tree gen.0 = [&U] ((1:1,2:1):1,(3:1,4:1):1);\n   tree gen.100 = [&U] ((1:1,3:1):1,(2:1,4:1):1);\nend;\n";
+const READER_CASES = [
+  ["two trees on one line", `${QUARTETS[0]}${QUARTETS[1]}\n`, ["line1", "line1"]],
+  ["a tree wrapped over lines", `((A:1,\nB:1):1,\n(C:1,D:1):1);\n${QUARTETS[1]}\n`, ["line1", "line4"]],
+  ["a byte-order mark", `\u{feff}${QUARTETS[0]}\n${QUARTETS[1]}\n`, ["line1", "line2"]],
+  ["a comment line before the trees", `[written by some tool]\n${QUARTETS[0]}\n${QUARTETS[1]}\n`, ["line2", "line3"]],
+  ["ape's TREE * STATE_n headers", `#NEXUS\nBEGIN TREES;\n\tTREE * STATE_1 = [&R] ${QUARTETS[0]}\n\tTREE * STATE_2 = [&R] ${QUARTETS[1]}\nEND;\n`, ["STATE_1", "STATE_2"]],
+  ["MrBayes gen.N headers", MRBAYES, ["gen.0", "gen.100"]],
+];
+for (const [label, content, names] of READER_CASES) {
+  const rf = rapidtrees.pairwise_rf(content);
+  check(JSON.stringify(rf.names) === JSON.stringify(names), `${label}: names ${JSON.stringify(rf.names)}`);
+  check(JSON.stringify([...rf.matrix]) === "[0,2,2,0]", `${label}: RF ${[...rf.matrix]}`);
+  rf.free();
+}
+console.log(`${failures === 0 ? "ok  " : "FAIL"} ${READER_CASES.length} reader edge cases match the CLI's reader`);
+
+// One tree is too few for a pairwise matrix, as in the CLI and the Python package.
+const TOO_FEW = [
+  ["burn-in past the last tree", readFileSync(join(ROOT, "tests/data", FILES[0]), "utf8"), 1000],
+  ["a single tree", `${QUARTETS[0]}\n`, 0],
+];
+for (const [label, content, burnin] of TOO_FEW) {
+  try {
+    rapidtrees.pairwise_rf(content, burnin);
+    check(false, `${label} did not throw`);
+  } catch (e) {
+    check(e instanceof Error && /at least 2 trees/.test(e.message), `${label}: unexpected error ${e}`);
+  }
 }
 
 // The CommonJS entry that `require` resolves to is the same Node build.

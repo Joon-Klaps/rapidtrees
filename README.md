@@ -242,7 +242,7 @@ let rf = snaps.pairwise_rf(None); // row-major, names.len() × names.len()
 
 ## 🌐 Browser and Node
 
-`npm install rapidtrees` gives `pairwise_rf`, `pairwise_wrf` and `pairwise_kf`, each taking the text of a BEAST/NEXUS file or of a Newick file with one tree per line, plus an optional burn-in in trees, and returning the tree names and the row-major matrix (`Uint32Array` for RF, `Float64Array` for the others). The package is built from [`bindings/wasm`](bindings/wasm) and the `rapidtrees` crate itself never depends on `wasm-bindgen`. The whole file is read into memory first, so the browser build does not stream.
+`npm install rapidtrees` gives `pairwise_rf`, `pairwise_wrf` and `pairwise_kf`, each taking the text of a BEAST/NEXUS or plain Newick file, plus an optional burn-in in trees, and returning the tree names and the row-major matrix (`Uint32Array` for RF, `Float64Array` for the others). The package is built from [`bindings/wasm`](bindings/wasm) and the `rapidtrees` crate itself never depends on `wasm-bindgen`. The whole file is read into memory first, so the browser build does not stream.
 
 In a browser, call `init()` once to load the `.wasm` file:
 
