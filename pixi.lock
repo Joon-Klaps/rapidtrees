@@ -4287,7 +4287,7 @@ packages:
 - pypi: ./
   name: rapidtrees
   version: 0.12.0
-  sha256: 002843a198fe8225fdec789f2e2eb28ed7427e10703ee371eca56d46252921ee
+  sha256: 4d2f2a3093bd905136bee8e9273148327d771e874d81e45f0a5c4cf71642149a
   requires_dist:
   - pytest ; extra == 'dev'
   - numpy>=2.2.6 ; extra == 'dev'

@@ -1,0 +1,15 @@
+{
+  "title": "rapidtrees: fast all-pairs phylogenetic tree distances",
+  "upload_type": "software",
+  "description": "rapidtrees is a high-performance Rust library, with Python bindings and a command-line interface, for all-pairs phylogenetic tree distances: Robinson-Foulds, weighted Robinson-Foulds and Kuhner-Felsenstein.",
+  "creators": [
+    {"name": "Klaps, Joon", "affiliation": "Rega Institute for Medical Research, KU Leuven", "orcid": "0000-0002-2507-0430"},
+    {"name": "Hong, Samuel L.", "affiliation": "Rega Institute for Medical Research, KU Leuven", "orcid": "0000-0001-6354-4943"},
+    {"name": "Brusselmans, Marius", "affiliation": "Rega Institute for Medical Research, KU Leuven", "orcid": "0009-0000-2134-1515"},
+    {"name": "Kafetzopoulou, Liana E.", "affiliation": "Rega Institute for Medical Research, KU Leuven", "orcid": "0000-0003-4531-1374"},
+    {"name": "Lemey, Philippe", "affiliation": "Rega Institute for Medical Research, KU Leuven", "orcid": "0000-0003-2826-5353"},
+    {"name": "Baele, Guy", "affiliation": "Rega Institute for Medical Research, KU Leuven", "orcid": "0000-0002-1915-7732"}
+  ],
+  "keywords": ["phylogenetics", "tree-distance", "robinson-foulds", "bioinformatics", "kuhner-felsenstein"],
+  "license": "MIT"
+}

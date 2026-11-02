@@ -8,7 +8,7 @@
 //! {load|build|rf|wrf|kf}_{T}trees_{N}taxa_q{P}[_annotated][_1thread]
 //! ```
 //!
-//! `load` times `io::load_beast_trees` on a NEXUS file written untimed
+//! `load` times `io::read_tree_file` on a NEXUS file written untimed
 //! beforehand, as the CLI loads it for RF: reading the file, parsing and
 //! interning. It is the only bench that sees what happens to the file's text,
 //! so it is the one the memory instrument needs for changes to the reader.
@@ -39,7 +39,7 @@
 //! `-m memory` for the memory instrument), or just `cargo bench --bench codspeed`
 //! for a quick wall-clock sanity check.
 
-use rapidtrees::io::load_beast_trees;
+use rapidtrees::io::{ReadOptions, read_tree_file};
 use rapidtrees::{Retain, Snapshots};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -147,7 +147,7 @@ mod load_real {
 /// What a bench times.
 #[derive(Clone, Copy)]
 enum Metric {
-    /// `io::load_beast_trees` on a NEXUS file: read, parse and intern.
+    /// `io::read_tree_file` on a NEXUS file: read, parse and intern.
     Load,
     /// `Snapshots::from_newicks`: parse and intern.
     Build,
@@ -255,7 +255,10 @@ fn malformed(name: &str) -> ! {
 /// Load a tree file as the CLI does for RF: TRANSLATE applied, no burn-in,
 /// unrooted, no branch lengths or bipartitions kept.
 fn load(path: &Path) -> Snapshots {
-    let (_, snaps) = load_beast_trees(path, 0, 0, true, false, Retain::for_distances(false));
+    let mut opts = ReadOptions::default();
+    opts.use_real_taxa = true;
+    opts.retain = Retain::for_distances(false);
+    let (_, snaps) = read_tree_file(path, &opts).expect("bench input loads");
     snaps
 }
 
