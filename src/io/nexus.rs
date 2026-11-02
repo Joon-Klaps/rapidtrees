@@ -1,31 +1,49 @@
 //! NEXUS primitives: tree headers, tree lines and the `TRANSLATE` block.
 //!
-//! `extract_name_state` and `parse_taxon_block` are treetracer-web's API: change
-//! their signatures only together with that repo.
+//! Readers outside this crate build on `extract_name_state`, `nexus_tree_lines`
+//! and `parse_taxon_block`, so treat their signatures as published surface.
 
 use std::collections::HashMap;
 
 /// Split a NEXUS tree header into `(tree_name, state_number)`.
+///
+/// The name is the first word after `tree`, past the `*` that marks a default
+/// tree (`TREE * STATE_0`). The state is the number after `STATE_`, and `0` for
+/// a header without one, such as MrBayes's `tree gen.100`, which keeps its name.
+///
+/// ```
+/// # use rapidtrees::io::extract_name_state;
+/// let beast = extract_name_state("tree STATE_100 [&lnP=-12.3]");
+/// assert_eq!(beast, ("STATE_100".to_string(), 100));
+/// let mrbayes = extract_name_state("tree gen.100");
+/// assert_eq!(mrbayes, ("gen.100".to_string(), 0));
+/// ```
+#[must_use]
 pub fn extract_name_state(header: &str) -> (String, usize) {
-    let upper = header.to_ascii_uppercase();
-    if let Some(state_pos) = upper.find("STATE_")
-        && let Some((_, rest)) = header.split_once(' ')
-    {
-        // NEXUS allows an optional `*` marking the default tree: `TREE * STATE_0 = ...`
-        let tree_name = rest
-            .split_whitespace()
-            .find(|&t| t != "*")
-            .unwrap_or("")
-            .to_string();
-        let digits = header[state_pos + 6..]
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect::<String>();
-        if let Ok(num) = digits.parse::<usize>() {
-            return (tree_name, num);
-        }
-    }
-    (String::new(), 0)
+    let (name, state) = name_state(header);
+    (name.to_string(), state)
+}
+
+/// [`extract_name_state`] with the name borrowed from `header`.
+pub(super) fn name_state(header: &str) -> (&str, usize) {
+    let name = header
+        .split_whitespace()
+        .skip(1)
+        .find(|&word| word != "*")
+        .unwrap_or("");
+    // Every byte of a match is ASCII, so the slice after it starts on a char.
+    let state: usize = header
+        .as_bytes()
+        .windows(6)
+        .position(|window| window.eq_ignore_ascii_case(b"STATE_"))
+        .and_then(|pos| {
+            header[pos + 6..]
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+        })
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or(0);
+    (name, state)
 }
 
 /// Case-insensitive ASCII prefix test that allocates no uppercased copy.
@@ -35,20 +53,36 @@ pub(super) fn starts_with_ci(s: &str, prefix: &str) -> bool {
         .is_some_and(|p| p.eq_ignore_ascii_case(prefix))
 }
 
+/// A NEXUS tree line, `tree <name> = <newick>`, as its trimmed header and
+/// body, or `None` for any other line. Splits on `" = "`, not `'='`: BEAST
+/// headers carry `[&lnP=…]`.
+#[inline]
+pub(super) fn split_tree_line(line: &str) -> Option<(&str, &str)> {
+    let (header, body) = line.split_once(" = ")?;
+    Some((header.trim(), body.trim()))
+}
+
 /// Every `tree ... = ...` line of a NEXUS trees block, as `(header, body)`.
 ///
-/// Lazy, so [`detect_format`](super::detect_format) can stop at the first hit instead of collecting
-/// the whole block just to ask whether one exists.
-pub(super) fn nexus_tree_lines(content: &str) -> impl Iterator<Item = (&str, &str)> {
+/// For a reader that wants the tree lines themselves, borrowed and unparsed,
+/// to pick its own trees from: [`extract_name_state`] reads a header, and
+/// [`read_trees`](super::read_trees) is the reader for everything else.
+/// Lazy, so [`detect_format`](super::detect_format) can stop at the first hit
+/// instead of collecting the whole block just to ask whether one exists.
+///
+/// ```
+/// # use rapidtrees::io::nexus_tree_lines;
+/// let nexus = "#NEXUS\nbegin trees;\n  tree STATE_0 = (A,B,C);\nend;\n";
+/// let lines: Vec<_> = nexus_tree_lines(nexus).collect();
+/// assert_eq!(lines, [("tree STATE_0", "(A,B,C);")]);
+/// ```
+pub fn nexus_tree_lines(content: &str) -> impl Iterator<Item = (&str, &str)> {
     content
         .lines()
         .map(str::trim)
         .skip_while(|line| !starts_with_ci(line, "tree "))
         .take_while(|line| !starts_with_ci(line, "end;"))
-        .filter_map(|line| {
-            let (header, body) = line.split_once(" = ")?;
-            Some((header.trim(), body.trim()))
-        })
+        .filter_map(split_tree_line)
 }
 
 /// Read a NEXUS `TRANSLATE` block into a numeric-ID → taxon-name map.
@@ -106,11 +140,20 @@ mod tests {
         assert_eq!(state, 0);
     }
 
+    /// A header without `STATE_` keeps its name: MrBayes and PAUP* write none.
     #[test]
-    fn test_extract_name_state_no_state_keyword_returns_empty() {
-        let (name, state) = extract_name_state("tree my_tree");
-        assert_eq!(name, "");
-        assert_eq!(state, 0);
+    fn test_extract_name_state_without_state_keeps_the_name() {
+        assert_eq!(extract_name_state("tree my_tree"), ("my_tree".into(), 0));
+        assert_eq!(extract_name_state("tree gen.100"), ("gen.100".into(), 0));
+        assert_eq!(
+            extract_name_state("TREE * UNTITLED"),
+            ("UNTITLED".into(), 0)
+        );
+    }
+
+    #[test]
+    fn test_extract_name_state_unparsable_state_keeps_the_name() {
+        assert_eq!(extract_name_state("tree STATE_x"), ("STATE_x".into(), 0));
     }
 
     // ── parse_taxon_block ─────────────────────────────────────────────────────

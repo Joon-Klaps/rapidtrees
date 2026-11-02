@@ -10,6 +10,8 @@ This project uses release names based on random words from [codenamegenerator.co
 
 ## [UNRELEASED] - MICROSOFT_CORPORATION SNAKE (YYYY-MM-DD)
 
+- ([#64](https://github.com/Joon-Klaps/rapidtrees/pull/64)) - __FEATURE__ __BREAKING API CHANGE__: `io::read_trees` and `io::read_tree_file` replace `load_beast_trees`, reading trees from any reader or path and returning a `ReadTreesError` instead of printing to stderr, NEXUS trees without a `STATE_` keep their name, and a comment before a Newick tree no longer drops it.
+
 ## [0.11.0] - Redmond Rattlesnake (2026-10-02)
 
 - ([#44](https://github.com/Joon-Klaps/rapidtrees/pull/44)) - __PERFORMANCE__: Tree files are streamed a chunk of trees at a time instead of being read whole and copied, so memory no longer grows with the size of the input file.

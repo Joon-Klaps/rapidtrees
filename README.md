@@ -216,6 +216,21 @@ For BEAST `.trees` files, translate maps, the snapshot API, and multi-file usage
 
 ---
 
+## 🦀 Rust API
+
+The CLI reads its input with `io::read_tree_file`, and `io::read_trees` does the same for anything that implements `BufRead`, such as bytes already in memory. Both tell NEXUS from Newick by the contents, apply burn-in, and return the tree names with a `Snapshots` ready for `pairwise_rf`, `pairwise_wrf` or `pairwise_kf`. An input that cannot be read, holds no trees, has fewer than two left after burn-in, or holds a tree that does not parse gives a `ReadTreesError`.
+
+```rust
+use rapidtrees::io::{ReadOptions, read_tree_file};
+
+let mut opts = ReadOptions::default();
+opts.burnin_trees = 100;
+let (names, snaps) = read_tree_file("posterior.trees", &opts)?;
+let rf = snaps.pairwise_rf(None); // row-major, names.len() × names.len()
+```
+
+---
+
 ## 📦 Presence Matrix
 
 Alongside a distance matrix, `rapidtrees` can hand back the **presence matrix**: which bipartition appears in which tree. That is everything the convergence diagnostics need (ESS, ASDSF, split frequencies), and it comes out of the same single parse as the distances.
