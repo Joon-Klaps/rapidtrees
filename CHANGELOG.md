@@ -10,6 +10,8 @@ This project uses release names based on random words from [codenamegenerator.co
 
 ## [UNRELEASED] - MICROSOFT_CORPORATION SNAKE (YYYY-MM-DD)
 
+## [0.12.0] - Vienna Viper (2026-11-02)
+
 - ([#64](https://github.com/Joon-Klaps/rapidtrees/pull/64)) - __FEATURE__ __BREAKING API CHANGE__: `io::read_trees` and `io::read_tree_file` replace `load_beast_trees`, reading trees from any reader or path and returning a `ReadTreesError` instead of printing to stderr, NEXUS trees without a `STATE_` keep their name, and a comment before a Newick tree no longer drops it.
 - ([#63](https://github.com/Joon-Klaps/rapidtrees/pull/63)) - __FEATURE__: An npm package gives browser and Node users the three pairwise metrics from BEAST NEXUS or Newick text.
 

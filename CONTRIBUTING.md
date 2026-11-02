@@ -242,4 +242,4 @@ All project metadata is in **`pyproject.toml`**:
 - Build system configuration (maturin)
 - Development tasks (under `[tool.pixi.tasks]`)
 
-**For releases:** Update `version` in `pyproject.toml` and `Cargo.toml`, then update `CHANGELOG.md` with the new version and release notes. This ensures consistency across all project files and simplifies the release process.
+**For releases:** Update `version` in `pyproject.toml`, `Cargo.toml` and `bindings/wasm/Cargo.toml`, then update `CHANGELOG.md` with the new version and release notes. This ensures consistency across all project files and simplifies the release process.
