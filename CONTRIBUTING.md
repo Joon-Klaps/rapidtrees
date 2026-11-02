@@ -216,11 +216,11 @@ Before submitting a PR:
 
 ## 🚀 Release Process
 
-1. Update version in `Cargo.toml` and `pyproject.toml`
+1. Update version in `Cargo.toml`, `pyproject.toml` and `bindings/wasm/Cargo.toml` (the npm package takes its version from the last)
 2. Update `CHANGELOG.md`
 3. Create a git tag: `git tag v0.4.1`
 4. Push tag: `git push origin v0.4.1`
-5. GitHub Actions publishes to PyPI and crates.io automatically
+5. GitHub Actions publishes to PyPI, crates.io and npm automatically
 
 ## ❓ Questions?
 
@@ -242,4 +242,4 @@ All project metadata is in **`pyproject.toml`**:
 - Build system configuration (maturin)
 - Development tasks (under `[tool.pixi.tasks]`)
 
-**For releases:** Update `version` in `pyproject.toml` and `Cargo.toml`, then update `CHANGELOG.md` with the new version and release notes. This ensures consistency across all project files and simplifies the release process.
+**For releases:** Update `version` in `pyproject.toml`, `Cargo.toml` and `bindings/wasm/Cargo.toml`, then update `CHANGELOG.md` with the new version and release notes. This ensures consistency across all project files and simplifies the release process.
