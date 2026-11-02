@@ -151,7 +151,8 @@ struct Open {
 /// two children of a bifurcating root, whose splits are each other's
 /// complement. The second case is every binary tree read unrooted and is merged
 /// directly. The first is rare and merges equal keys after the walk, sorting
-/// the parts first when unrooted.
+/// the parts first when unrooted. Either way, when one of the two is a pendant,
+/// the pendant is the part kept: `size == 1` is what marks one downstream.
 fn walk(
     newick: &str,
     index: usize,
@@ -273,7 +274,7 @@ fn walk(
             // every taxon, which is the root clade, and no rooted tree has one.
             parts.retain(|p| p.size as usize != shape.num_leaves);
         } else {
-            parts.sort_unstable_by_key(|p| p.key);
+            parts.sort_unstable_by_key(|p| (p.key, p.size));
         }
         parts.dedup_by(|later, kept| {
             later.key == kept.key && {
@@ -286,27 +287,32 @@ fn walk(
         && let [Some(a), Some(b)] = root_children
         && parts[a].key == parts[b].key
     {
-        parts[a].length += parts[b].length;
-        parts.remove(b);
+        let (kept, merged) = if parts[b].size == 1 { (b, a) } else { (a, b) };
+        parts[kept].length += parts[merged].length;
+        parts.remove(merged);
     }
     Ok((leaf_order, parts))
 }
 
-/// Append `node`'s part, unless it is the complement of a pendant edge, and
-/// return its index.
+/// Append `node`'s part and return its index, or `None` for an unrooted node
+/// that holds every taxon, whose edge splits nothing.
 fn emit(parts: &mut Vec<Part>, node: Closed, shape: Shape) -> Option<usize> {
-    // A split of `n - 1` leaves is the other side of a pendant edge, which is
-    // kept as the pendant itself. Rooted clades are all kept here; `walk`
-    // drops the root clade a unary root leaves behind.
-    if !shape.rooted && node.size != 1 && node.size as usize >= shape.num_leaves.saturating_sub(1) {
-        return None;
-    }
     // A pendant keeps its raw fingerprint: at two taxa `min(h, h ^ total)`
-    // would collapse the two pendants onto each other.
+    // would collapse the two pendants onto each other. Rooted clades are all
+    // kept here; `walk` drops the root clade a unary root leaves behind.
     let key = if shape.rooted || node.size == 1 {
         node.fp
     } else {
-        node.fp.min(node.fp ^ shape.total)
+        // Leaves on the far side of the edge.
+        match shape.num_leaves.saturating_sub(node.size as usize) {
+            0 => return None,
+            // The other side of a pendant edge takes the pendant's key, the
+            // missing leaf's own label, so `walk` adds this length to the
+            // pendant's: a root next to a leaf has two edges that unrooting
+            // joins into one.
+            1 => node.fp ^ shape.total,
+            _ => node.fp.min(node.fp ^ shape.total),
+        }
     };
     parts.push(Part {
         key,
