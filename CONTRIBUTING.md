@@ -216,11 +216,11 @@ Before submitting a PR:
 
 ## 🚀 Release Process
 
-1. Update version in `Cargo.toml` and `pyproject.toml`
+1. Update version in `Cargo.toml`, `pyproject.toml` and `bindings/wasm/Cargo.toml` (the npm package takes its version from the last)
 2. Update `CHANGELOG.md`
 3. Create a git tag: `git tag v0.4.1`
 4. Push tag: `git push origin v0.4.1`
-5. GitHub Actions publishes to PyPI and crates.io automatically
+5. GitHub Actions publishes to PyPI, crates.io and npm automatically
 
 ## ❓ Questions?
 

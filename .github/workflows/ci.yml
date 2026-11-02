@@ -145,3 +145,52 @@ jobs:
             # match those of CLI
             - name: Run the wasm32 build on BEAST files
               run: node tests/wasm/run.ts
+
+    npm-test:
+        name: npm package test
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  lfs: true
+
+            - name: Setup Rust
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  targets: wasm32-unknown-unknown
+
+            - name: Cache cargo and wasm-pack
+              uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cargo/registry
+                      ~/.cargo/git
+                      ~/.cache/.wasm-pack
+                      target
+                      bindings/wasm/target
+                  key: ${{ runner.os }}-npm-cargo-${{ hashFiles('**/Cargo.lock', 'bindings/wasm/Cargo.toml') }}
+
+            - name: Setup Node
+              uses: actions/setup-node@v4
+              with:
+                  node-version: 24
+
+            - name: Install wasm-pack
+              uses: taiki-e/install-action@v2
+              with:
+                  tool: wasm-pack@0.15.0
+
+            - name: Lint the binding crate
+              working-directory: bindings/wasm
+              run: |
+                  cargo fmt -- --check
+                  cargo clippy --target wasm32-unknown-unknown -- -D warnings
+
+            # Builds the package, installs the packed tarball into an empty
+            # project, and checks the matrices of the BEAST and Newick files in
+            # data/ against those of the CLI
+            - name: Build and test the npm package
+              run: |
+                  node bindings/wasm/build.mjs
+                  node bindings/wasm/tests/run.mjs
