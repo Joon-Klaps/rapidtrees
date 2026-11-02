@@ -1,7 +1,7 @@
 # The npm package for the browser and Node: wasm-bindgen glue over the `rapidtrees` library. This crate is a leaf that nothing links, which keeps `rapidtrees` itself free of wasm-bindgen (rule 1 in CLAUDE.md). Built with `node bindings/wasm/build.mjs`, never published to crates.io.
 [package]
 name = "rapidtrees-wasm"
-version = "0.12.0"
+version = "0.12.1"
 edition = "2024"
 description = "WebAssembly bindings for rapidtrees: pairwise Robinson-Foulds, weighted RF and Kuhner-Felsenstein tree distances in the browser and Node"
 license = "MIT"
