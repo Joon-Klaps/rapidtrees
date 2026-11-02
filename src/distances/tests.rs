@@ -72,6 +72,35 @@ fn kf_differs_from_wrf() {
     assert!(any_different, "KF and WRF should produce different values");
 }
 
+/// A root next to a leaf has two edges, which unrooting joins into the leaf's
+/// pendant. The first two trees differ only in the root edge opposite A, which
+/// phangorn 2.12.1 puts at KF 1 and weighted RF 1. The third moves length from
+/// that edge to A's own, which only a rooted comparison sees.
+#[test]
+fn root_edges_next_to_a_leaf_known_values() {
+    let trees = [
+        "(A:1,(B:1,(C:1,(D:1,E:1):1):1):2);",
+        "(A:1,(B:1,(C:1,(D:1,E:1):1):1):1);",
+        "(A:2,(B:1,(C:1,(D:1,E:1):1):1):1);",
+    ];
+    let sqrt2 = std::f64::consts::SQRT_2;
+    let unrooted = [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
+    let rooted_wrf = [0.0, 1.0, 2.0, 1.0, 0.0, 1.0, 2.0, 1.0, 0.0];
+    let rooted_kf = [0.0, 1.0, sqrt2, 1.0, 0.0, 1.0, sqrt2, 1.0, 0.0];
+    for (rooted, wrf, kf) in [(false, unrooted, unrooted), (true, rooted_wrf, rooted_kf)] {
+        let snaps = Snapshots::from_newicks(&trees, rooted).unwrap();
+        for (metric, mat, want) in [
+            ("WRF", snaps.pairwise_wrf(None), wrf),
+            ("KF", snaps.pairwise_kf(None), kf),
+        ] {
+            assert_eq!(mat.len(), want.len());
+            for (k, (&got, want)) in mat.iter().zip(want).enumerate() {
+                assert_close(got, want, &format!("{metric} [{k}] (rooted: {rooted})"));
+            }
+        }
+    }
+}
+
 /// Assert `d(i, k) ≤ d(i, j) + d(j, k)` for every triple, with a small
 /// epsilon for the float metrics.
 fn assert_triangle_inequality<T: Copy + Into<f64>>(mat: &[T], n: usize, metric: &str) {

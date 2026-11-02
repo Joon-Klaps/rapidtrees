@@ -914,9 +914,9 @@ fn reader_ignores_what_does_not_change_the_tree() {
         }
     }
 
-    // Unrooted, a bifurcating root's two edges are one edge, a unary node's
-    // edge joins the edge below it, and the other side of a pendant edge is
-    // no split at all.
+    // Unrooted, a bifurcating root's two edges are one edge, which next to a
+    // leaf is that leaf's pendant, and a unary node's edge joins the edge
+    // below it.
     for (text, plain) in [
         (
             "((A:1,B:2):0.5,(C:3,D:4):0.25);",
@@ -924,7 +924,7 @@ fn reader_ignores_what_does_not_change_the_tree() {
         ),
         ("(((A:1,B:1):1):2,C:1,D:1);", "((A:1,B:1):3,C:1,D:1);"),
         ("((A:1,B:1):1,((C:1,D:1):1):1);", "(A:1,B:1,(C:1,D:1):3);"),
-        ("(A:1,(B:1,(C:1,D:1):1):1);", "(A:1,B:1,(C:1,D:1):1);"),
+        ("(A:1,(B:1,(C:1,D:1):1):1);", "(A:2,B:1,(C:1,D:1):1);"),
     ] {
         assert_eq!(
             part_facts(&snapshot_of(text, false), false),
@@ -1188,9 +1188,10 @@ fn decorated_tree(n: usize, rng: &mut Lcg) -> (String, Edges) {
 /// rather than from its text. Taxon `i` is bit `i`.
 ///
 /// Rooted, every edge is a clade except one that cuts off every taxon, which
-/// only a unary root has. Unrooted, the other side of a pendant edge is dropped
-/// too, and a split keeps the side without leaf 0. Either way, edges that cut
-/// the same split merge into one with their lengths summed.
+/// only a unary root has. Unrooted, that edge is dropped too, the other side of
+/// a pendant edge is the pendant, and a split keeps the side without leaf 0.
+/// Either way, edges that cut the same split merge into one with their lengths
+/// summed.
 fn expected_facts(edges: &Edges, n: usize, rooted: bool) -> Vec<Fact> {
     let labels = taxon_labels(n);
     let total = labels.iter().fold(0, |acc, &label| acc ^ label);
@@ -1205,8 +1206,11 @@ fn expected_facts(edges: &Edges, n: usize, rooted: bool) -> Vec<Fact> {
                 continue;
             }
             (fp, leaves.clone())
-        } else if !pendant && leaves.len() >= n - 1 {
+        } else if !pendant && leaves.len() == n {
             continue;
+        } else if !pendant && leaves.len() == n - 1 {
+            let missing = (0..n as u32).filter(|bit| leaves.binary_search(bit).is_err());
+            (fp ^ total, missing.collect())
         } else if pendant || !leaves.contains(&0) {
             (
                 if pendant { fp } else { fp.min(fp ^ total) },
@@ -1266,6 +1270,42 @@ fn reader_reads_trees_as_built() {
             }
         }
     }
+}
+
+/// Unrooting a root next to a leaf joins the leaf's edge and the root's other
+/// edge into the leaf's pendant, with the two lengths added: whichever side of
+/// the root the leaf is on, through a unary node and under a unary root. Rooted,
+/// the two edges stay apart.
+#[test]
+fn root_next_to_a_leaf_joins_its_two_edges() {
+    let tree = "(A:1,(B:1,(C:1,(D:1,E:1):1):1):2);";
+    let facts = part_facts(&snapshot_of(tree, false), false);
+    // Five pendants, CDE|AB and DE|ABC: BCDE|A is A's pendant.
+    assert_eq!(facts.len(), 7, "{facts:?}");
+    let pendant_a = facts.iter().find(|fact| fact.1 == [0]).unwrap();
+    assert_eq!(pendant_a.2, 3.0);
+    for same in [
+        "((B:1,(C:1,(D:1,E:1):1):1):2,A:1);",
+        "(A:2,(B:1,(C:1,(D:1,E:1):1):1):1);",
+        "(A:3,B:1,(C:1,(D:1,E:1):1):1);",
+        "(A:1,((B:1,(C:1,(D:1,E:1):1):1):1.5):0.5);",
+        "((A:1,(B:1,(C:1,(D:1,E:1):1):1):2):7);",
+    ] {
+        assert_eq!(
+            part_facts(&snapshot_of(same, false), false),
+            facts,
+            "{same}"
+        );
+    }
+    // At three taxa the other root edge is all the tree's inner structure.
+    assert_eq!(
+        part_facts(&snapshot_of("(A:1,(B:1,C:1):2);", false), false),
+        part_facts(&snapshot_of("(A:3,B:1,C:1);", false), false),
+    );
+
+    let rooted = part_facts(&snapshot_of(tree, true), true);
+    let length_of = |leaves: &[u32]| rooted.iter().find(|fact| fact.1 == leaves).unwrap().2;
+    assert_eq!((length_of(&[0]), length_of(&[1, 2, 3, 4])), (1.0, 2.0));
 }
 
 /// NEXUS trees name leaves by number and map them through TRANSLATE. The

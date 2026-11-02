@@ -32,6 +32,10 @@ jobs:
         needs: validate-release-tag
         if: always() && (needs.validate-release-tag.result == 'success' || needs.validate-release-tag.result == 'skipped')
         runs-on: ubuntu-latest
+        # Trusted publishing: npm trades the job's OIDC token for a short-lived publish token and adds provenance, so no npm token is stored. The trusted publisher on npmjs.com names this file.
+        permissions:
+            contents: read
+            id-token: write
         steps:
             # LFS: the test reads the BEAST files in tests/data
             - uses: actions/checkout@v4
@@ -40,6 +44,7 @@ jobs:
             - uses: dtolnay/rust-toolchain@stable
               with:
                   targets: wasm32-unknown-unknown
+            # Trusted publishing needs npm 11.5.1 or later, which current Node 24 releases ship
             - uses: actions/setup-node@v4
               with:
                   node-version: 24
@@ -54,5 +59,3 @@ jobs:
               run: node bindings/wasm/tests/run.mjs
             - name: Publish to npm
               run: npm publish bindings/wasm/pkg --access public
-              env:
-                  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
