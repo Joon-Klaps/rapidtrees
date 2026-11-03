@@ -68,8 +68,8 @@ impl Snapshot {
     /// subtree owns a contiguous run of `leaf_order` and everything *else* is
     /// simply the rest of the array.
     ///
-    /// A pendant edge is kept as-is, leaf 0 or not — its complement was filtered
-    /// out, so no other occurrence can disagree about which side is canonical.
+    /// A pendant edge is kept as-is, leaf 0 or not — its complement was merged
+    /// into it, so no other occurrence can disagree about which side is canonical.
     pub(super) fn push_canonical(&self, part: &Part, rooted_mode: bool, table: &mut CladeTable) {
         let (lo, hi) = (
             part.first as usize,

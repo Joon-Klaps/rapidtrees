@@ -870,13 +870,28 @@ class TestPairwiseRFFromNewicksReference:
 class TestRPhangornCrossValidation:
     """Cross-check rapidtrees distance outputs against R phangorn.
 
-    Two suites:
+    Suites:
     - Synthetic 10-taxon trees (REFERENCE_NEWICKS): verifies the base algorithm.
     - Real BEAST HIV trees (hiv{1,2,3,4}.newick): verifies annotation stripping,
       large taxon counts, and real branch-length handling.
+    - Rooted trees whose root has a leaf child (ROOT_NEXT_TO_A_LEAF): unrooting
+      joins the two root edges into that leaf's pendant edge.
 
     All three metrics (RF, wRF, KF) are validated for each tree set.
     """
+
+    # The first two differ only in the root edge opposite A, which phangorn
+    # 2.12.1 puts at KF 1 and wRF 1. The next three are the first written with
+    # A second, with A's two edges split differently, and unrooted.
+    ROOT_NEXT_TO_A_LEAF = [
+        "(A:1,(B:1,(C:1,(D:1,E:1):1):1):2);",
+        "(A:1,(B:1,(C:1,(D:1,E:1):1):1):1);",
+        "((B:1,(C:1,(D:1,E:1):1):1):2,A:1);",
+        "(A:2,(B:1,(C:1,(D:1,E:1):1):1):1);",
+        "(A:3,B:1,(C:1,(D:1,E:1):1):1);",
+        "((A:0.5,B:1.5):0.25,(C:1,(D:2,E:1):0.5):1);",
+        "(E:0.7,(A:1,(B:1.2,(C:0.4,D:0.9):0.3):0.6):1.1);",
+    ]
 
     @pytest.mark.parametrize(
         "newick_file", ["hiv1.newick", "hiv2.newick", "hiv3.newick", "hiv4.newick"]
@@ -887,6 +902,15 @@ class TestRPhangornCrossValidation:
         path = str(TEST_DATA / newick_file)
         rt_vals = _rapidtrees_upper_triangle(path, metric)
         ph_vals = _phangorn_run(path, metric)
+        _assert_distances_match(rt_vals, ph_vals, metric)
+
+    @pytest.mark.parametrize("metric", ["RF", "wRF", "KF"])
+    def test_root_next_to_a_leaf_matches_phangorn(self, tmp_path, metric):
+        """A root edge opposite a leaf counts towards that leaf's pendant edge."""
+        path = tmp_path / "root_next_to_a_leaf.newick"
+        path.write_text("\n".join(self.ROOT_NEXT_TO_A_LEAF) + "\n")
+        rt_vals = _rapidtrees_upper_triangle(str(path), metric)
+        ph_vals = _phangorn_run(str(path), metric)
         _assert_distances_match(rt_vals, ph_vals, metric)
 
 

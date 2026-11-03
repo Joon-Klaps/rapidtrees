@@ -100,7 +100,7 @@ Two splits in Tree 1 only, two in Tree 2 only → **RF = 4**. ✅
 Two kinds of split get special treatment:
 
 - **Pendant edges** (`{A}`, `{B}`, …) — the branch leading to a single leaf. Every tree over the same taxa has all of them, so they never contribute to RF, and plain RF does not store them. They are kept for the *weighted* metrics, which need their branch lengths.
-- **Trivial splits** — a split whose one side is everything-but-one-leaf is just a pendant edge seen from the other direction, so it is dropped to avoid double-counting.
+- **Trivial splits** — a split whose one side is everything-but-one-leaf is just a pendant edge seen from the other direction. It turns up where a rooted tree's root sits next to a leaf, and unrooting joins it to that leaf's pendant: its branch length is added to the pendant's, and it is not counted as a split of its own.
 
 So the entire job reduces to: **turn each tree into its set of splits, then compare sets.** Everything that follows is about making both halves cheap.
 
@@ -235,7 +235,7 @@ key = min(fp, fp ^ total)
 
 Because `fingerprint(A′) = total ⊕ fingerprint(A)`, the two sides of a split give the two values `fp` and `fp ^ total` — in some order. Taking the `min` of the pair picks the same one no matter which side you started from. Both sides now produce an identical `key`, and **no leaf set was ever touched**.
 
-Pendant edges are the one exception: they keep their raw fingerprint. Their complement is filtered out anyway, so nothing can collide with them — and at exactly two taxa, `min(h, h ^ total)` would collapse the two pendants onto each other.
+Pendant edges are the one exception: they keep their raw fingerprint. Their complement takes the same key, `fp ^ total`, which is the missing leaf's own label, and is merged into them, so nothing else can collide with them — and at exactly two taxa, `min(h, h ^ total)` would collapse the two pendants onto each other.
 
 ---
 
@@ -253,8 +253,8 @@ struct Snapshot {
 
 Two things happen as each part is emitted:
 
-1. **Drop the trivial splits.** `size == 1` is a pendant (kept). `size >= n − 1` is a pendant's complement (dropped). Both decided by integer comparison on `size`.
-2. **Merge duplicates.** In a rooted binary tree both children of the root canonicalize to the *same* split; without merging, RF would come out inflated by 2 versus phangorn's `RF.dist(rooted=FALSE)`. When two parts merge, their branch lengths are summed. Those two children are the only way two parts of an ordinary tree can share a key, so the reader merges them directly. A unary node (one child) repeats its child's split too; that is rare, and the reader falls back to sorting the tree's parts by key and merging equal ones. In rooted mode the root's two children are different clades and stay apart. There a unary node's part is emitted straight after its child's, so merging neighbours is enough, and a unary root's only child is dropped, since it holds every taxon and a rooted tree has no root clade.
+1. **Sort out the trivial splits.** `size == 1` is a pendant (kept). `size == n − 1` is a pendant's complement, which takes the pendant's key for step 2 to merge. `size == n` splits nothing (dropped). All decided by integer comparison on `size`.
+2. **Merge duplicates.** In a rooted binary tree both children of the root canonicalize to the *same* split; without merging, RF would come out inflated by 2 versus phangorn's `RF.dist(rooted=FALSE)`. When two parts merge, their branch lengths are summed, and when one of them is a leaf the merged part is that leaf's pendant. Those two children are the only way two parts of an ordinary tree can share a key, so the reader merges them directly. A unary node (one child) repeats its child's split too; that is rare, and the reader falls back to sorting the tree's parts by key and merging equal ones. In rooted mode the root's two children are different clades and stay apart. There a unary node's part is emitted straight after its child's, so merging neighbours is enough, and a unary root's only child is dropped, since it holds every taxon and a rooted tree has no root clade.
 
 `Snapshot` is deliberately **short-lived**: built per tree, handed straight to the interner, dropped. Trees are processed in chunks sized to a memory budget, and never to fewer trees than there are threads, so peak memory stays near the *deduplicated* footprint instead of holding every tree's raw data at once.
 
