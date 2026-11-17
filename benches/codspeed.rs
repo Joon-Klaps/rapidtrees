@@ -74,8 +74,8 @@ benches! {
     // Loading a file: a posterior-sized set with and without BEAST annotations,
     // and a wide one, where the file's text dwarfs what is kept of it.
     load: [
-        load_1000trees_500taxa_q40,
-        load_1000trees_500taxa_q40_annotated,
+        load_3000trees_500taxa_q40,
+        load_3000trees_500taxa_q40_annotated,
         load_20trees_50000taxa_q40,
         load_20trees_50000taxa_q40_1thread,
     ],
@@ -84,8 +84,8 @@ benches! {
     build: [
         build_100trees_500taxa_q40,
         build_100trees_500taxa_q100,
+        build_3000trees_500taxa_q40,
         build_50trees_4000taxa_q40,
-        build_50trees_4000taxa_q40_1thread,
         build_20trees_50000taxa_q40,
     ],
 
