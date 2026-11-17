@@ -35,6 +35,12 @@
 //! random topologies: the adversarial case, where almost every split is unique
 //! to one tree.
 //!
+//! CI measures with the simulation and memory instruments only. Simulation
+//! counts instructions summed over every thread, so it cannot tell a pass that
+//! runs in parallel from one that runs on one thread: a change that moves work
+//! between the two needs a wall-clock check on a quiet machine, with
+//! `cargo bench --bench codspeed` on the branch and on its base.
+//!
 //! Build/run locally with `cargo codspeed build && cargo codspeed run` (add
 //! `-m memory` for the memory instrument), or just `cargo bench --bench codspeed`
 //! for a quick wall-clock sanity check.
@@ -74,23 +80,27 @@ benches! {
     // Loading a file: a posterior-sized set with and without BEAST annotations,
     // and a wide one, where the file's text dwarfs what is kept of it.
     load: [
-        load_1000trees_500taxa_q40,
-        load_1000trees_500taxa_q40_annotated,
+        load_3000trees_500taxa_q40,
+        load_3000trees_500taxa_q40_annotated,
         load_20trees_50000taxa_q40,
         load_20trees_50000taxa_q40_1thread,
     ],
 
-    // Construction: a small cell, and wide ones where the per-tree build dominates.
+    // Construction: small cells, a posterior-sized one, and wide ones where the
+    // per-tree build dominates.
     build: [
         build_100trees_500taxa_q40,
         build_100trees_500taxa_q100,
+        build_3000trees_500taxa_q40,
         build_50trees_4000taxa_q40,
-        build_50trees_4000taxa_q40_1thread,
         build_20trees_50000taxa_q40,
     ],
 
     // RF: small guards, the pair sweep on a posterior, independent and
-    // near-identical trees, and a wide cell.
+    // near-identical trees, and wide cells. RF builds posting lists only from 256
+    // trees, so the 20- and 50-tree wide cells never reach them. The cell of
+    // 300 trees over 10 000 taxa does, with over ten times as many posted splits
+    // per tree as the 500-taxon cells.
     rf: [
         rf_100trees_500taxa_q40,
         rf_100trees_500taxa_q100,
@@ -102,20 +112,22 @@ benches! {
         rf_50trees_4000taxa_q40,
         rf_3000trees_500taxa_q40,
         rf_20trees_50000taxa_q40,
+        rf_300trees_10000taxa_q40,
     ],
 
-    // Weighted RF and KF: small guards and the pair sweep on a posterior and on
-    // independent trees.
+    // Weighted RF and KF: small guards, the pair sweep on a posterior and on
+    // independent trees, and wide cells. With 20 trees a posted split has at
+    // most four holders, so the 300-tree wide cell is the one with long posting
+    // lists. The two metrics run one kernel and differ only in the per-split
+    // term, so each cell after the smallest measures one of them.
     weighted: [
         wrf_100trees_500taxa_q40,
+        kf_100trees_500taxa_q40,
         wrf_100trees_500taxa_q100,
         wrf_1500trees_500taxa_q40,
-        wrf_300trees_500taxa_q100,
-        kf_100trees_500taxa_q40,
-        kf_100trees_500taxa_q100,
-        kf_1500trees_500taxa_q40,
         kf_300trees_500taxa_q100,
         wrf_20trees_50000taxa_q40,
+        kf_300trees_10000taxa_q40,
     ],
 }
 
