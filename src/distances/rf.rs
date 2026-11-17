@@ -120,7 +120,6 @@ pub(super) fn distance_rf_split(
                     None => {}
                 }
             }
-            posted.sort_unstable_by_key(|&(col, _)| col);
             (posted, (snap.n_splits() - n_universal) as u32)
         },
     );

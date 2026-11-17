@@ -212,7 +212,7 @@ pub(super) struct Laid<T, S> {
 /// Lay the trees out over `layout` a block at a time, `width` values to a row.
 ///
 /// `tree(layout, snap, row)` writes `snap`'s dense columns into its zeroed
-/// `row` and returns its posted splits in column order, with their branch
+/// `row` and returns its posted splits in any order, with their branch
 /// lengths when `with_lengths`, and its `self` term. A block's trees are laid
 /// out in parallel and then added to the posting lists in tree order, which
 /// keeps every list ascending without a sort or atomics.

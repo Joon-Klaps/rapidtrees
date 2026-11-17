@@ -10,6 +10,8 @@ This project uses release names based on random words from [codenamegenerator.co
 
 ## [UNRELEASED] - MICROSOFT_CORPORATION SNAKE (YYYY-MM-DD)
 
+- ([#67](https://github.com/Joon-Klaps/rapidtrees/pull/67)) - __PERFORMANCE__: Each tree's posted splits are put in column order by a pass over the posting lists instead of a sort per tree, so laying the trees out takes linear time for all three metrics.
+
 ## [0.12.1] - Anaheim Adder (2026-11-02)
 
 - ([#65](https://github.com/Joon-Klaps/rapidtrees/pull/65)) - __BUGFIX__: Unrooted weighted RF and KF no longer drop the length of the root edge opposite a leaf, so they match phangorn on rooted trees whose root has a leaf child, and npm releases are published through trusted publishing, with provenance.
