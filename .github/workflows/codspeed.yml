@@ -13,7 +13,7 @@ on:
 
 env:
     CARGO_TERM_COLOR: always
-    # Pin rayon's pool to the 4 vCPUs of a public-repo `ubuntu-latest` runner, so a change of runner cannot shift results between base and head. The `_1thread` benches build their own one-thread pool.
+    # Pin rayon's pool to the 4 vCPUs of a public-repo Ubuntu runner, so a change of runner cannot shift results between base and head. The `_1thread` benches build their own one-thread pool.
     RAYON_NUM_THREADS: 4
 
 jobs:
@@ -22,7 +22,8 @@ jobs:
         #   - simulation: deterministic instruction counts (CPU-speed gate)
         #   - memory:     heap allocations per bench (memory gate)
         name: Benchmarks (${{ matrix.mode }}, ${{ matrix.shard }})
-        runs-on: ubuntu-latest
+        # Pinned, not ubuntu-latest: CodSpeed's simulation instrument rejects ubuntu-26.04 as an unsupported system, and a pinned image keeps base and head on one OS.
+        runs-on: ubuntu-24.04
         permissions:
             contents: read
             id-token: write
