@@ -7,6 +7,7 @@
 <p align="center">
   <a href="https://crates.io/crates/rapidtrees"><img src="https://img.shields.io/crates/v/rapidtrees.svg?style=flat-square&logo=rust&logoColor=white" alt="Crates.io" /></a>
   <a href="https://pypi.org/project/rapidtrees"><img src="https://img.shields.io/pypi/v/rapidtrees.svg?style=flat-square&logo=python&logoColor=white" alt="PyPI" /></a>
+  <a href="https://www.npmjs.com/package/rapidtrees"><img src="https://img.shields.io/npm/v/rapidtrees.svg?style=flat-square&logo=npm&logoColor=white" alt="npm" /></a>
   <a href="https://github.com/Joon-Klaps/rapidtrees/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Joon-Klaps/rapidtrees/ci.yml?style=flat-square&logo=github&label=CI" alt="CI" /></a>
   <a href="https://codecov.io/gh/Joon-Klaps/rapidtrees"><img src="https://img.shields.io/codecov/c/github/Joon-Klaps/rapidtrees?style=flat-square&logo=codecov" alt="Coverage" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square" alt="License: MIT" /></a>
@@ -16,11 +17,9 @@
 <p align="center">
   <a href="#%EF%B8%8F-overview">Overview</a> •
   <a href="#-installing">Installing</a> •
-  <a href="#-usage">Usage</a> •
-  <a href="#-python-api">Python API</a> •
-  <a href="#-browser-and-node">Browser and Node</a> •
-  <a href="#-presence-matrix">Presence Matrix</a> •
-  <a href="#%EF%B8%8F-benchmarks">Benchmarks</a>
+  <a href="#-command-line">Command line</a> •
+  <a href="#-from-code">From code</a> •
+  <a href="#-documentation">Documentation</a>
 </p>
 
 ---
@@ -39,9 +38,11 @@
 
 - 🦀 **Rust core** — splits as 128-bit fingerprints, compared as `u32` IDs in a cache-friendly layout
 - 🔀 **Parallel by default** — powered by [`rayon`](https://github.com/rayon-rs/rayon), automatically scales across all cores
-- 🐍 **Python bindings** — drop into any Python/NumPy workflow via [`PyO3`](https://pyo3.rs/)
+- 🐍 **Python, CLI and WebAssembly** — one kernel behind a NumPy-friendly Python API, a command-line tool and an npm package
 - 📦 **No Rust toolchain required** — pre-built wheels on PyPI for Linux, macOS, and Windows
 - 🗜️ **Gzip output** — stream directly to `.tsv.gz` without a separate compression step
+
+Two distinct splits are merged only if their 128-bit fingerprints collide, with probability about `e²/2¹²⁹` for `e` distinct splits in the run: `1.5 × 10⁻²³` at a hundred million splits. Every run prints its own `e` and bound.
 
 ### 🚀 Performance
 
@@ -49,80 +50,31 @@ Measured on an Apple M1 Max laptop (10 cores, 64 GB RAM) with rapidtrees 0.11.0 
 
 | Dataset | Taxa · trees | Pairs   | Robinson-Foulds | Weighted RF     | Kuhner-Felsenstein | Peak memory |
 | ------- | ------------ | ------- | --------------- | --------------- | ------------------ | ----------- |
-| YFV     | 65 · 5 001   | 12.5 M  | 0.12 s (0.56 s) | 0.41 s (2.38 s) | 0.37 s (2.21 s)    | 393 MiB     |
-| WNV     | 104 · 1 001  | 0.50 M  | 0.02 s (0.07 s) | 0.04 s (0.15 s) | 0.04 s (0.14 s)    | 85 MiB      |
-| batRABV | 372 · 1 001  | 0.50 M  | 0.05 s (0.15 s) | 0.07 s (0.27 s) | 0.06 s (0.27 s)    | 157 MiB     |
-| EBOV    | 836 · 1 167  | 0.68 M  | 0.07 s (0.30 s) | 0.11 s (0.70 s) | 0.10 s (0.54 s)    | 159 MiB     |
+| YFV     | 65 · 5 001   | 12.5M  | 0.12s (0.56s) | 0.41s (2.38s) | 0.37s (2.21s)    | 393 MiB     |
+| WNV     | 104 · 1 001  | 0.50M  | 0.02s (0.07s) | 0.04s (0.15s) | 0.04s (0.14s)    | 85 MiB      |
+| batRABV | 372 · 1 001  | 0.50M  | 0.05s (0.15s) | 0.07s (0.27s) | 0.06s (0.27s)    | 157 MiB     |
+| EBOV    | 836 · 1 167  | 0.68M  | 0.07s (0.30s) | 0.11s (0.70s) | 0.10s (0.54s)    | 159 MiB     |
 
-On YFV that is about **100 M Robinson-Foulds comparisons per second**. Command: `RAYON_NUM_THREADS=<n> rapidtrees --input <file>.trees --metric <rf|weighted|kf> --output /dev/null --use-real-taxa --quiet`, no burn-in, unrooted.
+Command: `rapidtrees --input <file>.trees --metric <rf|weighted|kf> --output /dev/null --use-real-taxa --quiet`, no burn-in, unrooted. Synthetic scaling results are in [benches/README.md](https://github.com/Joon-Klaps/rapidtrees/blob/master/benches/README.md).
 
 ---
 
 ## 🔧 Installing
 
-### 🐍 Python (PyPI) — _recommended_
-
-Pre-built wheels for Linux, macOS, and Windows. No Rust toolchain needed.
-
 ```bash
-pip install rapidtrees
+pip install rapidtrees     # Python, pre-built wheels, no Rust toolchain needed
+cargo install rapidtrees   # command-line tool, needs the Rust toolchain
+npm install rapidtrees     # WebAssembly build for browsers and Node
 ```
 
-### 🦀 CLI (crates.io)
-
-Install the standalone command-line binary. Requires the [Rust toolchain](https://rustup.rs/).
-
-```bash
-cargo install rapidtrees
-```
-
-
-### 🌐 Browser and Node (npm)
-
-The library compiled to WebAssembly, single-threaded, for browsers and Node. See [Browser and Node](#-browser-and-node) below.
-
-```bash
-npm install rapidtrees
-```
-
-### 🛠️ From source
-
-#### Prerequisites
-- [Rust toolchain](https://rustup.rs/) — for building the Rust core
-- [pixi](https://pixi.sh/) — for managing Python and R dependencies
-
-#### Setup
-
-```bash
-git clone https://github.com/Joon-Klaps/rapidtrees.git
-cd rapidtrees
-# Set up environment — installs Python, R (with phangorn), and builds the package
-pixi install
-```
-
-#### Development tasks
-
-```bash
-# Run Python API tests (includes R/phangorn cross-validation)
-pixi run test-python
-
-# Run Rust unit tests
-pixi run test-rust
-```
+To build from source and run the tests, see [CONTRIBUTING.md](https://github.com/Joon-Klaps/rapidtrees/blob/master/CONTRIBUTING.md).
 
 ---
 
-## 💻 Usage
+## 💻 Command line
 
 ```bash
-rapidtrees \
-  --input <path/to/file.trees> \
-  --output <path/to/output.tsv[.gz]> \
-  [--burnin-trees <N>] \
-  [--burnin-states <STATE>] \
-  [--use-real-taxa] \
-  [--metric rf|weighted|kf] \
-  [-q|--quiet]
+rapidtrees -i tests/data/hiv1.trees -o out/hiv1_rf.tsv.gz --metric rf
 ```
 
 | Flag                          | Description                                                        |
@@ -130,79 +82,24 @@ rapidtrees \
 | `-i, --input <INPUT>`         | Path to a NEXUS `.trees` or plain Newick file (auto-detected)      |
 | `-o, --output <OUTPUT>`       | Output path. Use `.gz` suffix for gzip compression; `-` for stdout |
 | `-t, --burnin-trees <N>`      | Drop the first N trees (default: `0`)                              |
-| `-s, --burnin-states <STATE>` | Keep only trees with `STATE > STATE` (default: `0`)                |
+| `-s, --burnin-states <STATE>` | Drop trees sampled at MCMC state `STATE` or before (default: `0`)  |
 | `--use-real-taxa`             | Map numeric taxon IDs via the TRANSLATE block                      |
 | `--metric <rf\|weighted\|kf>` | Distance metric (default: `rf`)                                    |
 | `-q, --quiet`                 | Suppress progress messages (errors still go to stderr)             |
 
-**Input formats.** `--input` takes either a NEXUS/BEAST trees file or a plain Newick file with one tree per line; the format is sniffed from the contents, not the extension. Newick files name nothing, carry no `TRANSLATE` block and no `STATE_` labels, so their trees are named after the line they start on, and `--burnin-states` / `--use-real-taxa` have nothing to act on (`--burnin-trees` still works).
+`--input` takes either a NEXUS/BEAST trees file or a plain Newick file with one tree per line; the format is sniffed from the contents, not the extension. Newick files carry no `TRANSLATE` block and no `STATE_` labels, so `--burnin-states` and `--use-real-taxa` have nothing to act on there (`--burnin-trees` still works).
 
-The output is a **square TSV matrix** where both the header row and first column contain tree names: `<file_basename>_<tree_name>` for NEXUS (e.g. `hiv1_STATE_10000`) and `<file_basename>_line<n>` for Newick (e.g. `hiv1_line3`). Use `-o -` to write to stdout for easy piping.
-
-### 💡 Examples
-
-<details open>
-<summary><strong>Compute RF matrix → gzipped file</strong></summary>
-
-```bash
-rapidtrees \
-  -i tests/data/hiv1.trees \
-  -o out/hiv1_rf.tsv.gz \
-  --metric rf
-
-# Reading in beast 0.003s
-# Read in 162 taxons for 21 trees
-# Creating tree bit snapshots 0.002s
-# Determining distances using RF for 210 combinations
-# Determining distances using RF 0.000s
-# Writing to output 0.000s
-```
-
-</details>
-
-<details>
-<summary><strong>Apply burn-in by tree count</strong></summary>
-
-```bash
-rapidtrees \
-  -i tests/data/hiv1.trees \
-  -o out/hiv1_rf.tsv \
-  -t 2
-
-# Reading in beast 0.003s
-# Read in 162 taxons for 19 trees
-# Creating tree bit snapshots 0.001s
-# Determining distances using RF for 171 combinations
-# Determining distances using RF 0.000s
-# Writing to output 0.000s
-```
-
-</details>
+The output is a **square TSV matrix** whose header row and first column hold the tree names: `<file_basename>_<tree_name>` for NEXUS (e.g. `hiv1_STATE_10000`) and `<file_basename>_line<n>` for Newick (e.g. `hiv1_line3`). Progress messages go to stdout, so pass `-q` when writing the matrix to stdout with `-o -`.
 
 ---
 
+## 🧩 From code
 
-### 🎛️ Tuning the kernels
-
-Every metric keeps a dense column only for splits held by a large enough share of the trees, and gives the rarer ones posting lists. The defaults were tuned on simulated posteriors. `RAPIDTREES_RF_DENSE_SHARE` (default `0.03`) and `RAPIDTREES_WEIGHTED_DENSE_SHARE` (default `0.25`) override them, for re-tuning on other data or hardware. They change the speed only, never a distance.
-
-
-## 🐍 Python API
-
-`rapidtrees` exposes six functions and the `ProgressCounter` class from its Rust core. All six functions accept a Python **iterator** of newick strings, keeping memory constant regardless of tree count, and share the signature `(names, newick_iter, translate_maps, map_indices, rooted=False, progress=None)`.
-
-| Function | Returns |
-| --- | --- |
-| `pairwise_rf_from_newick_iter` | `(names, bytes)` — RF matrix as flat `uint32` bytes, row-major |
-| `pairwise_rf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, dict, bytes)` — RF matrix + presence matrix as sparse rows + clade bitmasks |
-| `pairwise_wrf_from_newick_iter` | `(names, list[float])` — Weighted RF, flat row-major |
-| `pairwise_wrf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, dict, bytes)` — wRF matrix + branch-length matrix as sparse rows + clade bitmasks |
-| `pairwise_kf_from_newick_iter` | `(names, list[float])` — Kuhner-Felsenstein, flat row-major |
-| `pairwise_kf_with_snapshots_from_newick_iter` | `(names, bytes, leaf_names, n_bip, dict, bytes)` — KF matrix + branch-length matrix as sparse rows + clade bitmasks |
+**Python.** Every function takes an iterator of Newick strings, so memory stays flat however many trees you feed it:
 
 ```python
-import rapidtrees as rtd
 import numpy as np
+import rapidtrees as rtd
 
 trees = [
     "((A:0.1,B:0.1):0.1,(C:0.1,D:0.1):0.1);",
@@ -212,22 +109,14 @@ trees = [
 names = ["t1", "t2", "t3"]
 
 # Newick strings already use real taxon names, so pass one empty translate map for every tree
-tree_names, rf_bytes = rtd.pairwise_rf_from_newick_iter(
-    names, iter(trees), [{}], [0] * len(trees)
-)
+tree_names, rf_bytes = rtd.pairwise_rf_from_newick_iter(names, iter(trees), [{}], [0] * len(trees))
 rf = np.frombuffer(rf_bytes, dtype=np.uint32).reshape(len(tree_names), -1)
 # [[0 2 0]
 #  [2 0 2]
 #  [0 2 0]]
 ```
 
-For BEAST `.trees` files, translate maps, the snapshot API, and multi-file usage see **[docs/python-api.md](docs/python-api.md)**.
-
----
-
-## 🦀 Rust API
-
-The CLI reads its input with `io::read_tree_file`, and `io::read_trees` does the same for anything that implements `BufRead`, such as bytes already in memory. Both tell NEXUS from Newick by the contents, apply burn-in, and return the tree names with a `Snapshots` ready for `pairwise_rf`, `pairwise_wrf` or `pairwise_kf`. An input that cannot be read, holds no trees, has fewer than two left after burn-in, or holds a tree that does not parse gives a `ReadTreesError`.
+**Rust.** `io::read_tree_file` reads a NEXUS or Newick file, applies burn-in and returns the tree names with a `Snapshots` ready for the pairwise kernels:
 
 ```rust
 use rapidtrees::io::{ReadOptions, read_tree_file};
@@ -235,149 +124,23 @@ use rapidtrees::io::{ReadOptions, read_tree_file};
 let mut opts = ReadOptions::default();
 opts.burnin_trees = 100;
 let (names, snaps) = read_tree_file("posterior.trees", &opts)?;
-let rf = snaps.pairwise_rf(None); // row-major, names.len() × names.len()
+let rf = snaps.into_pairwise_rf(None); // row-major, names.len() × names.len()
 ```
+
+**JavaScript.** `pairwise_rf`, `pairwise_wrf` and `pairwise_kf` take the text of a tree file and return the names and the matrix. The build is single-threaded and does not stream.
 
 ---
 
-## 🌐 Browser and Node
+## 📚 Documentation
 
-`npm install rapidtrees` gives `pairwise_rf`, `pairwise_wrf` and `pairwise_kf`, each taking the text of a BEAST/NEXUS or plain Newick file, plus an optional burn-in in trees, and returning the tree names and the row-major matrix (`Uint32Array` for RF, `Float64Array` for the others). The package is built from [`bindings/wasm`](bindings/wasm) and the `rapidtrees` crate itself never depends on `wasm-bindgen`. The whole file is read into memory first, so the browser build does not stream.
-
-In a browser, call `init()` once to load the `.wasm` file:
-
-```js
-import init, { pairwise_rf } from "rapidtrees";
-
-await init();
-const rf = pairwise_rf(await fileInput.files[0].text(), 100);
-console.log(rf.n_trees, rf.names, rf.matrix);
-```
-
-In Node there is no `init()`:
-
-```js
-import { readFileSync } from "node:fs";
-import { pairwise_kf } from "rapidtrees";
-
-const kf = pairwise_kf(readFileSync("posterior.trees", "utf8"), 1000);
-```
-
-Build and test it locally with `pixi run test-npm` (needs wasm-pack, Node 18 or later and `rustup target add wasm32-unknown-unknown`). The full reference is in [bindings/wasm/README.md](bindings/wasm/README.md).
-
----
-
-## 📦 Presence Matrix
-
-Alongside a distance matrix, `rapidtrees` can hand back the **presence matrix**: which bipartition appears in which tree. That is everything the convergence diagnostics need (ESS, ASDSF, split frequencies), and it comes out of the same single parse as the distances.
-
-> **Splits are identified by a 128-bit fingerprint,** not by comparing leaf sets — that is what keeps building a tree linear in its taxon count rather than quadratic. Two distinct splits are merged if their fingerprints collide, with probability about `e²/2¹²⁹` for `e` distinct splits in the run: `1.5 × 10⁻²³` at a hundred million splits, some nineteen orders of magnitude below the rate at which the machine's own RAM flips a bit unnoticed. Every run prints its own `e` and bound.
-
-Bipartition column order is **deterministic**: columns are sorted in ascending `Bitset` order (lexicographic over `u64` words, i.e. by leaf-index bit pattern), so the same tree set always produces the same column indices regardless of parse order.
-
-### What the presence matrix gives you
-
-The presence matrix is sufficient for all major convergence diagnostics:
-
-| Diagnostic              | What you need                    |
-| ----------------------- | -------------------------------- |
-| **Pseudo ESS**          | `presence.mean(axis=0)` per chain |
-| **ASDSF**               | Per-chain split frequencies       |
-| **Fréchet ESS**         | RF distances via XOR of rows      |
-| **WRF / KF distances**  | Branch lengths — use `pairwise_wrf_with_snapshots_from_newick_iter` or `pairwise_kf_with_snapshots_from_newick_iter` |
-
-Note: `sum(presence[i] XOR presence[j]) == RF(tree_i, tree_j)` exactly.
-
-### Presence matrix from Python
-
-Use `pairwise_rf_with_snapshots_from_newick_iter` to get the presence matrix
-alongside the RF distances, from one parse — see the
-[Python API section](#-python-api) above.
-
-```python
-import math
-
-import numpy as np
-import pandas as pd
-import rapidtrees as rtd
-
-# `trees` and `names` are the ones from the Python API example above
-tree_names, rf_bytes, leaf_names, n_bip, sparse, bip_clade_bytes = (
-    rtd.pairwise_rf_with_snapshots_from_newick_iter(
-        names, iter(trees), [{}], [0] * len(trees)
-    )
-)
-n = len(tree_names)
-
-# The presence matrix comes as compressed sparse rows; expand it when you need the dense form
-offsets = np.frombuffer(sparse["row_offsets"], dtype=np.uint64)
-columns = np.frombuffer(sparse["column_indices"], dtype=np.uint32)
-presence = np.zeros((n, n_bip), dtype=np.uint8)
-for i in range(n):
-    presence[i, columns[offsets[i]:offsets[i + 1]]] = 1
-
-# Global split frequencies (for Pseudo ESS / ASDSF)
-global_freq = presence.mean(axis=0)
-
-# RF distance between any two trees — no recomputation needed
-rf_01 = int((presence[0].astype(int) ^ presence[1].astype(int)).sum())
-
-# Named presence matrix — decode clade bitmasks for column labels
-bytes_per_bip = math.ceil(len(leaf_names) / 8)
-bip_arr  = np.frombuffer(bip_clade_bytes, dtype=np.uint8).reshape(n_bip, bytes_per_bip)
-bip_bool = np.unpackbits(bip_arr, axis=1, bitorder="little")[:, :len(leaf_names)]
-col_labels = ["|".join(leaf_names[i] for i in np.where(bip_bool[j])[0]) for j in range(n_bip)]
-df = pd.DataFrame(presence, index=tree_names, columns=col_labels)
-```
-
----
-
-
-
-## ⏱️ Benchmarks
-
-Benchmarks were run on a MacBook Pro M1. Trees are parsed **once** and their interned split IDs are reused across all pairwise comparisons. Parallelism is provided by [`rayon`](https://github.com/rayon-rs/rayon) — no manual thread management needed.
-
-<details>
-<summary><strong>Show full benchmark table</strong></summary>
-
-> Output of `cargo bench --bench memory_time_benchmark`
-
-| Taxa (N) | Trees (T) | Combinations | Actual Memory | Wall Time | CPU Time |
-|----------|-----------|--------------|---------------|-----------|----------|
-| 10       | 100       | 5.0K         | ████░░░░░░ 22.19 KB | ░░░░░░░░░░ 96.31 µs | 393.50 µs |
-| 10       | 1000      | 500.0K       | █████░░░░░ 215.55 KB | ░░░░░░░░░░ 911.52 µs | 4.63 ms  |
-| 10       | 10000     | 50.0M        | ██████░░░░ 2.10 MB | ░░░░░░░░░░ 41.71 ms | 132.37 ms |
-| 100      | 100       | 5.0K         | █████░░░░░ 206.12 KB | ░░░░░░░░░░ 167.12 µs | 834.50 µs |
-| 100      | 1000      | 500.0K       | ██████░░░░ 1.94 MB | ░░░░░░░░░░ 1.27 ms | 5.02 ms  |
-| 100      | 10000     | 50.0M        | ███████░░░ 19.27 MB | ░░░░░░░░░░ 42.22 ms | 131.66 ms |
-| 500      | 100       | 5.0K         | ██████░░░░ 1.00 MB | ░░░░░░░░░░ 151.79 µs | 818.00 µs |
-| 500      | 1000      | 500.0K       | ███████░░░ 9.60 MB | ░░░░░░░░░░ 1.08 ms | 6.33 ms  |
-| 500      | 10000     | 50.0M        | ████████░░ 95.61 MB | ░░░░░░░░░░ 43.19 ms | 151.38 ms |
-| 1000     | 100       | 5.0K         | ██████░░░░ 2.01 MB | ░░░░░░░░░░ 118.50 µs | 683.00 µs |
-| 1000     | 1000      | 500.0K       | ███████░░░ 19.20 MB | ░░░░░░░░░░ 1.44 ms | 8.53 ms  |
-| 1000     | 10000     | 50.0M        | ████████░░ 191.03 MB | ░░░░░░░░░░ 51.35 ms | 137.48 ms |
-| 2000     | 100       | 5.0K         | ██████░░░░ 4.04 MB | ░░░░░░░░░░ 216.77 µs | 1.09 ms  |
-| 2000     | 1000      | 500.0K       | ███████░░░ 38.39 MB | ░░░░░░░░░░ 1.45 ms | 9.02 ms  |
-| 2000     | 10000     | 50.0M        | ████████░░ 381.89 MB | ░░░░░░░░░░ 36.07 ms | 127.28 ms |
-| 5000     | 100       | 5.0K         | ███████░░░ 10.24 MB | ░░░░░░░░░░ 195.81 µs | 981.50 µs |
-| 5000     | 1000      | 500.0K       | ████████░░ 96.09 MB | ░░░░░░░░░░ 1.58 ms | 9.22 ms  |
-| 5000     | 10000     | 50.0M        | █████████░ 954.57 MB | ░░░░░░░░░░ 39.01 ms | 152.59 ms |
-| 10000    | 100       | 5.0K         | ███████░░░ 20.56 MB | ░░░░░░░░░░ 267.69 µs | 1.65 ms  |
-| 10000    | 1000      | 500.0K       | ████████░░ 192.24 MB | ░░░░░░░░░░ 2.10 ms | 13.65 ms |
-| 10000    | 10000     | 50.0M        | █████████░ 1.86 GB | ░░░░░░░░░░ 48.65 ms | 224.52 ms |
-| 20000    | 100       | 5.0K         | ███████░░░ 41.28 MB | ░░░░░░░░░░ 1.37 ms | 3.38 ms  |
-| 20000    | 1000      | 500.0K       | ████████░░ 384.62 MB | ░░░░░░░░░░ 3.40 ms | 21.16 ms |
-| 20000    | 10000     | 50.0M        | █████████░ 3.73 GB | ░░░░░░░░░░ 113.57 ms | 352.03 ms |
-</details>
-
----
-
-## 🔍 Troubleshooting
-
-- **No trees parsed?** Verify the input is a valid NEXUS `.trees` or Newick file and adjust `--burnin-*` settings.
-- **Piping to other tools?** Use `-q` to suppress timing messages on stdout.
-- **Gzipped output not working?** Ensure the output filename ends with `.gz`.
+| Document | Covers |
+| --- | --- |
+| [Python API](https://github.com/Joon-Klaps/rapidtrees/blob/master/docs/python-api.md) | All six functions, BEAST files and translate maps, progress reporting, the presence and branch-length matrices for convergence diagnostics |
+| [Rust API (docs.rs)](https://docs.rs/rapidtrees) | `io::read_trees`, `io::read_tree_file`, `Snapshots` and the distance kernels |
+| [JavaScript API](https://github.com/Joon-Klaps/rapidtrees/blob/master/docs/javascript-api.md) | The npm package: all functions and return types, browser and Node usage, memory limits, building it locally |
+| [rapidtrees for Dummies](https://github.com/Joon-Klaps/rapidtrees/blob/master/docs/rapidtrees-for-dummies.md) | How it works, from Newick string to distance matrix, and the kernel tuning knobs |
+| [Benchmarks](https://github.com/Joon-Klaps/rapidtrees/blob/master/benches/README.md) | Synthetic memory and time scaling |
+| [Contributing](https://github.com/Joon-Klaps/rapidtrees/blob/master/CONTRIBUTING.md) | Building from source, tests, releases |
 
 ---
 

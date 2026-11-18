@@ -374,6 +374,10 @@ Two details keep the answer exact. The dense sweep runs eight independent runnin
 
 The dense sweep is tiled. A pair reads two rows of `n_dense` lengths, and a row of a wide tree is too long to stay in cache, so sweeping the pairs one at a time reads every row from memory once per pair and leaves the cores waiting on memory bandwidth. A task instead fills eight rows of the matrix, holding four of the other rows against them at a time and streaming 512 columns per pass, so each row's stretch of columns is read once per tile. Each pair still keeps its own eight running sums and adds its terms in the order above, so the tiles change the speed and not one bit of the answer.
 
+### Tuning the boundary
+
+RF draws the same line between dense columns and posting lists, at a lower share, since a dense RF column costs a bit rather than an `f64`. The defaults were tuned on simulated posteriors. `RAPIDTREES_RF_DENSE_SHARE` (default `0.03`) and `RAPIDTREES_WEIGHTED_DENSE_SHARE` (default `0.25`) override them, for re-tuning on other data or hardware, in the CLI and the Python package alike. They change the speed only, never a distance.
+
 ---
 
 ## Step 10 — Naming the split: the clade table

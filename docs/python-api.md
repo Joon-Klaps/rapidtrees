@@ -1,6 +1,6 @@
 # Python API reference
 
-`rapidtrees` exposes seven functions from its Rust core via PyO3. All accept a
+`rapidtrees` exposes six functions and the `ProgressCounter` class from its Rust core via PyO3. All six accept a
 Python **iterator** of newick strings, which lets the library stream through
 arbitrarily large tree files without materialising all strings in memory at
 once.
@@ -153,7 +153,7 @@ kf = np.array(kf_flat, dtype=np.float64).reshape(n, n)
 
 ### BEAST `.trees` files
 
-The Rust API does not expose file reading — parse your `.trees` file in Python
+The Python API does not read files — parse your `.trees` file in Python
 and feed the newick strings to the iterator API.  The translate maps carry the
 BEAST `TRANSLATE` block so that numeric taxon IDs are resolved to real names.
 Plain Newick files need no parsing at all: read the lines, pass them straight to
@@ -256,6 +256,15 @@ matrix **and** the bipartition presence matrix in a single parse, returning a
 The presence matrix entry `presence[i, j]` is `1` if edge `j` appears in tree
 `i`, otherwise `0`. Column order is deterministic and stable across calls on
 the same tree set, so the same trees always give the same column indices.
+
+The presence matrix is all the major convergence diagnostics need, and it comes out of the same single parse as the distances:
+
+| Diagnostic | What you need |
+| --- | --- |
+| **Pseudo ESS** | `presence.mean(axis=0)` per chain |
+| **ASDSF** | Per-chain split frequencies |
+| **Fréchet ESS** | RF distances via XOR of rows: `sum(presence[i] XOR presence[j]) == RF(tree_i, tree_j)` exactly |
+| **WRF / KF distances** | Branch lengths — use the [wRF](#wrf--branch-length-matrix-in-one-pass) or [KF](#kf--branch-length-matrix-in-one-pass) variant |
 
 #### Sparse presence format
 
