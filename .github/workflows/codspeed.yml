@@ -41,6 +41,9 @@ jobs:
 
             - name: Setup Rust + cargo-codspeed
               uses: moonrepo/setup-rust@v1
+              # cargo-binstall looks up the cargo-codspeed and cargo-cache releases through the GitHub API; unauthenticated, the shared runner IPs hit the rate limit and binstall waits 120 s per 403.
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
               with:
                   channel: stable
                   cache-target: release
