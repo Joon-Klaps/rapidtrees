@@ -10,8 +10,10 @@ This project uses release names based on random words from [codenamegenerator.co
 
 ## [UNRELEASED] - MICROSOFT_CORPORATION SNAKE (YYYY-MM-DD)
 
-- ([#71](https://github.com/Joon-Klaps/rapidtrees/pull/71)) - __BUGFIX__: Collections that keep branch lengths or bipartitions (weighted RF, KF and the snapshot exports) now stop with the existing "Too many distinct splits for 32-bit split IDs" error when the pendant edges and the internal splits together outnumber a 32-bit ID, instead of silently giving two different splits the same ID.
 - ([#58](https://github.com/Joon-Klaps/rapidtrees/pull/58)) - __FEATURE__ __BREAKING API CHANGE__: `pairwise_rf_with_snapshots_from_newick_iter`, `pairwise_wrf_with_snapshots_from_newick_iter` and `pairwise_kf_with_snapshots_from_newick_iter` return the tree-by-clade presence or branch-length matrix as compressed sparse rows instead of a dense matrix, and the RF one adds the branch lengths when called with `lengths=True`.
+- ([#67](https://github.com/Joon-Klaps/rapidtrees/pull/67)) - __PERFORMANCE__: Each tree's posted splits are put in column order by a pass over the posting lists instead of a sort per tree, so laying the trees out takes linear time for all three metrics.
+- ([#71](https://github.com/Joon-Klaps/rapidtrees/pull/71)) - __BUGFIX__: Collections that keep branch lengths or bipartitions (weighted RF, KF and the snapshot exports) now stop with the existing "Too many distinct splits for 32-bit split IDs" error when the pendant edges and the internal splits together outnumber a 32-bit ID, instead of silently giving two different splits the same ID.
+
 
 ## [0.12.1] - Anaheim Adder (2026-11-02)
 

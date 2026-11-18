@@ -13,7 +13,8 @@ use super::matrix::exclusive_prefix_sum;
 /// collection has.
 ///
 /// Each tree's own posted splits are recorded once, in column order, so a row
-/// walks only those rather than scanning all of its tree's splits.
+/// walks only those rather than scanning all of its tree's splits. The order
+/// is set by [`PostingsBuilder::finish`], not by how a tree lists its splits.
 pub(super) struct Postings {
     pub(super) offsets: Vec<usize>,
     pub(super) trees: Vec<u32>,
@@ -120,35 +121,57 @@ impl Postings {
 }
 
 impl PostingsBuilder {
-    /// Add the next block of trees, each tree's posted splits in column order.
-    /// Blocks come in order, so every list stays ascending.
+    /// Add the next block of trees, each tree's posted splits in any order.
+    /// Blocks come in order, so every list stays ascending. A tree's own
+    /// posted splits are only counted here; [`Self::finish`] fills them in.
     pub(super) fn push_block(&mut self, posted: &[Vec<(u32, f64)>]) {
-        let total = posted.iter().map(Vec::len).sum();
-        let mut own = OwnPosted {
-            starts: Vec::with_capacity(posted.len() + 1),
-            cols: Vec::with_capacity(total),
-            lengths: Vec::with_capacity(if self.with_lengths { total } else { 0 }),
-        };
-        own.starts.push(0);
+        let mut starts = Vec::with_capacity(posted.len() + 1);
+        starts.push(0);
         for (tree, splits) in (self.added..).zip(posted) {
             for &(col, length) in splits {
                 let at = &mut self.fill[col as usize];
                 self.postings.trees[*at] = tree as u32;
-                own.cols.push(col);
                 if self.with_lengths {
                     self.postings.lengths[*at] = length;
-                    own.lengths.push(length);
                 }
                 *at += 1;
             }
-            own.starts.push(own.cols.len());
+            starts.push(starts[starts.len() - 1] + splits.len());
         }
+        let total = starts[posted.len()];
         self.added += posted.len();
-        self.postings.own.push(own);
+        self.postings.own.push(OwnPosted {
+            starts,
+            cols: vec![0; total],
+            lengths: vec![0.0; if self.with_lengths { total } else { 0 }],
+        });
     }
 
-    /// The filled lists.
+    /// The filled lists, with each tree's own posted splits in column order.
+    ///
+    /// Every list holds its trees in ascending order, so walking the lists in
+    /// column order and handing each entry to its tree is a transpose: each
+    /// tree receives its columns in ascending order, in time linear in the
+    /// entries and without a sort.
     pub(super) fn finish(self) -> Postings {
-        self.postings
+        let mut postings = self.postings;
+        let shift = postings.own.shift;
+        // Where each tree's next own posted split goes in its block.
+        let mut next: Vec<usize> = (postings.own.blocks.iter())
+            .flat_map(|own| own.starts[..own.starts.len() - 1].iter().copied())
+            .collect();
+        for (col, span) in postings.offsets.windows(2).enumerate() {
+            for at in span[0]..span[1] {
+                let tree = postings.trees[at] as usize;
+                let own = &mut postings.own.blocks[tree >> shift];
+                let slot = &mut next[tree];
+                own.cols[*slot] = col as u32;
+                if self.with_lengths {
+                    own.lengths[*slot] = postings.lengths[at];
+                }
+                *slot += 1;
+            }
+        }
+        postings
     }
 }
