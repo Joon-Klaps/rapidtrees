@@ -381,9 +381,27 @@ fn weighted_at(snaps: &Snapshots, min_dense: u32) -> (Vec<f64>, Vec<f64>) {
     )
 }
 
+/// `kernel` on the global pool and on a one-thread pool, which must agree to
+/// the bit. One thread lays the trees out four to a block, so a small
+/// collection's posting lists are filled across several blocks whatever the
+/// machine's core count.
+fn on_both_pools<T: PartialEq + Debug + Send>(ctx: &str, kernel: impl Fn() -> T + Sync) -> T {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    let all = kernel();
+    assert_eq!(
+        all,
+        pool.install(&kernel),
+        "global pool vs one thread, {ctx}"
+    );
+    all
+}
+
 /// The boundary decides which path a split takes and must decide nothing
 /// else: all dense (2), mixed, and all posting lists (`n + 1`) all have to
-/// match the oracle.
+/// match the oracle, on every pool.
 #[test]
 fn weighted_boundary_does_not_change_distances() {
     for &(n_taxa, n_trees, duplicates, seed) in &[
@@ -394,8 +412,8 @@ fn weighted_boundary_does_not_change_distances() {
         let (newicks, snaps) = random_snapshots(n_taxa, n_trees, duplicates, seed);
         let n = snaps.snapshots.len();
         for min_dense in [2, 3, n as u32 / 2, n as u32, n as u32 + 1] {
-            let (wrf, kf) = weighted_at(&snaps, min_dense);
             let ctx = format!("seed={seed} min_dense={min_dense}");
+            let (wrf, kf) = on_both_pools(&ctx, || weighted_at(&snaps, min_dense));
             assert_weighted_match_reference(&snaps, &newicks, (&wrf, &kf), &ctx);
         }
     }
@@ -520,8 +538,10 @@ fn rf_boundary_does_not_change_distances() {
         let n = snaps.snapshots.len();
         for min_dense in [2, 3, n as u32 / 2, n as u32, n as u32 + 1] {
             let ctx = format!("seed={seed} min_dense={min_dense}");
-            let rf = borrowed_and_owned(&snaps, &ctx, |input| {
-                distance_rf_split(input, None, min_dense)
+            let rf = on_both_pools(&ctx, || {
+                borrowed_and_owned(&snaps, &ctx, |input| {
+                    distance_rf_split(input, None, min_dense)
+                })
             });
             assert_rf_matches_reference(&snaps, &rf, &ctx);
         }
