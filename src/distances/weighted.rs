@@ -3,6 +3,7 @@
 use super::boundary::{min_dense, weighted_dense_share};
 use super::layout::{Column, Input, Laid, Layout, lay_out};
 use super::matrix::fill_symmetric;
+use crate::par::*;
 use std::sync::atomic::AtomicUsize;
 
 /// Running sums per weighted sweep: see [`sweep`].
@@ -79,7 +80,11 @@ pub(super) fn weighted_lay_out(
         count >= 2
     });
     let stride = layout.n_dense;
-    lay_out(
+    let Laid {
+        rows,
+        postings,
+        selfs,
+    } = lay_out(
         input,
         layout,
         stride,
@@ -94,14 +99,23 @@ pub(super) fn weighted_lay_out(
                     None => unique_self += overlap(length, length),
                 }
             }
-            posted.sort_unstable_by_key(|&(col, _)| col);
-            let dense_self = sweep(row, row, overlap);
-            let posted_self = posted
-                .iter()
-                .fold(0.0, |sum, &(_, length)| sum + overlap(length, length));
-            (posted, (dense_self + posted_self) + unique_self)
+            (posted, (sweep(row, row, overlap), unique_self))
         },
-    )
+    );
+    // The posted part waits for the lists, which hand each tree its posted
+    // splits in column order.
+    let selfs = (selfs.par_iter().enumerate())
+        .map(|(i, &(dense_self, unique_self))| {
+            let posted_self = (postings.of_tree(i).1.iter())
+                .fold(0.0, |sum, &length| sum + overlap(length, length));
+            (dense_self + posted_self) + unique_self
+        })
+        .collect();
+    Laid {
+        rows,
+        postings,
+        selfs,
+    }
 }
 
 /// `finish(selfᵢ + selfⱼ − 2·Σ overlap)` — the shape WRF and KF share.
