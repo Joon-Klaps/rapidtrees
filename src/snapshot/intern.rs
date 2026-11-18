@@ -57,9 +57,28 @@ const SHARD_BITS: u32 = 8;
 const SHARDS: usize = 1 << SHARD_BITS;
 
 /// Local IDs a shard can hand out: while a chunk is interned, an ID is
-/// `local << SHARD_BITS | shard`, which has to fit a `u32`. All shards together
-/// hold as many splits as a `u32` split ID can name.
+/// `local << SHARD_BITS | shard`, which has to fit a `u32`. The shards fill
+/// unevenly, and the pendants take IDs too, so the limit on the whole
+/// collection is [`dense_offsets`]'s, not this one times [`SHARDS`].
 const LOCAL_IDS: u32 = 1 << (u32::BITS - SHARD_BITS);
+
+const TOO_MANY_SPLITS: &str = "Too many distinct splits for 32-bit split IDs.";
+
+/// The first dense ID of every shard: the `base` pendants take `0..base`, then
+/// each shard's local IDs follow in shard order.
+///
+/// `None` when the collection holds more splits than a `u32` can name. The sum
+/// runs in `u64` so that it cannot wrap, which in a release build it would do
+/// silently, handing two different splits the same ID.
+fn dense_offsets(base: usize, lens: impl IntoIterator<Item = usize>) -> Option<[u32; SHARDS]> {
+    let mut offsets = [0u32; SHARDS];
+    let mut total = base as u64;
+    for (offset, len) in offsets.iter_mut().zip(lens) {
+        *offset = u32::try_from(total).ok()?;
+        total += len as u64;
+    }
+    (total <= u64::from(u32::MAX)).then_some(offsets)
+}
 
 /// The shard of `key`. A canonical key is the smaller of `h` and `h ^ total`,
 /// which biases its high bits but leaves the low ones uniform.
@@ -128,7 +147,7 @@ impl Shard {
         let id = u32::try_from(fps.len())
             .ok()
             .filter(|&id| id < LOCAL_IDS)
-            .ok_or_else(|| "Too many distinct splits for 32-bit split IDs.".to_string())?;
+            .ok_or_else(|| TOO_MANY_SPLITS.to_string())?;
         // Grow by half rather than double: the shards fill evenly, so doubling
         // would leave every one of them oversized by the same large margin.
         // The floor stays small because it is paid [`SHARDS`] times over: a
@@ -251,7 +270,9 @@ impl Interner {
     /// (RF-only paths never read them).
     ///
     /// # Errors
-    /// Returns `Err` when the splits no longer fit 32-bit split IDs.
+    /// Returns `Err` when the splits no longer fit 32-bit split IDs: when one
+    /// shard runs out of local IDs, or when the pendants and every shard's
+    /// splits together outnumber a `u32`.
     pub(super) fn push_chunk(&mut self, raw: Vec<Snapshot>) -> Result<(), String> {
         let (retain, base, keep_pendants) = (self.retain, self.base(), self.keep_pendants);
         let run = Run {
@@ -281,6 +302,11 @@ impl Interner {
                 Ok((ids, starts))
             })
             .collect::<Result<_, String>>()?;
+        // A shard stays within its local IDs, but the pendants and the shards
+        // together can still outnumber a `u32`: stop here rather than at the
+        // end of the run.
+        dense_offsets(base, self.shards.iter().map(|shard| shard.fps.len()))
+            .ok_or_else(|| TOO_MANY_SPLITS.to_string())?;
 
         let interned: Vec<InternSnap> = raw
             .par_iter()
@@ -320,14 +346,20 @@ impl Interner {
 
     /// Number every shard's local IDs densely, shard by shard after the
     /// pendants, and assemble the collection.
-    pub(super) fn finish(self, leaf_names: Vec<String>) -> Snapshots {
+    ///
+    /// # Errors
+    /// Returns `Err` when the splits outnumber a `u32`, which
+    /// [`Interner::push_chunk`] already rules out.
+    pub(super) fn finish(self, leaf_names: Vec<String>) -> Result<Snapshots, String> {
         let base = self.base();
-        let mut offsets = [0u32; SHARDS];
-        let mut total = base as u32;
-        for (offset, shard) in offsets.iter_mut().zip(&self.shards) {
-            *offset = total;
-            total += shard.fps.len() as u32;
-        }
+        let offsets = dense_offsets(base, self.shards.iter().map(|shard| shard.fps.len()))
+            .ok_or_else(|| TOO_MANY_SPLITS.to_string())?;
+        let total = base
+            + self
+                .shards
+                .iter()
+                .map(|shard| shard.fps.len())
+                .sum::<usize>();
 
         let mut snapshots = self.snapshots;
         snapshots.par_iter_mut().for_each(|snap| {
@@ -337,7 +369,7 @@ impl Interner {
         });
 
         // Every tree holds every pendant once, and pendant `k` names leaf `k`.
-        let mut counts = Vec::with_capacity(total as usize);
+        let mut counts = Vec::with_capacity(total);
         counts.resize(base, snapshots.len() as u32);
         let mut clades = Vec::with_capacity(SHARDS + 1);
         if self.retain.bipartitions {
@@ -348,12 +380,60 @@ impl Interner {
             clades.push(shard.clades);
         }
 
-        Snapshots {
+        Ok(Snapshots {
             snapshots,
             clades: CladeTable::concat(clades),
             split_counts: counts,
             words_per_bitset: self.words,
             leaf_names,
-        }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every shard filled to `fill`, the way a large run leaves them.
+    fn even(fill: usize) -> impl Iterator<Item = usize> {
+        std::iter::repeat_n(fill, SHARDS)
+    }
+
+    #[test]
+    fn offsets_follow_the_pendants_shard_by_shard() {
+        let lens = [2, 0, 3]
+            .into_iter()
+            .chain(std::iter::repeat_n(1, SHARDS - 3));
+        let offsets = dense_offsets(5, lens).unwrap();
+        assert_eq!(offsets[..5], [5, 7, 7, 10, 11]);
+        assert_eq!(offsets[SHARDS - 1], 10 + (SHARDS as u32 - 4));
+    }
+
+    #[test]
+    fn rf_runs_may_use_every_id_but_one() {
+        // No pendants: the shards alone may fill the u32 range.
+        let full = LOCAL_IDS as usize;
+        let lens = std::iter::repeat_n(full, SHARDS - 1).chain([full - 1]);
+        let offsets = dense_offsets(0, lens).unwrap();
+        assert_eq!(offsets[SHARDS - 1], (SHARDS as u32 - 1) * LOCAL_IDS);
+        let lens = std::iter::repeat_n(full, SHARDS);
+        assert!(dense_offsets(0, lens).is_none());
+    }
+
+    #[test]
+    fn pendants_count_against_the_id_space() {
+        // Each shard 12 000 short of its own limit, so no shard refuses a split,
+        // but 4 million pendants need 928 000 more IDs than a u32 has. The old
+        // u32 arithmetic wrapped here and numbered the last shard's final
+        // 928 000 splits 0 to 927 999, the IDs of the first pendants.
+        let fill = LOCAL_IDS as usize - 12_000;
+        assert!(dense_offsets(4_000_000, even(fill)).is_none());
+        // Three million pendants still fit, and the last shard starts where the
+        // others end.
+        let offsets = dense_offsets(3_000_000, even(fill)).unwrap();
+        assert_eq!(
+            u64::from(offsets[SHARDS - 1]),
+            3_000_000 + (SHARDS as u64 - 1) * fill as u64
+        );
     }
 }
