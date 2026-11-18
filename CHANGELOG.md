@@ -10,6 +10,8 @@ This project uses release names based on random words from [codenamegenerator.co
 
 ## [UNRELEASED] - MICROSOFT_CORPORATION SNAKE (YYYY-MM-DD)
 
+- ([#58](https://github.com/Joon-Klaps/rapidtrees/pull/58)) - __FEATURE__ __BREAKING API CHANGE__: `pairwise_rf_with_snapshots_from_newick_iter`, `pairwise_wrf_with_snapshots_from_newick_iter` and `pairwise_kf_with_snapshots_from_newick_iter` return the tree-by-clade presence or branch-length matrix as compressed sparse rows instead of a dense matrix, and the RF one adds the branch lengths when called with `lengths=True`.
+
 ## [0.12.1] - Anaheim Adder (2026-11-02)
 
 - ([#65](https://github.com/Joon-Klaps/rapidtrees/pull/65)) - __BUGFIX__: Unrooted weighted RF and KF no longer drop the length of the root edge opposite a leaf, so they match phangorn on rooted trees whose root has a leaf child, and npm releases are published through trusted publishing, with provenance.

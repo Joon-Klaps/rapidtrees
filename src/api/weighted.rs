@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicUsize;
 
 use super::input::{IterInput, collect_snapshots_from_iter, validate_iter_args};
 use super::progress::{ProgressCounter, with_counter};
-use super::{PyRfSnapshotResult, n_pairs};
+use super::{PyRfSnapshotResult, csr_dict, n_pairs};
 use crate::snapshot::{Retain, Snapshots};
 
 /// A pairwise weighted metric, as a plain function pointer so WRF and KF can
@@ -45,7 +45,7 @@ fn weighted_pairwise(
 
 /// Shared body of the WRF and KF snapshot-exporting entry points.
 ///
-/// The branch-length matrix is metric-agnostic, so the two differ only in which
+/// The sparse branch-length matrix is metric-agnostic, so the two differ only in which
 /// distance fills the first buffer.
 fn weighted_pairwise_with_snapshots(
     py: Python<'_>,
@@ -62,7 +62,7 @@ fn weighted_pairwise_with_snapshots(
 
     let n_bip = snaps.n_distinct_splits();
     let leaf_names = snaps.leaf_names.clone();
-    let (bl_bytes, col_to_bip_id) = snaps.build_branch_length_matrix();
+    let (sparse, col_to_bip_id) = csr_dict(py, &snaps, true)?;
     let bip_bytes = snaps.build_bipartition_bytes(&col_to_bip_id);
 
     Ok((
@@ -70,7 +70,7 @@ fn weighted_pairwise_with_snapshots(
         PyBytes::new(py, &matrix_bytes).into(),
         leaf_names,
         n_bip,
-        PyBytes::new(py, &bl_bytes).into(),
+        sparse,
         PyBytes::new(py, &bip_bytes).into(),
     ))
 }
@@ -78,18 +78,33 @@ fn weighted_pairwise_with_snapshots(
 /// Compute pairwise WRF distances and export a branch-length matrix in a single pass.
 ///
 /// Parses each newick once, building both the pairwise WRF distance matrix and a
-/// per-edge branch-length matrix encoding the branch length of every edge in each tree.
+/// per-edge branch-length matrix holding the branch length of every edge in each tree,
+/// stored as compressed sparse rows (CSR) so a tree costs one entry per edge it holds.
 ///
 /// # Branch-length matrix format
 ///
-/// Shape `(n_trees, n_bip)`, encoded as a flat row-major `float64` byte buffer.
-/// `branch_length_bytes[i, j]` is the branch length of edge `j` in tree `i`, or `0.0`
-/// if that edge is absent. Pendant (leaf) edges are always present in every tree.
-/// Column order matches `bipartition_clade_bytes`, and is stable across calls.
+/// The fifth element is a dict with these keys:
+///
+/// - `format_version`: `1`.
+/// - `encoding`: `"csr"`.
+/// - `n_entries`: total number of (tree, edge) entries.
+/// - `row_offsets`: native-endian `uint64` bytes, `n_trees + 1` values.
+/// - `column_indices`: native-endian `uint32` bytes, `n_entries` values.
+/// - `lengths`: native-endian `float64` bytes, `n_entries` values, one branch length per entry in the order of `column_indices`.
+///
+/// Tree `i` holds the edges `column_indices[row_offsets[i]:row_offsets[i + 1]]`, ascending
+/// and in the column order of `bipartition_clade_bytes`, which is stable across calls.
+/// Edges a tree lacks have no entry, which the dense matrix wrote as `0.0`. Pendant (leaf)
+/// edges are present in every tree.
 ///
 /// Reconstruct and compute Fréchet traces on the Python side:
 /// ```python
-/// bl = np.frombuffer(branch_length_bytes, dtype=np.float64).reshape(n_trees, n_bip)
+/// offsets = np.frombuffer(sparse["row_offsets"], dtype=np.uint64)
+/// columns = np.frombuffer(sparse["column_indices"], dtype=np.uint32)
+/// lengths = np.frombuffer(sparse["lengths"], dtype=np.float64)
+/// bl = np.zeros((n_trees, n_bip))
+/// for i in range(n_trees):
+///     bl[i, columns[offsets[i]:offsets[i + 1]]] = lengths[offsets[i]:offsets[i + 1]]
 /// wrf_trace = np.sum(np.abs(bl[ref_idx, :] - bl), axis=1)   # wRF to one reference
 /// kf_trace  = np.sqrt(np.sum((bl[ref_idx, :] - bl)**2, axis=1))  # KF to one reference
 /// ```
@@ -107,7 +122,7 @@ fn weighted_pairwise_with_snapshots(
 ///
 /// Returns:
 ///     6-tuple (tree_names, wrf_matrix_bytes, leaf_names, n_bip,
-///     branch_length_bytes, bipartition_clade_bytes).
+///     sparse_branch_lengths, bipartition_clade_bytes).
 ///     wrf_matrix_bytes is flat float64 bytes (row-major n×n).
 ///
 /// Raises:
@@ -137,7 +152,7 @@ pub(super) fn pairwise_wrf_with_snapshots_from_newick_iter(
 ///
 /// Identical to `pairwise_wrf_with_snapshots_from_newick_iter` except the distance
 /// matrix uses the Kuhner–Felsenstein (Branch Score) metric instead of Weighted RF.
-/// The branch-length matrix is metric-agnostic and identical in both functions.
+/// The sparse branch-length matrix is metric-agnostic and identical in both functions.
 ///
 /// Args:
 ///     names: Tree identifiers (one per newick).
@@ -152,7 +167,7 @@ pub(super) fn pairwise_wrf_with_snapshots_from_newick_iter(
 ///
 /// Returns:
 ///     6-tuple (tree_names, kf_matrix_bytes, leaf_names, n_bip,
-///     branch_length_bytes, bipartition_clade_bytes).
+///     sparse_branch_lengths, bipartition_clade_bytes).
 ///     kf_matrix_bytes is flat float64 bytes (row-major n×n).
 ///
 /// Raises:
