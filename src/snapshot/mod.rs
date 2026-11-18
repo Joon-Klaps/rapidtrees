@@ -246,7 +246,7 @@ impl Snapshots {
             interner.push_chunk(raw)?;
         }
 
-        Ok(interner.finish(sorted_leaf_names))
+        interner.finish(sorted_leaf_names)
     }
 
     /// Build a `Snapshots` collection from a slice of plain Newick strings.

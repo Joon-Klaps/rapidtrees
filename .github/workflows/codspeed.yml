@@ -41,6 +41,8 @@ jobs:
 
             - name: Setup Rust + cargo-codspeed
               uses: moonrepo/setup-rust@v1
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
               with:
                   channel: stable
                   cache-target: release
